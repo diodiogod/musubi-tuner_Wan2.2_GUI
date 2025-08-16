@@ -89,6 +89,9 @@ This fork provides an intuitive visual interface for training LoRA adapters on W
 
 4. **Configure Weights & Biases (Optional)**
    ```bash
+   pip install wandb
+   ```
+   ```bash
    wandb login
    # Enter your API key when prompted
    ```
