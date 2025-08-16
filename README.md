@@ -111,6 +111,13 @@ This fork provides an intuitive visual interface for training LoRA adapters on W
 
 ## Usage
 
+### Launching the ACCELERATE command 
+
+```bash
+.\venv\Scripts\activate
+accelerate config
+```
+
 ### Launching the GUI
 
 **Windows**: Double-click `LAUNCH_GUI.bat`
