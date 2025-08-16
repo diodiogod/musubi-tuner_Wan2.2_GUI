@@ -1,0 +1,19 @@
+[general]
+caption_extension = ".txt"
+batch_size = 1
+enable_bucket = true
+bucket_no_upscale = false
+
+[[datasets]]
+resolution = [160, 160]
+video_directory = "D:/musubi-tuner_Wan2.2_GUI/dataset/My_Best_Lora_dataset/video"  # path to your video dataset
+cache_directory = "D:/musubi-tuner_Wan2.2_GUI/dataset/My_Best_Lora_dataset/cache/video" # recommended to set cache directory
+target_frames = [17, 33, 65]
+frame_extraction = "chunk"
+num_repeats = 1
+
+[[datasets]]
+resolution = [256, 256]
+image_directory = "D:/musubi-tuner_Wan2.2_GUI/dataset/My_Best_Lora_dataset/images" # path to your image dataset
+cache_directory = "D:/musubi-tuner_Wan2.2_GUI/dataset/My_Best_Lora_dataset/cache/images" # recommended to set cache directory
+num_repeats = 1
