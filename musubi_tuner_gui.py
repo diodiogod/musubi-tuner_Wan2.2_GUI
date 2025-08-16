@@ -251,7 +251,7 @@ class MusubiTunerGUI:
         self._add_widget(flow_frame, "timestep_sampling", "Timestep Sampling:", "Method for selecting timesteps during training. 'shift' is recommended.", kind='combobox', options=["uniform", "shift", "sigma", "logsnr", "qinglong_flux"])
         self._add_widget(flow_frame, "num_timestep_buckets", "Timestep Buckets:", "Enables stratified sampling by dividing timesteps into buckets. Can improve training stability, especially with small datasets. (e.g., 10)", validate_num=True)
         self.hidden_frames['timestep_boundary'] = ttk.Frame(flow_frame)
-        self._add_widget(self.hidden_frames['timestep_boundary'], "timestep_boundary", "Timestep Boundary:", "The point (as a ratio) where the model switches from high to low noise. Only used in combined training runs.", validate_num=True)
+        self._add_widget(self.hidden_frames['timestep_boundary'], "timestep_boundary", "Timestep Boundary:", "The integer timestep where the model switches from low to high noise (e.g., 875). Only for combined runs.", validate_num=True)
         self._add_widget(flow_frame, "discrete_flow_shift", "Discrete Flow Shift:", "Shift value for 'shift' sampling. The documentation recommends 3.0.", validate_num=True)
         self._add_widget(flow_frame, "preserve_distribution_shape", "Preserve Distribution Shape", "Prevents distortion of the timestep distribution. Recommended when training only one model (e.g., only low noise).", kind='checkbox')
         
@@ -419,31 +419,29 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
         if show_high: self.hidden_frames['high_noise_lora_params'].pack(fill='x', expand=True, pady=(0, 5))
         else: self.hidden_frames['high_noise_lora_params'].pack_forget()
         
-        # --- FIX --- This logic now correctly handles empty strings and the junk "None" string from faulty saves
         dim_high_val = self.entries["network_dim_high"].get().strip()
         alpha_high_val = self.entries["network_alpha_high"].get().strip()
         is_separate_run = (dim_high_val and dim_high_val != "None") or \
                           (alpha_high_val and alpha_high_val != "None")
         is_combined_run = show_low and show_high and not is_separate_run
-
-        # --- FIX --- The lock is gone. This checkbox is ALWAYS available to be clicked.
-        # Its effect is handled purely in the command building logic now.
-        offload_widget = self.entries["offload_inactive_dit"]
-        blocks_to_swap_widget = self.entries["blocks_to_swap"]
         
         if is_combined_run:
             self.hidden_frames['timestep_boundary'].pack(fill='x', expand=True)
             boundary_widget = self.entries["timestep_boundary"]
             current_val = boundary_widget.get()
-            default_val = "0.9" if is_i2v else "0.875"
+            # --- FIX --- Use integer strings for the boundary value
+            default_val = "900" if is_i2v else "875"
             if current_val != default_val: boundary_widget.delete(0, tk.END); boundary_widget.insert(0, default_val)
         else:
             self.hidden_frames['timestep_boundary'].pack_forget()
 
+        offload_widget = self.entries["offload_inactive_dit"]
+        blocks_to_swap_widget = self.entries["blocks_to_swap"]
+        
         is_offloading = offload_widget.var.get()
         blocks_to_swap_widget.config(state="disabled" if is_offloading else "normal")
-        if is_offloading:
-            blocks_to_swap_widget.delete(0, tk.END)
+        if is_offloading and blocks_to_swap_widget.cget('state') == 'normal':
+             blocks_to_swap_widget.delete(0, tk.END)
 
         scheduler = self.entries["lr_scheduler"].get()
         if scheduler == "constant_with_warmup": self.hidden_frames['lr_warmup'].pack(fill='x', expand=True)
@@ -487,7 +485,7 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             "lr_warmup_steps": "0", "lr_scheduler_num_cycles": "1",
             "mixed_precision": "fp16", "gradient_accumulation_steps": "1",
             "max_data_loader_n_workers": "2", "blocks_to_swap": "10", "timestep_sampling": "shift",
-            "num_timestep_buckets": "", "timestep_boundary": "0.875", "discrete_flow_shift": "3.0", "preserve_distribution_shape": False,
+            "num_timestep_buckets": "", "timestep_boundary": "875", "discrete_flow_shift": "3.0", "preserve_distribution_shape": False,
             "gradient_checkpointing": True, "persistent_data_loader_workers": True, "save_state": True, 
             "fp8_base": False, "fp8_scaled": False, "fp8_t5": False, "offload_inactive_dit": False,
             "attention_mechanism": "xformers", "resume_path": "", "network_weights": "",
@@ -640,6 +638,9 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             self.output_text.insert(tk.END, f"\n--- Previous step failed with code {return_code}. Halting sequence. ---\n")
             self.stop_all_activity(); return
         if self.command_sequence:
+            self.loss_data.clear()
+            self.current_step = 0
+            self.update_loss_graph() 
             next_command = self.command_sequence.pop(0)
             self.run_process(next_command, self._run_next_command_in_sequence, self.output_text)
         else:
