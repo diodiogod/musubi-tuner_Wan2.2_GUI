@@ -86,6 +86,8 @@ This fork provides an intuitive visual interface for training LoRA adapters on W
    # Optional: Install GUI enhancement packages, xformers
    pip install matplotlib pynvml tensorboard wandb
    pip install xformers==0.0.28.post1 --index-url https://download.pytorch.org/whl/cu124
+   OR (To build from source)
+   pip install -v --no-build-isolation -U git+https://github.com/facebookresearch/xformers.git@main#egg=xformers
    ```
 
 4. **Configure Weights & Biases (Optional)**
