@@ -84,7 +84,7 @@ This fork provides an intuitive visual interface for training LoRA adapters on W
    pip install -e .
    
    # Optional: Install GUI enhancement packages, xformers
-   pip install matplotlib pynvml tensorboard wandb
+   pip install matplotlib pynvml tensorboard
    ```
 
    ```bash
