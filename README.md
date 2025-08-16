@@ -23,7 +23,7 @@ This fork provides an intuitive visual interface for training LoRA adapters on W
 - Core settings: learning rate, epochs, save frequency, seed
 - LoRA configuration: network dimension (rank) and alpha
 - Optimizer selection (adamw8bit, prodigy, etc.)
-- Learning rate scheduler options (cosine, polynomial)
+- Learning rate scheduler options
 
 **Advanced Settings**
 - Memory optimizations: mixed precision, gradient checkpointing, data loader settings
@@ -84,7 +84,7 @@ This fork provides an intuitive visual interface for training LoRA adapters on W
    pip install -e .
    
    # Optional: Install GUI enhancement packages
-   pip install matplotlib pynvml tensorboard wandb
+   pip install matplotlib pynvml tensorboard wandb xformers
    ```
 
 4. **Configure Weights & Biases (Optional)**
