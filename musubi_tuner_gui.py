@@ -72,8 +72,8 @@ class MusubiTunerGUI:
         self.loss_data = []
         self.peak_vram = 0
         self.command_sequence = []
-        self.fp8_warning_shown = False
         self.last_line_was_progress = False
+        self.current_step = 0
 
         self.create_interface()
         self.load_default_settings()
@@ -130,7 +130,7 @@ class MusubiTunerGUI:
         self.create_advanced_tab()
         self.create_run_monitor_tab()
         self.create_convert_lora_tab()
-        self.create_accelerate_config_tab() # --- ADDED ---
+        self.create_accelerate_config_tab()
 
     def create_settings_buttons(self, parent):
         button_frame = ttk.Frame(parent); button_frame.pack(fill="x", pady=(0, 10), anchor='w')
@@ -271,7 +271,7 @@ class MusubiTunerGUI:
 
         other_frame = ttk.LabelFrame(frame, text="Other Options"); other_frame.pack(fill="x", padx=10, pady=10)
         fp8_frame = ttk.Frame(other_frame); fp8_frame.pack(fill='x')
-        self._add_widget(fp8_frame, "fp8_base", "FP8 Base", "Use FP8 precision for the base model. Requires bf16.", kind='checkbox', command=self._handle_fp8_precision_conflict)
+        self._add_widget(fp8_frame, "fp8_base", "FP8 Base", "Use FP8 precision for the base model. Select a compatible mixed precision (fp16 or bf16).", kind='checkbox')
         self._add_widget(fp8_frame, "fp8_scaled", "FP8 Scaled", "Use scaled FP8 training.", kind='checkbox')
         self._add_widget(fp8_frame, "fp8_t5", "FP8 T5", "Use FP8 precision for the T5 text encoder.", kind='checkbox')
         self._add_widget(other_frame, "save_state", "Save State", "Save the complete training state (optimizer, etc.) to allow resuming later.", kind='checkbox', default_val=True)
@@ -329,7 +329,6 @@ class MusubiTunerGUI:
         self.convert_output_text.configure(yscrollcommand=scrollbar.set); self.convert_output_text.pack(side="left", fill="both", expand=True); scrollbar.pack(side="right", fill="y")
         
     def create_accelerate_config_tab(self):
-        # --- ADDED --- New tab for Accelerate config
         tab_frame = ttk.Frame(self.notebook); self.notebook.add(tab_frame, text="Accelerate Config")
         main_frame = ttk.Frame(tab_frame); main_frame.pack(fill='both', expand=True, padx=10, pady=10)
 
@@ -419,23 +418,32 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
         else: self.hidden_frames['low_noise_lora_params'].pack_forget()
         if show_high: self.hidden_frames['high_noise_lora_params'].pack(fill='x', expand=True, pady=(0, 5))
         else: self.hidden_frames['high_noise_lora_params'].pack_forget()
+        
+        # --- FIX --- This logic now correctly handles empty strings and the junk "None" string from faulty saves
+        dim_high_val = self.entries["network_dim_high"].get().strip()
+        alpha_high_val = self.entries["network_alpha_high"].get().strip()
+        is_separate_run = (dim_high_val and dim_high_val != "None") or \
+                          (alpha_high_val and alpha_high_val != "None")
+        is_combined_run = show_low and show_high and not is_separate_run
 
-        is_combined_run = show_low and show_high and not (self.entries["network_dim_high"].get() or self.entries["network_alpha_high"].get())
-
+        # --- FIX --- The lock is gone. This checkbox is ALWAYS available to be clicked.
+        # Its effect is handled purely in the command building logic now.
+        offload_widget = self.entries["offload_inactive_dit"]
+        blocks_to_swap_widget = self.entries["blocks_to_swap"]
+        
         if is_combined_run:
             self.hidden_frames['timestep_boundary'].pack(fill='x', expand=True)
             boundary_widget = self.entries["timestep_boundary"]
             current_val = boundary_widget.get()
             default_val = "0.9" if is_i2v else "0.875"
             if current_val != default_val: boundary_widget.delete(0, tk.END); boundary_widget.insert(0, default_val)
-        else: self.hidden_frames['timestep_boundary'].pack_forget()
+        else:
+            self.hidden_frames['timestep_boundary'].pack_forget()
 
-        offload_widget = self.entries["offload_inactive_dit"]; blocks_to_swap_widget = self.entries["blocks_to_swap"]
-        offload_widget.config(state="normal" if is_combined_run else "disabled")
-        if not is_combined_run: offload_widget.var.set(False) 
-        is_offloading = offload_widget.var.get() and is_combined_run
+        is_offloading = offload_widget.var.get()
         blocks_to_swap_widget.config(state="disabled" if is_offloading else "normal")
-        if is_offloading: blocks_to_swap_widget.delete(0, tk.END)
+        if is_offloading:
+            blocks_to_swap_widget.delete(0, tk.END)
 
         scheduler = self.entries["lr_scheduler"].get()
         if scheduler == "constant_with_warmup": self.hidden_frames['lr_warmup'].pack(fill='x', expand=True)
@@ -455,9 +463,15 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
         for key, value in settings.items():
             if key in self.entries:
                 widget = self.entries[key]
-                if isinstance(widget, (tk.BooleanVar, tk.StringVar)): widget.set(value)
-                elif hasattr(widget, 'var'): widget.var.set(value)
-                else: widget.delete(0, tk.END); widget.insert(0, str(value))
+                if isinstance(widget, (tk.BooleanVar, tk.StringVar)):
+                    widget.set(value if value is not None else "")
+                elif hasattr(widget, 'var'):
+                    widget.var.set(value if value is not None else False)
+                elif isinstance(widget, ttk.Combobox):
+                    widget.set(value if value is not None else "")
+                elif isinstance(widget, ttk.Entry):
+                    widget.delete(0, tk.END)
+                    widget.insert(0, str(value) if value is not None else "")
         self.update_button_states()
 
     def load_default_settings(self):
@@ -502,15 +516,6 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             except Exception as e: messagebox.showerror("Error", f"Failed to load settings: {e}")
 
     def _load_last_settings(self): self.load_settings(filepath="last_settings.json")
-    
-    def _handle_fp8_precision_conflict(self):
-        if self.entries["fp8_base"].var.get():
-            precision_widget = self.entries["mixed_precision"]
-            if precision_widget.get() != 'bf16':
-                precision_widget.set('bf16')
-                if not self.fp8_warning_shown:
-                    messagebox.showinfo("Precision Adjusted", "FP8 Base requires bf16 for compatibility.\n\nMixed precision has been automatically set to 'bf16'.")
-                    self.fp8_warning_shown = True
 
     def start_vram_monitor(self):
         if not PYNVML_AVAILABLE: self.vram_label_var.set("VRAM: pynvml not installed"); return
@@ -610,10 +615,17 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
                 if char in ('\n', '\r'):
                     self.root.after(0, self.process_console_output, buffer, output_widget)
                     if output_widget == self.output_text:
-                        loss_match = re.search(r" loss=([\d\.]+)", buffer); step_match = re.search(r"(\d+)/\d+ \[", buffer)
+                        step_match = re.search(r"(\d+)/\d+ \[", buffer)
+                        if step_match:
+                            self.current_step = int(step_match.group(1))
+
+                        loss_match = re.search(r"loss=([\d\.]+)", buffer)
+                        if loss_match and self.current_step > 0:
+                            self.root.after(0, self.update_loss_graph, self.current_step, float(loss_match.group(1)))
+
                         epoch_match = re.search(r"epoch\s*=\s*(\d+)\s*/\s*(\d+)", buffer, re.IGNORECASE)
-                        if loss_match and step_match: self.root.after(0, self.update_loss_graph, int(step_match.group(1)), float(loss_match.group(1)))
-                        if epoch_match: self.root.after(0, self.update_progress_bar, int(epoch_match.group(1)), int(epoch_match.group(2)))
+                        if epoch_match:
+                            self.root.after(0, self.update_progress_bar, int(epoch_match.group(1)), int(epoch_match.group(2)))
                     buffer = ""
             if buffer: self.root.after(0, self.process_console_output, buffer, output_widget)
         except Exception as e:
@@ -648,7 +660,9 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
         if not self._check_logging_dependencies(settings.get("log_with")): return
         if self.start_btn['state'] == 'disabled':
             messagebox.showerror("Validation Error", "Please fill all required fields and select at least one DiT model to train."); return
-        self.loss_data.clear(); self.update_loss_graph(); self.start_vram_monitor()
+        
+        self.loss_data.clear(); self.current_step = 0
+        self.update_loss_graph(); self.start_vram_monitor()
         self.progress_var.set(0); self.progress_label_var.set("Starting sequence...")
         self.output_text.delete("1.0", tk.END); self.command_sequence = []
         python_executable = sys.executable or "python"
@@ -748,7 +762,9 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
                 add_arg(command, "--log_with", log_with); add_arg(command, "--logging_dir", settings.get("logging_dir"), is_path=True); add_arg(command, "--log_prefix", settings.get("log_prefix"))
             return command
         
-        is_separate_run = train_low and train_high and (settings.get("network_dim_high") or settings.get("network_alpha_high"))
+        dim_high = (settings.get("network_dim_high") or "").strip()
+        alpha_high = (settings.get("network_alpha_high") or "").strip()
+        is_separate_run = train_low and train_high and (dim_high or alpha_high)
         is_combined_run = train_low and train_high and not is_separate_run
 
         if is_separate_run:
@@ -798,7 +814,6 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
         self.stop_all_activity()
 
     def run_accelerate_config(self):
-        # --- ADDED --- Logic to run accelerate config in a new terminal
         try:
             python_executable = Path(sys.executable)
             accelerate_path = python_executable.parent / "accelerate"
