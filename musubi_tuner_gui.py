@@ -225,6 +225,8 @@ class MusubiTunerGUI:
 
         optimizer_frame = ttk.LabelFrame(frame, text="Optimizer Settings"); optimizer_frame.pack(fill="x", padx=10, pady=10)
         self._add_widget(optimizer_frame, "optimizer_type", "Optimizer Type:", "'adamw8bit' is a memory-efficient and stable default. 'prodigy' can also work well.", kind='combobox', options=["adamw", "adamw8bit", "adafactor", "lion", "prodigy"])
+        # --- ADDED --- max_grad_norm widget
+        self._add_widget(optimizer_frame, "max_grad_norm", "Max Grad Norm:", "Clips the gradient norm to prevent gradients from exploding, which can stabilize training. '1.0' is a good default. '0' disables it.", validate_num=True)
         self._add_widget(optimizer_frame, "optimizer_args", "Optimizer Args:", "Additional arguments for the optimizer, e.g., 'weight_decay=0.1'. Can be left blank.", kind='entry')
         
         lr_frame = ttk.LabelFrame(frame, text="Learning Rate Scheduler"); lr_frame.pack(fill="x", padx=10, pady=10)
@@ -318,8 +320,8 @@ class MusubiTunerGUI:
         main_frame = ttk.Frame(tab_frame); main_frame.pack(fill='both', expand=True, padx=10, pady=10)
         settings_frame = ttk.LabelFrame(main_frame, text="Conversion Settings"); settings_frame.pack(fill='x', pady=(0,10))
         self._add_widget(settings_frame, "convert_lora_path", "LoRA to Convert:", "Path to the .safetensors LoRA file you want to convert.", kind='path_entry', options=[("Safetensors", "*.safetensors")], is_path=True)
-        self._add_widget(settings_frame, "convert_output_path", "Output Path:", "Path to save the converted LoRA file.", kind='path_entry', options=[("Safetensors", "*.safetensors")])
-        self._add_widget(settings_frame, "convert_precision", "Precision:", "The data type to save the converted LoRA in. 'fp16' is common for distribution.", kind='combobox', options=["fp16", "bf16", "float"])
+        # --- MODIFIED --- Changed to directory selector
+        self._add_widget(settings_frame, "convert_output_dir", "Output Directory:", "Folder to save the converted LoRA file.", kind='path_entry', is_dir=True)
         
         button = ttk.Button(settings_frame, text="Start Conversion", command=self.start_conversion); button.pack(pady=10)
 
@@ -429,7 +431,6 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             self.hidden_frames['timestep_boundary'].pack(fill='x', expand=True)
             boundary_widget = self.entries["timestep_boundary"]
             current_val = boundary_widget.get()
-            # --- FIX --- Use integer strings for the boundary value
             default_val = "900" if is_i2v else "875"
             if current_val != default_val: boundary_widget.delete(0, tk.END); boundary_widget.insert(0, default_val)
         else:
@@ -481,7 +482,7 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             "output_dir": "", "output_name": "my-lora",
             "learning_rate": "2e-4", "max_train_epochs": "10", "save_every_n_epochs": "1", "save_every_n_steps": "", "seed": "42",
             "network_dim_low": "32", "network_alpha_low": "16", "network_dim_high": "", "network_alpha_high": "",
-            "optimizer_type": "adamw8bit", "optimizer_args": "", "lr_scheduler": "cosine",
+            "optimizer_type": "adamw8bit", "max_grad_norm": "1.0", "optimizer_args": "", "lr_scheduler": "cosine",
             "lr_warmup_steps": "0", "lr_scheduler_num_cycles": "1",
             "mixed_precision": "fp16", "gradient_accumulation_steps": "1",
             "max_data_loader_n_workers": "2", "blocks_to_swap": "10", "timestep_sampling": "shift",
@@ -491,7 +492,7 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             "attention_mechanism": "xformers", "resume_path": "", "network_weights": "",
             "log_with": "none", "logging_dir": "", "log_prefix": "",
             "recache_latents": False, "recache_text": False,
-            "convert_lora_path": "", "convert_output_path": "", "convert_precision": "fp16"
+            "convert_lora_path": "", "convert_output_dir": ""
         }
         self.set_values(defaults)
         
@@ -724,7 +725,8 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             if attention and attention != "none": command.append(f"--{attention}")
             add_arg(command, "--fp8_base", settings.get("fp8_base")); add_arg(command, "--fp8_scaled", settings.get("fp8_scaled")); add_arg(command, "--fp8_t5", settings.get("fp8_t5"))
             add_arg(command, "--optimizer_type", settings.get("optimizer_type")); add_arg(command, "--learning_rate", settings.get("learning_rate"))
-            add_arg(command, "--gradient_checkpointing", settings.get("gradient_checkpointing")); add_arg(command, "--gradient_accumulation_steps", settings.get("gradient_accumulation_steps"))
+            add_arg(command, "--max_grad_norm", settings.get("max_grad_norm")); add_arg(command, "--gradient_checkpointing", settings.get("gradient_checkpointing"))
+            add_arg(command, "--gradient_accumulation_steps", settings.get("gradient_accumulation_steps"))
             add_arg(command, "--max_data_loader_n_workers", settings.get("max_data_loader_n_workers")); add_arg(command, "--persistent_data_loader_workers", settings.get("persistent_data_loader_workers"))
 
             if is_combined_run and settings.get("offload_inactive_dit"): add_arg(command, "--offload_inactive_dit", True)
@@ -794,16 +796,20 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
 
     def start_conversion(self):
         lora_path = self.entries["convert_lora_path"].get()
-        output_path = self.entries["convert_output_path"].get()
-        precision = self.entries["convert_precision"].get()
+        output_dir = self.entries["convert_output_dir"].get()
 
-        if not (lora_path and os.path.exists(lora_path) and output_path and precision):
-            messagebox.showerror("Validation Error", "Please fill all fields for conversion correctly."); return
+        if not (lora_path and os.path.exists(lora_path) and output_dir and os.path.isdir(output_dir)):
+            messagebox.showerror("Validation Error", "Please provide a valid LoRA file and a valid output directory."); return
         
+        # --- MODIFIED --- Auto-generate output path and fix command arguments
+        base_name = Path(lora_path).stem
+        output_name = f"{base_name}_converted.safetensors"
+        final_output_path = Path(output_dir) / output_name
+
         self.convert_output_text.delete("1.0", tk.END)
         python_executable = sys.executable or "python"
         command = [python_executable, "src/musubi_tuner/convert_lora.py",
-                   "--lora_path", lora_path, "--output_path", output_path, "--precision", precision]
+                   "--input", lora_path, "--output", str(final_output_path), "--target", "default"]
         
         self.run_process(command, on_complete=self.on_conversion_complete, output_widget=self.convert_output_text)
 
