@@ -1,136 +1,170 @@
 # Musubi Tuner WAN 2.2 GUI
 
-This repository is a fork of the original [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner) project, enhanced with a graphical user interface (GUI) tailored for WAN 2.2 LoRA training. The GUI simplifies configuring, running, and monitoring LoRA training for WAN 2.2 models, making it accessible for users who prefer a visual interface over command-line operations.
+A graphical user interface for WAN 2.2 LoRA training, built on top of the [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner) project. This GUI simplifies the configuration, execution, and monitoring of LoRA training workflows for WAN 2.2 models.
 
-The core functionality builds on the Musubi Tuner ecosystem, supporting Low-Rank Adaptation (LoRA) training for architectures like HunyuanVideo, WAN 2.1/2.2, FramePack, and FLUX.1 Kontext. This fork focuses on WAN 2.2, with features for handling high-noise and low-noise DiT models.
+## Overview
 
-**Note**: This GUI is experimental and optimized for Windows (via the included .bat launcher), but it may work on other platforms with adjustments. Refer to the original repository for the full capabilities of Musubi Tuner.
+This fork provides an intuitive visual interface for training LoRA adapters on WAN 2.2 models, supporting both high-noise and low-noise DiT architectures. The GUI handles complex parameter configurations, real-time monitoring, and automated caching processes while maintaining compatibility with the underlying Musubi Tuner ecosystem.
+
+**Note**: This GUI is experimental and optimized for Windows systems. Other platforms may require adjustments.
 
 ## Features
 
-The GUI provides an intuitive interface for setting up and executing WAN 2.2 LoRA training workflows. Key features include:
+### 🎛️ Configuration Tabs
 
-### Configuration Tabs
-- **Model Paths & Dataset Tab**:
-  - Specify the dataset configuration (TOML file) path.
-  - Enable training for High Noise and/or Low Noise DiT models.
-  - Set paths for VAE, optional CLIP, and T5 text encoder models.
-  - Define the output directory and LoRA filename.
-  - Includes file browsers for easy path selection.
+**Model Paths & Dataset**
+- Dataset configuration (TOML file) selection
+- High/Low Noise DiT model training toggles
+- VAE, CLIP, and T5 text encoder path configuration
+- Output directory and LoRA filename specification
+- Built-in file browsers for easy navigation
 
-- **Training Parameters Tab**:
-  - Configure core parameters: learning rate, max epochs, save frequency, and seed.
-  - Set LoRA network dimension (rank) and alpha.
-  - Select optimizer type (e.g., `adamw8bit`, `prodigy`) and optional additional arguments.
-  - Choose learning rate scheduler (e.g., `cosine`, `polynomial`) with power and min LR ratio options.
+**Training Parameters**
+- Core settings: learning rate, epochs, save frequency, seed
+- LoRA configuration: network dimension (rank) and alpha
+- Optimizer selection (adamw8bit, prodigy, etc.)
+- Learning rate scheduler options (cosine, polynomial)
 
-- **Advanced Settings Tab**:
-  - Memory optimizations: Mixed precision (`fp16`/`bf16`), gradient checkpointing, persistent data loaders, gradient accumulation steps, and max data loader workers.
-  - WAN 2.2-specific options: Offload inactive DiT model or swap blocks to save VRAM.
-  - Flow matching: Timestep sampling (`uniform`/`shift`), discrete flow shift, and preserve distribution shape.
-  - Attention mechanisms: Select from None, xFormers, Flash Attention, or SDPA via radio buttons.
-  - Logging: Enable TensorBoard or Weights & Biases (W&B) with customizable log directory and prefix.
+**Advanced Settings**
+- Memory optimizations: mixed precision, gradient checkpointing, data loader settings
+- WAN 2.2 specific: DiT model offloading and block swapping for VRAM efficiency
+- Flow matching: timestep sampling and distribution controls
+- Attention mechanisms: xFormers, Flash Attention, SDPA support
+- Logging integration: TensorBoard and Weights & Biases
 
-- **Run & Monitor Tab**:
-  - Real-time console output for training progress. 
-  - Progress bar showing current epoch and completion percentage.
-  - Live loss graph (requires `matplotlib`; optional). (x axis range should be divided by batch size value but it's ok)*
-  - VRAM usage monitor with current, peak, and total usage (requires `pynvml`; optional).
-  - Buttons to start/stop training, show the generated command, and clear the console.
+**Run & Monitor**
+- Real-time console output and progress tracking
+- Live loss visualization (requires matplotlib)
+- VRAM usage monitoring (requires pynvml)
+- Training control: start, stop, and command preview
 
-### Additional Functionality
-- **Settings Management**: Load/save configurations from JSON files, reset to defaults, and auto-save last settings on close.
-- **Validation**: Checks required fields before training; highlights invalid inputs.
-- **Caching Support**: Optionally recache latents and text encoder outputs before training.
-- **Command Building**: Automatically generates and executes commands for caching and training using `accelerate launch`.
-- **Tooltips**: Hover over fields for explanations and tips.
-- **FP8 Handling**: Automatically adjusts mixed precision for FP8 base models, with warnings.
-- **Sequence Execution**: Runs caching and training steps sequentially, halting on errors.
-- **Resume Training**: Supports resuming from checkpoints, from network weights, and advanced flags like FP8 scaled/base.
+### 🔧 Additional Features
+
+- **Settings Management**: Save/load configurations, auto-save on exit
+- **Input Validation**: Required field checking with visual feedback
+- **Caching Support**: Automated latent and text encoder caching
+- **Command Generation**: View and copy generated training commands
+- **Resume Training**: Checkpoint loading and advanced resumption options
+- **FP8 Compatibility**: Automatic precision adjustments with warnings
 
 ## Installation
 
-1. **Clone the Repository**:
+### Prerequisites
+
+- Python 3.10 or higher
+- NVIDIA GPU (recommended for optimal performance)
+- 12GB+ VRAM (24GB+ recommended for high-resolution training)
+- 32GB+ system RAM
+
+### Setup
+
+1. **Clone the Repository**
    ```bash
    git clone https://github.com/PGCRT/musubi-tuner_Wan2.2_GUI.git
    cd musubi-tuner_Wan2.2_GUI
+   ```
 
-Set Up Virtual Environment (Recommended):
+2. **Create Virtual Environment**
+   ```bash
+   # Windows
+   python -m venv venv
+   .\venv\Scripts\activate
+   
+   # macOS/Linux
+   python -m venv venv
+   source venv/bin/activate
+   ```
 
-Create and activate a Python 3.10+ virtual environment.
+3. **Install Dependencies**
+   ```bash
+   # Install PyTorch with CUDA support
+   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+   
+   # Install Musubi Tuner
+   pip install -e .
+   
+   # Optional: Install GUI enhancement packages
+   pip install matplotlib pynvml tensorboard wandb
+   ```
 
-bashpython -m venv venv
-venv\Scripts\activate  # On Windows
-source venv/bin/activate  # On Linux/macOS
+4. **Configure Weights & Biases (Optional)**
+   ```bash
+   wandb login
+   # Enter your API key when prompted
+   ```
 
-Install Dependencies:
+5. **Download Models**
+   Follow the original [Musubi Tuner documentation](https://github.com/kohya-ss/musubi-tuner) to download WAN 2.2 models (DiT high/low noise, VAE, text encoders).
 
-Install PyTorch (CUDA-enabled recommended):
-bashpip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+   **Important**: Use fp16 models only. Scaled models are not supported.
 
-Install the Musubi Tuner package:
-bashpip install -e .
+## Usage
 
-Optional dependencies for full GUI features:
-bashpip install matplotlib pynvml tensorboard wandb
+### Launching the GUI
 
-matplotlib: For live loss graphing.
-pynvml: For VRAM monitoring (NVIDIA GPUs only).
+**Windows**: Double-click `LAUNCH_GUI.bat`
 
-tensorboard/wandb: For logging (selected in GUI):
-On Windows:
-.\venv\Scripts\activate
+**Other Platforms**: 
+```bash
+python musubi_tuner_gui.py
+```
 
-On macOS/Linux:
-source venv/bin/activate
+### Basic Workflow
 
-wandb login
+1. **Configure Paths**
+   - Set your dataset TOML file path
+   - Specify model paths (DiT, VAE, text encoders)
+   - Choose output directory and LoRA filename
 
-Then paste your API key
+2. **Set Training Parameters**
+   - Configure learning rate, epochs, and network dimensions
+   - Select optimizer and scheduler options
+   - Adjust advanced settings as needed
 
+3. **Enable Caching (First Run)**
+   - Check latents and/or text encoder caching options
+   - Required for initial training or when dataset changes
 
+4. **Start Training**
+   - Switch to "Run & Monitor" tab
+   - Click "Start Training" to begin
+   - Monitor progress via console, graph, and VRAM usage
 
+5. **Save Configuration**
+   - Use "Save Settings" to preserve your configuration
+   - Settings auto-save on GUI close
 
-Model Downloads:
+### Tips
 
-Follow the instructions in the original Musubi Tuner README for downloading WAN 2.2 models (DiT high/low noise, VAE, text encoders).
-Place models in the directory structure as described in the original repository. 
-SCALED MODELS won't work! Uses fp16 models with fp8 training, works on RTX 4090
+- Enable both high and low noise models for complete WAN 2.2 training (not for consumer grade GPU) (can check offload inactive DITs if both models selected, AUTOMATICALLY disable BLOCKS SWAPs)
+- Use caching on first run or when adding new data to your dataset
+- Monitor VRAM usage to optimize memory settings
+- Save successful configurations for future use
 
-Usage
-Launching the GUI
+## Hardware Requirements
 
-Windows: Double-click LAUNCH_GUI.bat to activate the virtual environment and start the GUI.
-Other Platforms: Run python musubi_tuner_gui.py from the activated virtual environment.
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| VRAM | 12GB | 24GB+ |
+| System RAM | 16GB | 32GB+ |
+| GPU | NVIDIA RTX 3080 | RTX 4090+ |
+| Storage | 50GB free | 100GB+ SSD |
 
-The GUI opens with the title "Musubi Tuner GUI - WAN 2.2 LoRA Training" (resizable, default size 1200x900).
-Configuring Training
+## Known Limitations
 
-Fill in Paths and Parameters:
+- **I2V Training**: GUI optimized for Text-to-Video only. For Image-to-Video, generate commands via GUI and run with native scripts
+- **Multi-GPU**: Single GPU training only
+- **Platform**: Best performance on Windows; other platforms may need adjustments
+- **Dependencies**: Some features require optional packages (matplotlib, pynvml)
 
-Use the tabs to enter required fields (e.g., dataset TOML, model paths).
-Tooltips provide guidance for each field.
-Use browse buttons to select files/directories.
+## License
 
+Licensed under the Apache License 2.0, consistent with the original Musubi Tuner project. See the [LICENSE](LICENSE) file for full details.
 
-Load/Save Settings:
+## Acknowledgments
 
-Click "Load Settings" to import from a JSON file.
-Click "Save Settings" to export the current configuration.
-Click "Reset to Defaults" to load predefined safe values.
+Built upon the excellent work of the [kohya-ss/musubi-tuner](https://github.com/kohya-ss/musubi-tuner) project. Special thanks to the original contributors and the broader AI training community.
 
+---
 
-About Caching:
-
-Enable caching for latents or text encoders if needed. (Check boxes on the first run, uncheck for the next one or if resume, rebake cache if adding images/videos to your dataset, or if you change resolution of the training)
-
-
-
-Known Limitations
-
-The GUI is optimized for WAN 2.2 T2V ONLY, You can use it to generate command line for I2V, then change the timesteps to the recommended ones for I2V, then run the command with the native script like on the official repo.
-
-
-License
-Licensed under the Apache License 2.0, consistent with the original Musubi Tuner. See the LICENSE file for details.
-For additional details on the underlying Musubi Tuner, refer to the original repository.
+**Need Help?** Check the [Issues](https://github.com/PGCRT/musubi-tuner_Wan2.2_GUI/issues) page or refer to the [original Musubi Tuner documentation](https://github.com/kohya-ss/musubi-tuner) for additional guidance.
