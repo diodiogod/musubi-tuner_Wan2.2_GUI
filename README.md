@@ -94,12 +94,6 @@ This fork provides an intuitive visual interface for training LoRA adapters on W
 
 ## Usage
 
-### Launching the ACCELERATE command 
-
-```bash
-.\venv\Scripts\activate
-accelerate config
-```
 
 ### Launching the GUI
 
@@ -111,6 +105,8 @@ python musubi_tuner_gui.py
 ```
 
 ### Basic Workflow
+
+Launch ACCELERATE config (last tab, only once)
 
 1. **Configure Paths**
    - Set your dataset TOML file path
