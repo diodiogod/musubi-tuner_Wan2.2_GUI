@@ -77,15 +77,6 @@ This fork provides an intuitive visual interface for training LoRA adapters on W
    
    # Optional: Install GUI enhancement packages
    pip install matplotlib pynvml tensorboard
-   ```
-
-   ```bash
-   pip install xformers
-   ```
-   OR (To build from source)
-   ```bash
-   pip install -v --no-build-isolation -U git+https://github.com/facebookresearch/xformers.git@main#egg=xformers
-   ```
 
 4. **Configure Weights & Biases (Optional)**
    ```bash
@@ -150,22 +141,6 @@ python musubi_tuner_gui.py
 - Use caching on first run or when adding new data to your dataset
 - Monitor VRAM usage to optimize memory settings
 - Save successful configurations for future use
-
-## Hardware Requirements
-
-| Component | Minimum | Recommended |
-|-----------|---------|-------------|
-| VRAM | 12GB | 24GB+ |
-| System RAM | 16GB | 32GB+ |
-| GPU | NVIDIA RTX 3080 | RTX 4090+ |
-| Storage | 50GB free | 100GB+ SSD |
-
-## Known Limitations
-
-- **I2V Training**: GUI optimized for Text-to-Video only. For Image-to-Video, generate commands via GUI and run with native scripts
-- **Multi-GPU**: Single GPU training only
-- **Platform**: Best performance on Windows; other platforms may need adjustments
-- **Dependencies**: Some features require optional packages (matplotlib, pynvml)
 
 ## License
 
