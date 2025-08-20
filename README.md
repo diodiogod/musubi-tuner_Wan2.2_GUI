@@ -88,12 +88,16 @@ This fork provides an intuitive visual interface for training LoRA adapters on W
    ```
 
 5. **Download Models**
-   Follow the original [Musubi Tuner documentation](https://github.com/kohya-ss/musubi-tuner) to download WAN 2.2 models (DiT high/low noise, VAE, text encoders).
+   2.2 HIGH NOISE https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/blob/main/split_files/diffusion_models/wan2.2_t2v_high_noise_14B_fp16.safetensors
+   2.2 LOW NOISE https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/blob/main/split_files/diffusion_models/wan2.2_t2v_low_noise_14B_fp16.safetensors
+
+   T5 https://huggingface.co/Kijai/WanVideo_comfy/blob/main/umt5-xxl-enc-bf16.safetensors
+
+   VAE https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/blob/main/split_files/vae/wan_2.1_vae.safetensors
 
    **Important**: Use fp16 models only. Scaled models are not supported.
 
 ## Usage
-
 
 ### Launching the GUI
 
@@ -106,7 +110,7 @@ python musubi_tuner_gui.py
 
 ### Basic Workflow
 
-Launch ACCELERATE config (last tab, only once)
+Launch ACCELERATE config (last tab, follow instructions, only once)
 
 1. **Configure Paths**
    - Set your dataset TOML file path
@@ -128,15 +132,78 @@ Launch ACCELERATE config (last tab, only once)
    - Monitor progress via console, graph, and VRAM usage
 
 5. **Save Configuration**
-   - Use "Save Settings" to preserve your configuration
-   - Settings auto-save on GUI close
+   - Use "Save Settings" to save your configuration
+   - Settings auto-save on GUI close anyway
 
-### Tips
+*   **IMPORTANT:** Use caching on your first run or when adding new data to your dataset to speed up initialization.
+*   Monitor VRAM usage to optimize memory settings with `blocks_to_swap`, batch size, and resolution.
 
-- Enable both high and low noise models for complete WAN 2.2 training (not for consumer grade GPU) (can check offload inactive DITs if both models selected, AUTOMATICALLY disable BLOCKS SWAPs)
-- Use caching on first run or when adding new data to your dataset
-- Monitor VRAM usage to optimize memory settings
-- Save successful configurations for future use
+
+### Dual Model Training Methods
+Here are the four distinct methods for training both the High and Low noise models.
+
+---
+
+### 1. Manually Sequential Training
+*This is a fully manual workflow where you run two separate training jobs yourself, one for each model.*
+
+*   **How to Configure:**
+    1.  **Part 1:** Check **only** `Train High Noise Model` and run the training to completion.
+    2.  **Part 2:** Return, uncheck the low noise model, check **only** `Train Low Noise Model`, and start the second training.
+
+*   **Key Attributes:**
+    *   **VRAM Usage:** **Moderate.** Very friendly to lower-VRAM systems.
+    *   **Training Speed:** **Good.** Each session runs at full speed.
+    *   **Best Use Case:** The **highly recommended alternative** to Method 2 for users with limited VRAM. It is predictable, efficient, and avoids the crippling speed loss.
+
+ ---
+
+### 2. Sequentially (Two Separate Trainings)
+*This method automatically runs two training sessions back-to-back when you set different LoRA parameters for each model.*
+
+*   **How to Configure:**
+    1.  Go to the **"Model Paths & Dataset"** tab and check **both** `Train High Noise Model` and `Train Low Noise Model`.
+    2.  Go to the **"Training Parameters"** tab and enter **different** values for `Network Dimension (Rank)` or `Network Alpha` for the high noise model.
+
+*   **Key Attributes:**
+    *   **VRAM Usage:** **Moderate.** Only one DiT model is loaded into VRAM at a time.
+    *   **Training Speed:** **Good.** Each session runs at full speed.
+    *   **Best Use Case:** Required when you intentionally want different LoRA ranks or alphas for each model, using the same dataset and learning rate. / If you want to automate training both models            during the night.
+
+---
+
+### 3. Combined (Single Run - Very High VRAM Usage)
+*This is the fastest and most efficient method, running a single unified process that trains both models simultaneously by keeping them both in VRAM.*
+
+*   **How to Configure:**
+    1.  Go to the **"Model Paths & Dataset"** tab and check **both** `Train High Noise Model` and `Train Low Noise Model`.
+    2.  In the **"Training Parameters"** tab, leave the high noise model's `Network Dimension` and `Network Alpha` **blank**.
+    3.  In the **"Advanced Settings"** tab, ensure `Offload Inactive DiT Model` is **UNCHECKED**.
+
+*   **Key Attributes:**
+    *   **VRAM Usage:** **Very High.** Requires enough VRAM to hold both DiT models (Too much for consumer grade GPU).
+    *   **Training Speed:** **Fastest.** The most time-efficient method.
+    *   **Best Use Case:** The default and highly recommended method for users with sufficient VRAM.
+
+---
+
+### 4. Combined (Single Run - VRAM Saving Mode)
+*This method attempts a combined run on low-VRAM systems by constantly swapping the inactive model between VRAM and system RAM, causing a high performance bottleneck.*
+
+*   **How to Configure:**
+    1.  Go to the **"Model Paths & Dataset"** tab and check **both** `Train High Noise Model` and `Train Low Noise Model`.
+    2.  In the **"Training Parameters"** tab, leave the high noise model's `Network Dimension` and `Network Alpha` **blank**.
+    3.  In the **"Advanced Settings"** tab, **CHECK** the `Offload Inactive DiT Model` option.
+
+*   **Key Attributes:**
+    *   **VRAM Usage:** **Low.** Drastically reduces VRAM consumption.
+    *   **Training Speed:** **Slow.** The performance cost is crippling.
+    *   **Best Use Case:**
+        > **WARNING:** This option has no real practical use case and should be avoided. The speed penalty is so significant that it is almost always slower than running two separate trainings (Method 1 or 2).
+
+---
+
+
 
 ## License
 
