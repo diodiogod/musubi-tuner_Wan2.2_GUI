@@ -64,7 +64,6 @@ This fork provides an intuitive visual interface for training LoRA adapters on W
 
 2. **Create Virtual Environment**
    ```bash
-   # Windows
    python -m venv venv
    .\venv\Scripts\activate
 
@@ -76,7 +75,7 @@ This fork provides an intuitive visual interface for training LoRA adapters on W
    # Install Musubi Tuner
    pip install -e .
    
-   # Optional: Install GUI enhancement packages, xformers
+   # Optional: Install GUI enhancement packages
    pip install matplotlib pynvml tensorboard
    ```
 
