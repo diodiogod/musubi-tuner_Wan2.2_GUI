@@ -67,11 +67,6 @@ This fork provides an intuitive visual interface for training LoRA adapters on W
    # Windows
    python -m venv venv
    .\venv\Scripts\activate
-   
-   # macOS/Linux
-   python -m venv venv
-   source venv/bin/activate
-   ```
 
 3. **Install Dependencies**
    ```bash
