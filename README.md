@@ -44,7 +44,6 @@ This fork provides an intuitive visual interface for training LoRA adapters on W
 - **Input Validation**: Required field checking with visual feedback
 - **Command Generation**: View and copy generated training commands
 - **Resume Training**: Checkpoint loading and advanced resumption options
-- **FP8 Compatibility**: Automatic precision adjustments with warnings
 
 ## Installation
 
