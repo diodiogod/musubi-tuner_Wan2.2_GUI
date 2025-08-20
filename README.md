@@ -4,7 +4,7 @@ A graphical user interface for WAN 2.2 LoRA training, built on top of the [kohya
 
 ## Overview
 
-This fork provides an intuitive visual interface for training LoRA adapters on WAN 2.2 models, supporting both high-noise and low-noise DiT architectures. The GUI handles complex parameter configurations, real-time monitoring, and automated caching processes while maintaining compatibility with the underlying Musubi Tuner ecosystem.
+This fork provides an intuitive visual interface for training LoRA adapters on WAN 2.2 models, supporting both high-noise and low-noise DiT architectures. The GUI handles complex parameter configurations, real-time monitoring.
 
 **Note**: This GUI is experimental and optimized for Windows systems. Other platforms may require adjustments.
 
@@ -42,7 +42,6 @@ This fork provides an intuitive visual interface for training LoRA adapters on W
 
 - **Settings Management**: Save/load configurations, auto-save on exit
 - **Input Validation**: Required field checking with visual feedback
-- **Caching Support**: Automated latent and text encoder caching
 - **Command Generation**: View and copy generated training commands
 - **Resume Training**: Checkpoint loading and advanced resumption options
 - **FP8 Compatibility**: Automatic precision adjustments with warnings
