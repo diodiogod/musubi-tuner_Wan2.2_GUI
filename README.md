@@ -174,6 +174,7 @@ Here are the four distinct methods for training both the High and Low noise mode
 
 ### 3. Combined (Single Run - Very High VRAM Usage)
 *This is the fastest and most efficient method, running a single unified process that trains both models simultaneously by keeping them both in VRAM.*
+Similar to AI toolkit when both models are selected with LOW VRAM "OFF"
 
 *   **How to Configure:**
     1.  Go to the **"Model Paths & Dataset"** tab and check **both** `Train High Noise Model` and `Train Low Noise Model`.
@@ -189,6 +190,7 @@ Here are the four distinct methods for training both the High and Low noise mode
 
 ### 4. Combined (Single Run - VRAM Saving Mode)
 *This method attempts a combined run on low-VRAM systems by constantly swapping the inactive model between VRAM and system RAM, causing a high performance bottleneck.*
+Similar to AI toolkit when both models are selected with LOW VRAM "ON"
 
 *   **How to Configure:**
     1.  Go to the **"Model Paths & Dataset"** tab and check **both** `Train High Noise Model` and `Train Low Noise Model`.
