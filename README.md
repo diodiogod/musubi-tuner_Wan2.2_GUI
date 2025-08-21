@@ -110,6 +110,7 @@ python musubi_tuner_gui.py
 
 ### Basic Workflow
 
+EDIT your .TOML dataset file in the dataset folder, IMPORTANT! Don't use backslashes "\" when you paste your dataset path, use "/" slashs instead (on notepad ++, CTRL+H to replace all backslashes)
 Launch ACCELERATE config (last tab, follow instructions, only once)
 
 1. **Configure Paths**
