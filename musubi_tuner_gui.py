@@ -274,8 +274,14 @@ class MusubiTunerGUI:
         other_frame = ttk.LabelFrame(frame, text="Other Options"); other_frame.pack(fill="x", padx=10, pady=10)
         fp8_frame = ttk.Frame(other_frame); fp8_frame.pack(fill='x')
         self._add_widget(fp8_frame, "fp8_base", "FP8 Base", "Use FP8 precision for the base model. Select a compatible mixed precision (fp16 or bf16).", kind='checkbox')
-        self._add_widget(fp8_frame, "fp8_scaled", "FP8 Scaled", "Use scaled FP8 training.", kind='checkbox')
+        self._add_widget(fp8_frame, "fp8_scaled", "FP8 Scaled", "Use scaled FP8 training with block-wise quantization for better accuracy.", kind='checkbox')
         self._add_widget(fp8_frame, "fp8_t5", "FP8 T5", "Use FP8 precision for the T5 text encoder.", kind='checkbox')
+        self._add_widget(fp8_frame, "fp8_llm", "FP8 LLM", "Use FP8 precision for LLM components. Only helps if NOT using cached text encoder outputs (rarely useful for WAN training).", kind='checkbox')
+
+        # WAN 2.2 specific options
+        wan22_frame = ttk.Frame(other_frame); wan22_frame.pack(fill='x')
+        self._add_widget(wan22_frame, "force_v2_1_time_embedding", "Force v2.1 Time Embedding", "Use Wan2.1 time embedding format for Wan2.2 (reduces VRAM usage).", kind='checkbox')
+
         self._add_widget(other_frame, "save_state", "Save State", "Save the complete training state (optimizer, etc.) to allow resuming later.", kind='checkbox', default_val=True)
         
         resume_frame = ttk.LabelFrame(frame, text="Resume Training"); resume_frame.pack(fill="x", padx=10, pady=10)
@@ -370,6 +376,30 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
         if value in ("", ".", "-"): return True
         try: float(value); return True
         except ValueError: return False
+
+    def _create_temp_cache_config(self, original_config_path):
+        """Create a temporary dataset config for caching that excludes image_directory"""
+        import tempfile
+        import shutil
+
+        # Create temp file
+        temp_config = tempfile.NamedTemporaryFile(mode='w', suffix='.toml', delete=False)
+
+        # Read original config and filter out image_directory
+        with open(original_config_path, 'r') as f:
+            content = f.read()
+
+        # Remove image_directory lines
+        filtered_lines = []
+        for line in content.split('\n'):
+            if not line.strip().startswith('image_directory'):
+                filtered_lines.append(line)
+
+        # Write filtered content
+        temp_config.write('\n'.join(filtered_lines))
+        temp_config.close()
+
+        return temp_config.name
 
     def update_button_states(self, event=None):
         try:
@@ -487,8 +517,8 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             "mixed_precision": "fp16", "gradient_accumulation_steps": "1",
             "max_data_loader_n_workers": "2", "blocks_to_swap": "10", "timestep_sampling": "shift",
             "num_timestep_buckets": "", "timestep_boundary": "875", "discrete_flow_shift": "3.0", "preserve_distribution_shape": False,
-            "gradient_checkpointing": True, "persistent_data_loader_workers": True, "save_state": True, 
-            "fp8_base": False, "fp8_scaled": False, "fp8_t5": False, "offload_inactive_dit": False,
+            "gradient_checkpointing": True, "persistent_data_loader_workers": True, "save_state": True,
+            "fp8_base": False, "fp8_scaled": False, "fp8_t5": False, "fp8_llm": False, "force_v2_1_time_embedding": False, "offload_inactive_dit": False,
             "attention_mechanism": "xformers", "resume_path": "", "network_weights": "",
             "log_with": "none", "logging_dir": "", "log_prefix": "",
             "recache_latents": False, "recache_text": False,
@@ -670,10 +700,22 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
         python_executable = sys.executable or "python"
         
         if settings.get("recache_latents"):
-            latents_cmd = [python_executable, "src/musubi_tuner/wan_cache_latents.py", "--dataset_config", settings["dataset_config"], "--vae", settings["vae_model"]]
+            # For i2v caching, create a temporary config without image_directory
+            dataset_config_path = settings["dataset_config"]
+            if settings.get("is_i2v"):
+                dataset_config_path = self._create_temp_cache_config(settings["dataset_config"])
+
+            latents_cmd = [python_executable, "src/musubi_tuner/wan_cache_latents.py", "--dataset_config", dataset_config_path, "--vae", settings["vae_model"]]
+            if settings.get("is_i2v"):
+                latents_cmd.append("--i2v")
             self.command_sequence.append(latents_cmd)
         if settings.get("recache_text"):
-            text_cmd = [python_executable, "src/musubi_tuner/wan_cache_text_encoder_outputs.py", "--dataset_config", settings["dataset_config"], "--t5", settings["t5_model"]]
+            # For i2v text caching, also use temporary config without image_directory
+            dataset_config_path = settings["dataset_config"]
+            if settings.get("is_i2v"):
+                dataset_config_path = self._create_temp_cache_config(settings["dataset_config"])
+
+            text_cmd = [python_executable, "src/musubi_tuner/wan_cache_text_encoder_outputs.py", "--dataset_config", dataset_config_path, "--t5", settings["t5_model"]]
             self.command_sequence.append(text_cmd)
         
         training_commands = self.build_training_commands()
@@ -701,8 +743,8 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
                     cmd_list.extend([key, str(normalize_path(clean_value) if is_path else clean_value)] if clean_value not in (True, "True") else [key])
 
             command = ["accelerate", "launch", "--num_cpu_threads_per_process", "1", "src/musubi_tuner/wan_train_network.py"]
-            add_arg(command, "--task", "t2v-A14B")
-            if settings.get("is_i2v"): add_arg(command, "--i2v", True)
+            task_type = "i2v-A14B" if settings.get("is_i2v") else "t2v-A14B"
+            add_arg(command, "--task", task_type)
             add_arg(command, "--mixed_precision", settings.get("mixed_precision"))
 
             add_arg(command, "--vae", settings.get("vae_model"), is_path=True); add_arg(command, "--t5", settings.get("t5_model"), is_path=True)
@@ -723,7 +765,8 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             
             attention = settings.get("attention_mechanism");
             if attention and attention != "none": command.append(f"--{attention}")
-            add_arg(command, "--fp8_base", settings.get("fp8_base")); add_arg(command, "--fp8_scaled", settings.get("fp8_scaled")); add_arg(command, "--fp8_t5", settings.get("fp8_t5"))
+            add_arg(command, "--fp8_base", settings.get("fp8_base")); add_arg(command, "--fp8_scaled", settings.get("fp8_scaled")); add_arg(command, "--fp8_t5", settings.get("fp8_t5")); add_arg(command, "--fp8_llm", settings.get("fp8_llm"))
+            add_arg(command, "--force_v2_1_time_embedding", settings.get("force_v2_1_time_embedding"))
             add_arg(command, "--optimizer_type", settings.get("optimizer_type")); add_arg(command, "--learning_rate", settings.get("learning_rate"))
             add_arg(command, "--max_grad_norm", settings.get("max_grad_norm")); add_arg(command, "--gradient_checkpointing", settings.get("gradient_checkpointing"))
             add_arg(command, "--gradient_accumulation_steps", settings.get("gradient_accumulation_steps"))
