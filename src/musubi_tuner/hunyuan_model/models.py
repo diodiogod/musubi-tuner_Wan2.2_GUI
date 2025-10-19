@@ -15,7 +15,7 @@ from musubi_tuner.hunyuan_model.posemb_layers import apply_rotary_emb
 from musubi_tuner.hunyuan_model.mlp_layers import MLP, MLPEmbedder, FinalLayer
 from musubi_tuner.hunyuan_model.modulate_layers import ModulateDiT, modulate, apply_gate
 from musubi_tuner.hunyuan_model.token_refiner import SingleTokenRefiner
-from musubi_tuner.modules.custom_offloading_utils import ModelOffloader, synchronize_device, clean_memory_on_device
+from musubi_tuner.modules.custom_offloading_utils import ModelOffloader, _synchronize_device as synchronize_device, _clean_memory_on_device as clean_memory_on_device
 from musubi_tuner.hunyuan_model.posemb_layers import get_nd_rotary_pos_embed
 
 from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen

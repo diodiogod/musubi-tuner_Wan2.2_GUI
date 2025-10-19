@@ -18,7 +18,7 @@ from musubi_tuner.hv_train_network import (
     setup_parser_common,
     read_config_from_file,
 )
-from musubi_tuner.modules.custom_offloading_utils import synchronize_device
+from musubi_tuner.modules.custom_offloading_utils import _synchronize_device as synchronize_device
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.wan_generate_video import parse_one_frame_inference_args
 
@@ -697,6 +697,11 @@ def wan_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
     )
     parser.add_argument("--vae_cache_cpu", action="store_true", help="cache features in VAE on CPU")
     parser.add_argument("--one_frame", action="store_true", help="Use one frame sampling method for sample generation")
+    parser.add_argument(
+        "--force_v2_1_time_embedding",
+        action="store_true",
+        help="Use Wan2.1 time embedding shape to reduce VRAM usage / VRAM使用量を削減するためにWan2.1のタイムエンベディング形状を使用",
+    )
 
     # Wan2.2 specific arguments
     parser.add_argument("--dit_high_noise", type=str, required=False, default=None, help="DiT checkpoint path for high noise model")
