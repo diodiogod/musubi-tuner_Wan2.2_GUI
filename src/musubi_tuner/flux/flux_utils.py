@@ -1,7 +1,7 @@
 import json
 import math
 from PIL import Image
-from typing import Callable, Optional, Union
+from typing import Optional, Union
 import einops
 import numpy as np
 import torch
@@ -102,7 +102,6 @@ def get_schedule(
     max_shift: float = 1.15,
     shift_value: Optional[float] = None,
 ) -> list[float]:
-
     # shifting the schedule to favor high timesteps for higher signal images
     # extra step for zero
     timesteps = torch.linspace(1, 0, num_steps + 1)
@@ -163,7 +162,7 @@ def load_flow_model(
     # if fp8_scaled is True, convert the model to fp8
     if fp8_scaled:
         # fp8 optimization: calculate on CUDA, move back to CPU if loading_device is CPU (block swap)
-        logger.info(f"Optimizing model weights to fp8. This may take a while.")
+        logger.info("Optimizing model weights to fp8. This may take a while.")
         sd = model.fp8_optimization(sd, device, move_to_device=loading_device.type == "cpu")
 
         if loading_device.type != "cpu":

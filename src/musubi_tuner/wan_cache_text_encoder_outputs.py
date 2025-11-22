@@ -1,10 +1,7 @@
 import argparse
-import os
-from typing import Optional, Union
+from typing import Optional
 
-import numpy as np
 import torch
-from tqdm import tqdm
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
@@ -18,7 +15,6 @@ from musubi_tuner.wan.configs import wan_t2v_14B
 import musubi_tuner.cache_text_encoder_outputs as cache_text_encoder_outputs
 import logging
 
-from musubi_tuner.utils.model_utils import str_to_dtype
 from musubi_tuner.wan.modules.t5 import T5EncoderModel
 
 logger = logging.getLogger(__name__)
@@ -81,6 +77,7 @@ def main():
     logger.info("Encoding with T5")
 
     def encode_for_text_encoder(batch: list[ItemInfo]):
+        nonlocal text_encoder, device, accelerator
         encode_and_save_batch(text_encoder, batch, device, accelerator)
 
     cache_text_encoder_outputs.process_text_encoder_batches(
@@ -95,7 +92,9 @@ def main():
     del text_encoder
 
     # remove cache files not in dataset
-    cache_text_encoder_outputs.post_process_cache_files(datasets, all_cache_files_for_dataset, all_cache_paths_for_dataset, args.keep_cache)
+    cache_text_encoder_outputs.post_process_cache_files(
+        datasets, all_cache_files_for_dataset, all_cache_paths_for_dataset, args.keep_cache
+    )
 
 
 def wan_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:

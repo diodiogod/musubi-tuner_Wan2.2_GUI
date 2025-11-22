@@ -1,17 +1,12 @@
-import argparse
 import logging
-import math
-import os
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import (
-    BaseDataset,
     ItemInfo,
     ARCHITECTURE_FLUX_KONTEXT,
     save_latent_cache_flux_kontext,
@@ -19,7 +14,6 @@ from musubi_tuner.dataset.image_video_dataset import (
 from musubi_tuner.flux import flux_utils
 from musubi_tuner.flux import flux_models
 import musubi_tuner.cache_latents as cache_latents
-from musubi_tuner.cache_latents import preprocess_contents
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -37,6 +31,7 @@ def preprocess_contents_flux_kontext(batch: List[ItemInfo]) -> tuple[torch.Tenso
 
         if isinstance(item.control_content[0], np.ndarray):
             control_image = item.control_content[0]  # np.ndarray
+            control_image = control_image[..., :3]  # ensure RGB, remove alpha if present
         else:
             control_image = item.control_content[0]  # PIL.Image
             control_image = control_image.convert("RGB")  # convert to RGB if RGBA
@@ -46,17 +41,10 @@ def preprocess_contents_flux_kontext(batch: List[ItemInfo]) -> tuple[torch.Tenso
     contents = contents.permute(0, 3, 1, 2)  # B, H, W, C -> B, C, H, W
     contents = contents / 127.5 - 1.0  # normalize to [-1, 1]
 
-    # we cannot stack controls because they are not the same size, so we keep them as a list
-
-    # trim to divisible by 16
-    for i in range(len(controls)):
-        h, w = controls[i].shape[:2]
-        h = math.floor(h / 16) * 16
-        w = math.floor(w / 16) * 16
-        controls[i] = controls[i][:h, :w, :]  # trim to divisible by 16
-
-    controls = [control.permute(2, 0, 1) for control in controls]  # H, W, C -> C, H, W
-    controls = [control / 127.5 - 1.0 for control in controls]
+    # we can stack controls because they are all the same size (bucketed)
+    controls = torch.stack(controls, dim=0)  # B, H, W, C
+    controls = controls.permute(0, 3, 1, 2)  # B, H, W, C -> B, C, H, W
+    controls = controls / 127.5 - 1.0  # normalize to [-1, 1]
 
     return contents, controls
 
@@ -74,17 +62,12 @@ def encode_and_save_batch(ae: flux_models.AutoEncoder, batch: List[ItemInfo]):
 
     with torch.no_grad():
         latents = ae.encode(contents.to(ae.device, dtype=ae.dtype))  # B, C, H, W
-
-        control_latents = []
-        for control in controls:
-            control = control.to(ae.device, dtype=ae.dtype).unsqueeze(0)
-            control_latent = ae.encode(control)
-            control_latents.append(control_latent.squeeze(0))  # B, C, H, W -> C, H, W
+        control_latents = ae.encode(controls.to(ae.device, dtype=ae.dtype))  # B, C, H, W
 
     # save cache for each item in the batch
     for b, item in enumerate(batch):
-        control_latent = control_latents[b]  # C, H, W
         target_latent = latents[b]  # C, H, W. Target latents for this image (ground truth)
+        control_latent = control_latents[b]  # C, H, W
 
         print(
             f"Saving cache for item {item.item_key} at {item.latent_cache_path}. control latents shape: {control_latent.shape}, target latents shape: {target_latent.shape}"
@@ -108,6 +91,10 @@ def main():
     # parser = flux_kontext_setup_parser(parser)
 
     args = parser.parse_args()
+
+    if args.disable_cudnn_backend:
+        logger.info("Disabling cuDNN PyTorch backend.")
+        torch.backends.cudnn.enabled = False
 
     if args.vae_dtype is not None:
         raise ValueError("VAE dtype is not supported in FLUX.1 Kontext.")

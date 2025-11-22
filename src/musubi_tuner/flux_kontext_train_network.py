@@ -1,18 +1,14 @@
 import argparse
 from typing import Optional
-from PIL import Image
 
 
 from einops import rearrange
-import numpy as np
 import torch
-import torchvision.transforms.functional as TF
 from tqdm import tqdm
-from accelerate import Accelerator, init_empty_weights
+from accelerate import Accelerator
 
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_FLUX_KONTEXT, ARCHITECTURE_FLUX_KONTEXT_FULL
 from musubi_tuner.flux import flux_models, flux_utils
-from musubi_tuner.hv_generate_video import resize_image_to_bucket
 from musubi_tuner.hv_train_network import (
     NetworkTrainer,
     load_prompts,
@@ -20,14 +16,13 @@ from musubi_tuner.hv_train_network import (
     setup_parser_common,
     read_config_from_file,
 )
-from musubi_tuner.wan_generate_video import parse_one_frame_inference_args
 
 import logging
 
+from musubi_tuner.utils import model_utils
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-from musubi_tuner.utils import model_utils
 
 
 class FluxKontextNetworkTrainer(NetworkTrainer):
@@ -74,7 +69,7 @@ class FluxKontextNetworkTrainer(NetworkTrainer):
         )
 
         # Encode with T5 and CLIP text encoders
-        logger.info(f"Encoding with T5 and CLIP text encoders")
+        logger.info("Encoding with T5 and CLIP text encoders")
 
         sample_prompts_te_outputs = {}  # (prompt) -> (t5, clip)
         with torch.amp.autocast(device_type=device.type, dtype=t5_dtype), torch.no_grad():
@@ -249,7 +244,7 @@ class FluxKontextNetworkTrainer(NetworkTrainer):
             pixels = vae.decode(latent)  # decode to pixels
         del latent
 
-        logger.info(f"Decoding complete")
+        logger.info("Decoding complete")
         pixels = pixels.to(torch.float32).cpu()
         pixels = (pixels / 2 + 0.5).clamp(0, 1)  # -1 to 1 -> 0 to 1
 
@@ -288,6 +283,12 @@ class FluxKontextNetworkTrainer(NetworkTrainer):
         )
         return model
 
+    def compile_transformer(self, args, transformer):
+        transformer: flux_models.Flux = transformer
+        return model_utils.compile_transformer(
+            args, transformer, [transformer.double_blocks, transformer.single_blocks], disable_linear=self.blocks_to_swap > 0
+        )
+
     def scale_shift_latents(self, latents):
         return latents
 
@@ -307,7 +308,7 @@ class FluxKontextNetworkTrainer(NetworkTrainer):
 
         bsize = latents.shape[0]
         latents = batch["latents"]  # B, C, H, W
-        control_latents = batch["control"]  # list of control latent, each is C, H, W
+        control_latents = batch["latents_control"]  # B, C, H, W
 
         # pack latents
         packed_latent_height = latents.shape[2] // 2
@@ -316,30 +317,13 @@ class FluxKontextNetworkTrainer(NetworkTrainer):
 
         img_ids = flux_utils.prepare_img_ids(bsize, packed_latent_height, packed_latent_width)
 
-        # calculate max control latent length
-        control_latent_lengths = [cl.shape[1] * cl.shape[2] // 4 for cl in control_latents]
-        max_control_length = max(control_latent_lengths)
+        # pack control latents
+        packed_control_latent_height = control_latents.shape[2] // 2
+        packed_control_latent_width = control_latents.shape[3] // 2
+        control_latents = rearrange(control_latents, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+        control_latent_lengths = [control_latents.shape[1]] * bsize
 
-        # pack and pad control latents
-        dim = control_latents[0].shape[0] * 2 * 2
-        dtype = control_latents[0].dtype
-        device = control_latents[0].device
-        padded_control_latents = torch.zeros(bsize, max_control_length, dim, dtype=dtype, device=device)
-        padded_control_ids = torch.zeros(bsize, max_control_length, 3)
-
-        for i, control_latent in enumerate(control_latents):
-            ctrl_packed_height = control_latent.shape[1] // 2
-            ctrl_packed_width = control_latent.shape[2] // 2
-            control_latent = rearrange(control_latent, "c (h ph) (w pw) -> (h w) (c ph pw)", ph=2, pw=2)
-            control_latent_ids = flux_utils.prepare_img_ids(1, ctrl_packed_height, ctrl_packed_width, is_ctrl=True)[0]
-            # print(f"control_latent shape: {control_latent.shape}, control_latent_ids shape: {control_latent_ids.shape}")
-
-            padded_control_latents[i, : control_latent.shape[0], :] = control_latent
-            padded_control_ids[i, : control_latent_ids.shape[0], :] = control_latent_ids
-
-        control_latents = padded_control_latents
-        control_ids = padded_control_ids
-        del padded_control_latents, padded_control_ids
+        control_ids = flux_utils.prepare_img_ids(bsize, packed_control_latent_height, packed_control_latent_width, is_ctrl=True)
 
         # context
         t5_vec = batch["t5_vec"]  # B, T, D

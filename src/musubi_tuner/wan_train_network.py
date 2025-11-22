@@ -1,5 +1,4 @@
 import argparse
-import random
 from typing import List, Optional
 from PIL import Image
 
@@ -7,7 +6,7 @@ import numpy as np
 import torch
 import torchvision.transforms.functional as TF
 from tqdm import tqdm
-from accelerate import Accelerator, init_empty_weights
+from accelerate import Accelerator
 
 from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_WAN, ARCHITECTURE_WAN_FULL, load_video
 from musubi_tuner.hv_generate_video import resize_image_to_bucket
@@ -18,7 +17,7 @@ from musubi_tuner.hv_train_network import (
     setup_parser_common,
     read_config_from_file,
 )
-from musubi_tuner.modules.custom_offloading_utils import _synchronize_device as synchronize_device
+from musubi_tuner.utils.device_utils import synchronize_device
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.wan_generate_video import parse_one_frame_inference_args
 
@@ -28,7 +27,6 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 from musubi_tuner.utils import model_utils
-from musubi_tuner.utils.safetensors_utils import load_safetensors, MemoryEfficientSafeOpen
 from musubi_tuner.wan.configs import WAN_CONFIGS
 from musubi_tuner.wan.modules.clip import CLIPModel
 from musubi_tuner.wan.modules.model import WanModel, detect_wan_sd_dtype, load_wan_model
@@ -81,12 +79,12 @@ class WanNetworkTrainer(NetworkTrainer):
 
         if self.high_low_training:
             if args.blocks_to_swap is not None and args.blocks_to_swap > 0:
-                assert (
-                    not args.offload_inactive_dit
-                ), "Block swap is not supported with offloading inactive DiT / 非アクティブDiTをオフロードする設定ではブロックスワップはサポートされていません"
+                assert not args.offload_inactive_dit, (
+                    "Block swap is not supported with offloading inactive DiT / 非アクティブDiTをオフロードする設定ではブロックスワップはサポートされていません"
+                )
             if args.num_timestep_buckets is not None:
                 logger.warning(
-                    f"num_timestep_buckets is not working well with high and low models training / high and lowモデルのトレーニングではnum_timestep_bucketsがうまく機能しません"
+                    "num_timestep_buckets is not working well with high and low models training / high and lowモデルのトレーニングではnum_timestep_bucketsがうまく機能しません"
                 )
 
         self.timestep_boundary = (
@@ -159,7 +157,7 @@ class WanNetworkTrainer(NetworkTrainer):
             clip = CLIPModel(dtype=config.clip_dtype, device=device, weight_path=clip_path)
             clip.model.to(device)
 
-            logger.info(f"Encoding image to CLIP context")
+            logger.info("Encoding image to CLIP context")
             with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
                 for image_path in sample_prompts_image_embs:
                     logger.info(f"Encoding image: {image_path}")
@@ -409,7 +407,7 @@ class WanNetworkTrainer(NetworkTrainer):
         prompt_idx = sample_parameter.get("enum", 0)
         latent = noise
         with torch.no_grad():
-            for i, t in enumerate(tqdm(timesteps, desc=f"Sampling timesteps for prompt {prompt_idx+1}")):
+            for i, t in enumerate(tqdm(timesteps, desc=f"Sampling timesteps for prompt {prompt_idx + 1}")):
                 latent_model_input = [latent.to(device=device)]
                 timestep = t.unsqueeze(0)
 
@@ -444,7 +442,7 @@ class WanNetworkTrainer(NetworkTrainer):
         video = video.unsqueeze(0)  # add batch dim
         del latent
 
-        logger.info(f"Decoding complete")
+        logger.info("Decoding complete")
         video = video.to(torch.float32).cpu()
         video = (video / 2 + 0.5).clamp(0, 1)  # -1 to 1 -> 0 to 1
 
@@ -472,8 +470,19 @@ class WanNetworkTrainer(NetworkTrainer):
         dit_weight_dtype: Optional[torch.dtype],
     ):
         model = load_wan_model(
-            self.config, accelerator.device, dit_path, attn_mode, split_attn, loading_device, dit_weight_dtype, args.fp8_scaled
+            self.config,
+            accelerator.device,
+            dit_path,
+            attn_mode,
+            split_attn,
+            loading_device,
+            dit_weight_dtype,
+            args.fp8_scaled,
+            disable_numpy_memmap=args.disable_numpy_memmap,
         )
+        if args.force_v2_1_time_embedding:
+            model.set_time_embedding_v2_1(True)
+
         if self.high_low_training:
             # load high noise model
             logger.info(f"Loading high noise model from {self.dit_high_noise_path}")
@@ -486,7 +495,10 @@ class WanNetworkTrainer(NetworkTrainer):
                 "cpu" if args.offload_inactive_dit else loading_device,
                 dit_weight_dtype,
                 args.fp8_scaled,
+                disable_numpy_memmap=args.disable_numpy_memmap,
             )
+            if args.force_v2_1_time_embedding:
+                model_high_noise.set_time_embedding_v2_1(True)
             if self.blocks_to_swap > 0:
                 # This moves the weights to the appropriate device
                 logger.info(f"Prepare block swap for high noise model, blocks_to_swap={self.blocks_to_swap}")
@@ -504,6 +516,10 @@ class WanNetworkTrainer(NetworkTrainer):
             self.next_model_is_high_noise = False
 
         return model
+
+    def compile_transformer(self, args, transformer):
+        transformer: WanModel = transformer
+        return model_utils.compile_transformer(args, transformer, [transformer.blocks], disable_linear=self.blocks_to_swap > 0)
 
     def scale_shift_latents(self, latents):
         return latents
@@ -563,6 +579,17 @@ class WanNetworkTrainer(NetworkTrainer):
 
     def swap_high_low_weights(self, args: argparse.Namespace, accelerator: Accelerator, model: WanModel):
         if self.current_model_is_high_noise != self.next_model_is_high_noise:
+
+            def patch_fn(state_dict):
+                if not args.compile:
+                    return state_dict
+                for key in list(state_dict.keys()):
+                    if key.startswith("blocks.") and "._orig_mod." not in key:
+                        tokens = key.split(".")
+                        new_key = ".".join(tokens[:2] + ["_orig_mod"] + tokens[2:])
+                        state_dict[new_key] = state_dict.pop(key)
+                return state_dict
+
             if self.blocks_to_swap == 0:
                 # If offloading inactive DiT, move the model to CPU first
                 if args.offload_inactive_dit:
@@ -572,7 +599,7 @@ class WanNetworkTrainer(NetworkTrainer):
 
                 state_dict = model.state_dict()  # CPU or accelerator.device
 
-                info = model.load_state_dict(self.dit_inactive_state_dict, strict=True, assign=True)
+                info = model.load_state_dict(patch_fn(self.dit_inactive_state_dict), strict=True, assign=True)
                 assert len(info.missing_keys) == 0, f"Missing keys: {info.missing_keys}"
                 assert len(info.unexpected_keys) == 0, f"Unexpected keys: {info.unexpected_keys}"
 
@@ -585,7 +612,7 @@ class WanNetworkTrainer(NetworkTrainer):
                 # If block swap is enabled, we cannot use offloading inactive DiT, because weights are partially on CPU
                 state_dict = model.state_dict()  # CPU or accelerator.device
 
-                info = model.load_state_dict(self.dit_inactive_state_dict, strict=True, assign=True)
+                info = model.load_state_dict(patch_fn(self.dit_inactive_state_dict), strict=True, assign=True)
                 assert len(info.missing_keys) == 0, f"Missing keys: {info.missing_keys}"
                 assert len(info.unexpected_keys) == 0, f"Unexpected keys: {info.unexpected_keys}"
 
@@ -697,13 +724,11 @@ def wan_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
     )
     parser.add_argument("--vae_cache_cpu", action="store_true", help="cache features in VAE on CPU")
     parser.add_argument("--one_frame", action="store_true", help="Use one frame sampling method for sample generation")
-    parser.add_argument(
-        "--force_v2_1_time_embedding",
-        action="store_true",
-        help="Use Wan2.1 time embedding shape to reduce VRAM usage / VRAM使用量を削減するためにWan2.1のタイムエンベディング形状を使用",
-    )
 
     # Wan2.2 specific arguments
+    parser.add_argument(
+        "--force_v2_1_time_embedding", action="store_true", help="Force using 2.1 style time embedding even for Wan 2.2"
+    )
     parser.add_argument("--dit_high_noise", type=str, required=False, default=None, help="DiT checkpoint path for high noise model")
     parser.add_argument(
         "--timestep_boundary",

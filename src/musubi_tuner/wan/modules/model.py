@@ -10,7 +10,8 @@ from accelerate import init_empty_weights
 import logging
 
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
-from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, load_safetensors
+from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
+from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -389,12 +390,15 @@ class WanAttentionBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
         self.gradient_checkpointing = False
+        self.activation_cpu_offloading = False
 
-    def enable_gradient_checkpointing(self):
+    def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False):
         self.gradient_checkpointing = True
+        self.activation_cpu_offloading = activation_cpu_offloading
 
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
+        self.activation_cpu_offloading = False
 
     def _forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens):
         r"""
@@ -413,15 +417,19 @@ class WanAttentionBlock(nn.Module):
             assert e[0].dtype == torch.float32
 
             # self-attention
-            y = self.self_attn((self.norm1(x).float() * (1 + e[1]) + e[0]).to(org_dtype), seq_lens, grid_sizes, freqs)
-            x = (x + y.to(torch.float32) * e[2]).to(org_dtype)
+            # y = self.self_attn((self.norm1(x).float() * (1 + e[1]) + e[0]).to(org_dtype), seq_lens, grid_sizes, freqs)
+            y = self.self_attn(torch.addcmul(e[0], self.norm1(x).float(), (1 + e[1])).to(org_dtype), seq_lens, grid_sizes, freqs)
+            # x = (x + y.to(torch.float32) * e[2]).to(org_dtype)
+            x = torch.addcmul(x, y.to(torch.float32), e[2]).to(org_dtype)
             del y
 
             # cross-attention & ffn
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             del context
-            y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).to(org_dtype))
-            x = (x + y.to(torch.float32) * e[5]).to(org_dtype)
+            # y = self.ffn((self.norm2(x).float() * (1 + e[4]) + e[3]).to(org_dtype))
+            y = self.ffn(torch.addcmul(e[3], self.norm2(x).float(), (1 + e[4])).to(org_dtype))
+            # x = (x + y.to(torch.float32) * e[5]).to(org_dtype)
+            x = torch.addcmul(x, y.to(torch.float32), e[5]).to(org_dtype)
             del y
         else:  # For Wan2.2
             e = self.modulation.to(torch.float32) + e
@@ -429,24 +437,33 @@ class WanAttentionBlock(nn.Module):
             assert e[0].dtype == torch.float32
 
             # self-attention
+            # y = self.self_attn(
+            #     (self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2)).to(org_dtype), seq_lens, grid_sizes, freqs
+            # )
             y = self.self_attn(
-                (self.norm1(x).float() * (1 + e[1].squeeze(2)) + e[0].squeeze(2)).to(org_dtype), seq_lens, grid_sizes, freqs
+                torch.addcmul(e[0].squeeze(2), self.norm1(x).float(), (1 + e[1].squeeze(2))).to(org_dtype), seq_lens, grid_sizes, freqs
             )
-            x = (x + y.to(torch.float32) * e[2].squeeze(2)).to(org_dtype)
+            # x = (x + y.to(torch.float32) * e[2].squeeze(2)).to(org_dtype)
+            x = torch.addcmul(x, y.to(torch.float32), e[2].squeeze(2)).to(org_dtype)
             del y
 
             # cross-attention & ffn
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
             del context
-            y = self.ffn((self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2)).to(org_dtype))
-            x = (x + y.to(torch.float32) * e[5].squeeze(2)).to(org_dtype)
+            # y = self.ffn((self.norm2(x).float() * (1 + e[4].squeeze(2)) + e[3].squeeze(2)).to(org_dtype))
+            y = self.ffn(torch.addcmul(e[3].squeeze(2), self.norm2(x).float(), (1 + e[4].squeeze(2))).to(org_dtype))
+            # x = (x + y.to(torch.float32) * e[5].squeeze(2)).to(org_dtype)
+            x = torch.addcmul(x, y.to(torch.float32), e[5].squeeze(2)).to(org_dtype)
             del y
 
         return x
 
     def forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens):
         if self.training and self.gradient_checkpointing:
-            return checkpoint(self._forward, x, e, seq_lens, grid_sizes, freqs, context, context_lens, use_reentrant=False)
+            forward_fn = self._forward
+            if self.activation_cpu_offloading:
+                forward_fn = create_cpu_offloading_wrapper(forward_fn, self.modulation.device)
+            return checkpoint(forward_fn, x, e, seq_lens, grid_sizes, freqs, context, context_lens, use_reentrant=False)
         return self._forward(x, e, seq_lens, grid_sizes, freqs, context, context_lens)
 
 
@@ -477,10 +494,12 @@ class Head(nn.Module):
         assert e.dtype == torch.float32
         if self.model_version == "2.1":
             e = (self.modulation.to(torch.float32) + e.unsqueeze(1)).chunk(2, dim=1)
-            x = self.head(self.norm(x) * (1 + e[1]) + e[0])
+            # x = self.head(self.norm(x) * (1 + e[1]) + e[0])
+            x = self.head(torch.addcmul(e[0], self.norm(x), (1 + e[1])))
         else:  # For Wan2.2
             e = (self.modulation.unsqueeze(0).to(torch.float32) + e.unsqueeze(2)).chunk(2, dim=2)
-            x = self.head(self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2))
+            # x = self.head(self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2))
+            x = self.head(torch.addcmul(e[0].squeeze(2), self.norm(x), (1 + e[1].squeeze(2))))
 
         return x
 
@@ -624,6 +643,7 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
 
         self.time_embedding = nn.Sequential(nn.Linear(freq_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.time_projection = nn.Sequential(nn.SiLU(), nn.Linear(dim, dim * 6))
+        self.force_v2_1_time_embedding = False  # Override to use 2.1 style time embedding for 2.2 model
 
         # blocks
         cross_attn_type = "t2v_cross_attn" if model_type == "t2v" else "i2v_cross_attn"
@@ -664,6 +684,7 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         self.init_weights()
 
         self.gradient_checkpointing = False
+        self.activation_cpu_offloading = False
 
         # offloading
         self.blocks_to_swap = None
@@ -676,6 +697,11 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
     @property
     def device(self):
         return self.patch_embedding.weight.device
+
+    def set_time_embedding_v2_1(self, force_v2_1_time_embedding: bool):
+        self.force_v2_1_time_embedding = force_v2_1_time_embedding
+        if force_v2_1_time_embedding:
+            logger.info("WanModel: Using 2.1 style time embedding for time_projection.")
 
     def fp8_optimization(
         self, state_dict: dict[str, torch.Tensor], device: torch.device, move_to_device: bool, use_scaled_mm: bool = False
@@ -701,23 +727,25 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
 
         return state_dict
 
-    def enable_gradient_checkpointing(self):
+    def enable_gradient_checkpointing(self, activation_cpu_offloading=False):
         self.gradient_checkpointing = True
+        self.activation_cpu_offloading = activation_cpu_offloading
 
         for block in self.blocks:
-            block.enable_gradient_checkpointing()
+            block.enable_gradient_checkpointing(activation_cpu_offloading)
 
-        print(f"WanModel: Gradient checkpointing enabled.")
+        print(f"WanModel: Gradient checkpointing enabled. Activation CPU offloading: {activation_cpu_offloading}")
 
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
+        self.activation_cpu_offloading = False
 
         for block in self.blocks:
             block.disable_gradient_checkpointing()
 
         print(f"WanModel: Gradient checkpointing disabled.")
 
-    def enable_block_swap(self, blocks_to_swap: int, device: torch.device, supports_backward: bool):
+    def enable_block_swap(self, blocks_to_swap: int, device: torch.device, supports_backward: bool, use_pinned_memory: bool = False):
         self.blocks_to_swap = blocks_to_swap
         self.num_blocks = len(self.blocks)
 
@@ -726,7 +754,7 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         ), f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
 
         self.offloader = ModelOffloader(
-            "wan_attn_block", self.blocks, self.num_blocks, self.blocks_to_swap, supports_backward, device  # , debug=True
+            "wan_attn_block", self.blocks, self.num_blocks, self.blocks_to_swap, supports_backward, device, use_pinned_memory  # , debug=True
         )
         print(
             f"WanModel: Block swap enabled. Swapping {self.blocks_to_swap} blocks out of {self.num_blocks} blocks. Supports backward: {supports_backward}"
@@ -820,9 +848,15 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
         # time embeddings
         # with amp.autocast(dtype=torch.float32):
         with torch.amp.autocast(device_type=device.type, dtype=torch.float32):
-            if self.model_version == "2.1":
+            if self.model_version == "2.1" or self.force_v2_1_time_embedding:  # For Wan2.1
                 e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
                 e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+                # e0: torch.Size([1, 6, 5120]), e: torch.Size([1, 5120]), t: torch.Size([1])
+
+                if self.model_version != "2.1":  # Reshape to be compatible with 2.2 blocks
+                    e0 = e0.unsqueeze(1)
+                    e = e.unsqueeze(1)
+                    t = t.unsqueeze(1).expand(-1, seq_len)
             else:  # For Wan2.2
                 if t.dim() == 1:
                     # t = t.expand(t.size(0), seq_len) # this should be a bug in the original code
@@ -831,6 +865,8 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
                 t = t.flatten()
                 e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).unflatten(0, (bt, seq_len)).float())
                 e0 = self.time_projection(e).unflatten(2, (6, self.dim))
+                # e0: torch.Size([1, 14040, 6, 5120]), e: torch.Size([1, 14040, 5120]), t: torch.Size([14040])
+
         assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # context
@@ -852,6 +888,7 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
             clean_memory_on_device(device)
 
         # print(f"x: {x.shape}, e: {e0.shape}, context: {context.shape}, seq_lens: {seq_lens}")
+        input_device = x.device
         for block_idx, block in enumerate(self.blocks):
             is_block_skipped = skip_block_indices is not None and block_idx in skip_block_indices
 
@@ -863,6 +900,9 @@ class WanModel(nn.Module):  # ModelMixin, ConfigMixin):
 
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks_forward(self.blocks, block_idx)
+
+        if x.device != input_device:
+            x = x.to(input_device)
 
         # head
         x = self.head(x, e)
@@ -949,6 +989,7 @@ def load_wan_model(
     lora_weights_list: Optional[Dict[str, torch.Tensor]] = None,
     lora_multipliers: Optional[List[float]] = None,
     use_scaled_mm: bool = False,
+    disable_numpy_memmap: bool = False,
 ) -> WanModel:
     """
     Load a WAN model from the specified checkpoint.
@@ -965,6 +1006,8 @@ def load_wan_model(
         fp8_scaled (bool): Whether to use fp8 scaling for the model weights.
         lora_weights_list (Optional[Dict[str, torch.Tensor]]): LoRA weights to apply, if any.
         lora_multipliers (Optional[List[float]]): LoRA multipliers for the weights, if any.
+        use_scaled_mm (bool): Whether to use scaled matrix multiplication for fp8.
+        disable_numpy_memmap (bool): Whether to disable numpy memmap when loading weights.
     """
     # dit_weight_dtype is None for fp8_scaled
     assert (not fp8_scaled and dit_weight_dtype is not None) or (fp8_scaled and dit_weight_dtype is None)
@@ -1006,6 +1049,7 @@ def load_wan_model(
         move_to_device=(loading_device == device),
         target_keys=FP8_OPTIMIZATION_TARGET_KEYS,
         exclude_keys=FP8_OPTIMIZATION_EXCLUDE_KEYS,
+        disable_numpy_memmap=disable_numpy_memmap,
     )
 
     # remove "model.diffusion_model." prefix: 1.3B model has this prefix

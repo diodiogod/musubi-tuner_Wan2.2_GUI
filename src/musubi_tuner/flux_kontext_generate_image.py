@@ -1,36 +1,27 @@
 import argparse
-from datetime import datetime
-import gc
-import json
+from importlib.util import find_spec
 import random
 import os
-import re
 import time
-import math
 import copy
-from typing import Tuple, Optional, List, Union, Any, Dict
+from typing import Tuple, Optional, List, Any, Dict
 
-from einops import rearrange, repeat
+from einops import rearrange
 import torch
 from safetensors.torch import load_file, save_file
 from safetensors import safe_open
-from PIL import Image
-import numpy as np
 from tqdm import tqdm
 
 from musubi_tuner.flux import flux_utils
 from musubi_tuner.flux.flux_utils import load_flow_model
 from musubi_tuner.flux import flux_models
-from musubi_tuner.dataset import image_video_dataset
+from musubi_tuner.utils import model_utils
 
-try:
-    from lycoris.kohya import create_network_from_weights
-except:
-    pass
+lycoris_available = find_spec("lycoris") is not None
 
 from musubi_tuner.networks import lora_flux
 from musubi_tuner.utils.device_utils import clean_memory_on_device
-from musubi_tuner.hv_generate_video import get_time_flag, save_images_grid, synchronize_device
+from musubi_tuner.hv_generate_video import get_time_flag, save_images_grid, setup_parser_compile, synchronize_device
 from musubi_tuner.wan_generate_video import merge_lora_weights
 
 import logging
@@ -119,6 +110,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--blocks_to_swap", type=int, default=0, help="number of blocks to swap in the model")
     parser.add_argument(
+        "--use_pinned_memory_for_block_swap",
+        action="store_true",
+        help="use pinned memory for block swapping, which may speed up data transfer between CPU and GPU but uses more shared GPU memory on Windows",
+    )
+    parser.add_argument(
         "--output_type",
         type=str,
         default="images",
@@ -127,15 +123,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
-    parser.add_argument("--lycoris", action="store_true", help="use lycoris for inference")
-    # parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
-    # parser.add_argument(
-    #     "--compile_args",
-    #     nargs=4,
-    #     metavar=("BACKEND", "MODE", "DYNAMIC", "FULLGRAPH"),
-    #     default=["inductor", "max-autotune-no-cudagraphs", "False", "False"],
-    #     help="Torch.compile settings",
-    # )
+    parser.add_argument(
+        "--lycoris", action="store_true", help=f"use lycoris for inference{'' if lycoris_available else ' (not available)'}"
+    )
+    setup_parser_compile(parser)
 
     # New arguments for batch and interactive modes
     parser.add_argument("--from_file", type=str, default=None, help="Read prompts from a file")
@@ -150,6 +141,9 @@ def parse_args() -> argparse.Namespace:
     if args.latent_path is None or len(args.latent_path) == 0:
         if args.prompt is None and not args.from_file and not args.interactive:
             raise ValueError("Either --prompt, --from_file or --interactive must be specified")
+
+    if args.lycoris and not lycoris_available:
+        raise ValueError("install lycoris: https://github.com/KohakuBlueleaf/LyCORIS")
 
     return args
 
@@ -313,29 +307,21 @@ def optimize_model(model: flux_models.Flux, args: argparse.Namespace, device: to
         if target_device is not None and target_dtype is not None:
             model.to(target_device, target_dtype)  # move and cast  at the same time. this reduces redundant copy operations
 
-    # if args.compile:
-    #     compile_backend, compile_mode, compile_dynamic, compile_fullgraph = args.compile_args
-    #     logger.info(
-    #         f"Torch Compiling[Backend: {compile_backend}; Mode: {compile_mode}; Dynamic: {compile_dynamic}; Fullgraph: {compile_fullgraph}]"
-    #     )
-    #     torch._dynamo.config.cache_size_limit = 32
-    #     for i in range(len(model.blocks)):
-    #         model.blocks[i] = torch.compile(
-    #             model.blocks[i],
-    #             backend=compile_backend,
-    #             mode=compile_mode,
-    #             dynamic=compile_dynamic.lower() in "true",
-    #             fullgraph=compile_fullgraph.lower() in "true",
-    #         )
-
     if args.blocks_to_swap > 0:
         logger.info(f"Enable swap {args.blocks_to_swap} blocks to CPU from device: {device}")
-        model.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
+        model.enable_block_swap(
+            args.blocks_to_swap, device, supports_backward=False, use_pinned_memory=args.use_pinned_memory_for_block_swap
+        )
         model.move_to_device_except_swap_blocks(device)
         model.prepare_block_swap_before_forward()
     else:
         # make sure the model is on the right device
         model.to(device)
+
+    if args.compile:
+        model = model_utils.compile_transformer(
+            args, model, [model.double_blocks, model.single_blocks], disable_linear=args.blocks_to_swap > 0
+        )
 
     model.eval().requires_grad_(False)
     clean_memory_on_device(device)
@@ -345,7 +331,7 @@ def optimize_model(model: flux_models.Flux, args: argparse.Namespace, device: to
 
 
 def decode_latent(ae: flux_models.AutoEncoder, latent: torch.Tensor, device: torch.device) -> torch.Tensor:
-    logger.info(f"Decoding image...")
+    logger.info("Decoding image...")
     if latent.ndim == 3:
         latent = latent.unsqueeze(0)  # add batch dimension
 
@@ -363,13 +349,11 @@ def prepare_image_inputs(args: argparse.Namespace, device: torch.device, ae: flu
     """Prepare image-related inputs for Kontext: AE encoding."""
     height, width = check_inputs(args)
 
-    from musubi_tuner.utils.image_utils import preprocess_image
-
     if args.control_image_path is not None:
         control_image_tensor, _, _ = flux_utils.preprocess_control_image(args.control_image_path, not args.no_resize_control)
 
         # AE encoding
-        logger.info(f"Encoding control image to latent space with AE")
+        logger.info("Encoding control image to latent space with AE")
         ae_original_device = ae.device
         ae.to(device)
 
@@ -414,7 +398,7 @@ def prepare_text_inputs(
     text_encoder1_original_device = text_encoder1.device if text_encoder1 else None
     text_encoder2_original_device = text_encoder2.device if text_encoder2 else None
 
-    logger.info(f"Encoding prompt with Text Encoders")
+    logger.info("Encoding prompt with Text Encoders")
 
     # Ensure text_encoder1 and text_encoder2 are not None before proceeding
     if not text_encoder1 or not text_encoder2 or not tokenizer1 or not tokenizer2:
@@ -873,7 +857,7 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
     ae_for_batch.to(device)
 
     for i, prompt_args_item in enumerate(all_prompt_args_list):
-        logger.info(f"Image preprocessing for prompt {i+1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
+        logger.info(f"Image preprocessing for prompt {i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
         # prepare_image_inputs will move ae/image_encoder to device temporarily
         image_data = prepare_image_inputs(prompt_args_item, device, ae_for_batch)
         all_precomputed_image_data.append(image_data)
@@ -910,7 +894,7 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
     }
 
     for i, prompt_args_item in enumerate(all_prompt_args_list):
-        logger.info(f"Text preprocessing for prompt {i+1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
+        logger.info(f"Text preprocessing for prompt {i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
         # prepare_text_inputs will move text_encoders to device temporarily
         text_data = prepare_text_inputs(prompt_args_item, device, temp_shared_models_txt)
         all_precomputed_text_data.append(text_data)
@@ -957,7 +941,7 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
             current_image_data = all_precomputed_image_data[i]
             current_text_data = all_precomputed_text_data[i]
 
-            logger.info(f"Generating latent for prompt {i+1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
+            logger.info(f"Generating latent for prompt {i + 1}/{len(all_prompt_args_list)}: {prompt_args_item.prompt}")
             try:
                 # generate is called with precomputed data, so it won't load VAE/Text/Image encoders.
                 # It will use the DiT model from shared_models_for_generate.
@@ -999,11 +983,11 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
 
         for i, latent in enumerate(all_latents):
             if latent is None:  # Skip failed generations
-                logger.warning(f"Skipping decoding for prompt {i+1} due to previous error.")
+                logger.warning(f"Skipping decoding for prompt {i + 1} due to previous error.")
                 continue
 
             current_args = all_prompt_args_list[i]
-            logger.info(f"Decoding output {i+1}/{len(all_latents)} for prompt: {current_args.prompt}")
+            logger.info(f"Decoding output {i + 1}/{len(all_latents)} for prompt: {current_args.prompt}")
 
             # if args.output_type is "latent_images", we already saved latent above.
             # so we skip saving latent here.

@@ -1,8 +1,6 @@
-import importlib.metadata
 import math
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 try:
@@ -17,12 +15,12 @@ except ImportError:
     flash_attn_func = None
 
 try:
-    print(f"Trying to import sageattention")
+    print("Trying to import sageattention")
     from sageattention import sageattn_varlen, sageattn
 
     print("Successfully imported sageattention")
 except ImportError:
-    print(f"Failed to import sageattention")
+    print("Failed to import sageattention")
     sageattn_varlen = None
     sageattn = None
 
@@ -201,7 +199,7 @@ def attention(
             del q, k, v
         else:
             x = flash_attn_func(q, k, v, dropout_p=drop_rate, causal=causal)
-            del q, k, v
+            del q, k, v  # this causes error in compiled mode with fullgraph=True
 
     elif mode == "sageattn":
         x = sageattn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)

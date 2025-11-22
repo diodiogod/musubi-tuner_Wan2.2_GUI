@@ -1,5 +1,5 @@
 import os
-from typing import Any, List, Tuple, Optional, Union, Dict
+from typing import List, Tuple, Optional, Union, Dict
 import accelerate
 from einops import rearrange
 
@@ -15,10 +15,12 @@ from musubi_tuner.hunyuan_model.posemb_layers import apply_rotary_emb
 from musubi_tuner.hunyuan_model.mlp_layers import MLP, MLPEmbedder, FinalLayer
 from musubi_tuner.hunyuan_model.modulate_layers import ModulateDiT, modulate, apply_gate
 from musubi_tuner.hunyuan_model.token_refiner import SingleTokenRefiner
-from musubi_tuner.modules.custom_offloading_utils import ModelOffloader, _synchronize_device as synchronize_device, _clean_memory_on_device as clean_memory_on_device
+from musubi_tuner.modules.custom_offloading_utils import ModelOffloader
+from musubi_tuner.utils.device_utils import synchronize_device, clean_memory_on_device
 from musubi_tuner.hunyuan_model.posemb_layers import get_nd_rotary_pos_embed
 
-from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
+from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
+from musubi_tuner.utils.safetensors_utils import load_safetensors
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -107,6 +109,7 @@ class MMDoubleStreamBlock(nn.Module):
         self.hybrid_seq_parallel_attn = None
 
         self.gradient_checkpointing = False
+        self.activation_cpu_offloading = False
 
     def enable_deterministic(self):
         self.deterministic = True
@@ -114,11 +117,13 @@ class MMDoubleStreamBlock(nn.Module):
     def disable_deterministic(self):
         self.deterministic = False
 
-    def enable_gradient_checkpointing(self):
+    def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False):
         self.gradient_checkpointing = True
+        self.activation_cpu_offloading = activation_cpu_offloading
 
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
+        self.activation_cpu_offloading = False
 
     def _forward(
         self,
@@ -156,9 +161,9 @@ class MMDoubleStreamBlock(nn.Module):
             img_q_shape = img_q.shape
             img_k_shape = img_k.shape
             img_q, img_k = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
-            assert (
-                img_q.shape == img_q_shape and img_k.shape == img_k_shape
-            ), f"img_kk: {img_q.shape}, img_q: {img_q_shape}, img_kk: {img_k.shape}, img_k: {img_k_shape}"
+            assert img_q.shape == img_q_shape and img_k.shape == img_k_shape, (
+                f"img_kk: {img_q.shape}, img_q: {img_q_shape}, img_kk: {img_k.shape}, img_k: {img_k_shape}"
+            )
             # img_q, img_k = img_qq, img_kk
 
         # Prepare txt for attention.
@@ -183,9 +188,9 @@ class MMDoubleStreamBlock(nn.Module):
         v = torch.cat((img_v, txt_v), dim=1)
         img_v = txt_v = None
 
-        assert (
-            cu_seqlens_q.shape[0] == 2 * img.shape[0] + 1
-        ), f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, img.shape[0]:{img.shape[0]}"
+        assert cu_seqlens_q.shape[0] == 2 * img.shape[0] + 1, (
+            f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, img.shape[0]:{img.shape[0]}"
+        )
 
         # attention computation start
         if not self.hybrid_seq_parallel_attn:
@@ -220,19 +225,27 @@ class MMDoubleStreamBlock(nn.Module):
         attn = None
 
         # Calculate the img bloks.
-        img = img + apply_gate(self.img_attn_proj(img_attn), gate=img_mod1_gate)
+        # img = img + apply_gate(self.img_attn_proj(img_attn), gate=img_mod1_gate)
+        img = torch.addcmul(img, self.img_attn_proj(img_attn), img_mod1_gate.unsqueeze(1))
         img_attn = None
-        img = img + apply_gate(
-            self.img_mlp(modulate(self.img_norm2(img), shift=img_mod2_shift, scale=img_mod2_scale)),
-            gate=img_mod2_gate,
+        # img = img + apply_gate(
+        #     self.img_mlp(modulate(self.img_norm2(img), shift=img_mod2_shift, scale=img_mod2_scale)),
+        #     gate=img_mod2_gate,
+        # )
+        img = torch.addcmul(
+            img, self.img_mlp(modulate(self.img_norm2(img), shift=img_mod2_shift, scale=img_mod2_scale)), img_mod2_gate.unsqueeze(1)
         )
 
         # Calculate the txt bloks.
-        txt = txt + apply_gate(self.txt_attn_proj(txt_attn), gate=txt_mod1_gate)
+        # txt = txt + apply_gate(self.txt_attn_proj(txt_attn), gate=txt_mod1_gate)
+        txt = torch.addcmul(txt, self.txt_attn_proj(txt_attn), txt_mod1_gate.unsqueeze(1))
         txt_attn = None
-        txt = txt + apply_gate(
-            self.txt_mlp(modulate(self.txt_norm2(txt), shift=txt_mod2_shift, scale=txt_mod2_scale)),
-            gate=txt_mod2_gate,
+        # txt = txt + apply_gate(
+        #     self.txt_mlp(modulate(self.txt_norm2(txt), shift=txt_mod2_shift, scale=txt_mod2_scale)),
+        #     gate=txt_mod2_gate,
+        # )
+        txt = torch.addcmul(
+            txt, self.txt_mlp(modulate(self.txt_norm2(txt), shift=txt_mod2_shift, scale=txt_mod2_scale)), txt_mod2_gate.unsqueeze(1)
         )
 
         return img, txt
@@ -251,7 +264,10 @@ class MMDoubleStreamBlock(nn.Module):
     # ) -> Tuple[torch.Tensor, torch.Tensor]:
     def forward(self, *args, **kwargs):
         if self.training and self.gradient_checkpointing:
-            return checkpoint(self._forward, *args, use_reentrant=False, **kwargs)
+            forward_fn = self._forward
+            if self.activation_cpu_offloading:
+                forward_fn = create_cpu_offloading_wrapper(forward_fn, self.img_attn_qkv.weight.device)
+            return checkpoint(forward_fn, *args, use_reentrant=False, **kwargs)
         else:
             return self._forward(*args, **kwargs)
 
@@ -307,6 +323,7 @@ class MMSingleStreamBlock(nn.Module):
         self.hybrid_seq_parallel_attn = None
 
         self.gradient_checkpointing = False
+        self.activation_cpu_offloading = False
 
     def enable_deterministic(self):
         self.deterministic = True
@@ -314,11 +331,13 @@ class MMSingleStreamBlock(nn.Module):
     def disable_deterministic(self):
         self.deterministic = False
 
-    def enable_gradient_checkpointing(self):
+    def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False):
         self.gradient_checkpointing = True
+        self.activation_cpu_offloading = activation_cpu_offloading
 
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
+        self.activation_cpu_offloading = False
 
     def _forward(
         self,
@@ -355,9 +374,9 @@ class MMSingleStreamBlock(nn.Module):
             img_q_shape = img_q.shape
             img_k_shape = img_k.shape
             img_q, img_k = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
-            assert (
-                img_q.shape == img_q_shape and img_k_shape == img_k.shape
-            ), f"img_kk: {img_q.shape}, img_q: {img_q.shape}, img_kk: {img_k.shape}, img_k: {img_k.shape}"
+            assert img_q.shape == img_q_shape and img_k_shape == img_k.shape, (
+                f"img_kk: {img_q.shape}, img_q: {img_q.shape}, img_kk: {img_k.shape}, img_k: {img_k.shape}"
+            )
             # img_q, img_k = img_qq, img_kk
             # del img_qq, img_kk
             q = torch.cat((img_q, txt_q), dim=1)
@@ -403,7 +422,8 @@ class MMSingleStreamBlock(nn.Module):
         mlp = None
         output = self.linear2(attn_mlp)
         attn_mlp = None
-        return x + apply_gate(output, gate=mod_gate)
+        # return x + apply_gate(output, gate=mod_gate)
+        return torch.addcmul(x, output, mod_gate.unsqueeze(1))
 
     # def forward(
     #     self,
@@ -419,7 +439,10 @@ class MMSingleStreamBlock(nn.Module):
     # ) -> torch.Tensor:
     def forward(self, *args, **kwargs):
         if self.training and self.gradient_checkpointing:
-            return checkpoint(self._forward, *args, use_reentrant=False, **kwargs)
+            forward_fn = self._forward
+            if self.activation_cpu_offloading:
+                forward_fn = create_cpu_offloading_wrapper(forward_fn, self.linear1.weight.device)
+            return checkpoint(forward_fn, *args, use_reentrant=False, **kwargs)
         else:
             return self._forward(*args, **kwargs)
 
@@ -609,6 +632,7 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
         )
 
         self.gradient_checkpointing = False
+        self.activation_cpu_offloading = False
         self.blocks_to_swap = None
         self.offloader_double = None
         self.offloader_single = None
@@ -622,30 +646,34 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
     def dtype(self):
         return next(self.parameters()).dtype
 
-    def enable_gradient_checkpointing(self):
+    def enable_gradient_checkpointing(self, activation_cpu_offloading: bool = False):
         self.gradient_checkpointing = True
+        self.activation_cpu_offloading = activation_cpu_offloading
 
         self.txt_in.enable_gradient_checkpointing()
 
         for block in self.double_blocks + self.single_blocks:
-            block.enable_gradient_checkpointing()
+            block.enable_gradient_checkpointing(activation_cpu_offloading)
 
-        print(f"HYVideoDiffusionTransformer: Gradient checkpointing enabled.")
+        print(
+            f"HYVideoDiffusionTransformer: Gradient checkpointing enabled. Activation CPU offloading: {activation_cpu_offloading}"
+        )
 
     def disable_gradient_checkpointing(self):
         self.gradient_checkpointing = False
+        self.activation_cpu_offloading = False
 
         self.txt_in.disable_gradient_checkpointing()
 
         for block in self.double_blocks + self.single_blocks:
             block.disable_gradient_checkpointing()
 
-        print(f"HYVideoDiffusionTransformer: Gradient checkpointing disabled.")
+        print("HYVideoDiffusionTransformer: Gradient checkpointing disabled.")
 
     def enable_img_in_txt_in_offloading(self):
         self._enable_img_in_txt_in_offloading = True
 
-    def enable_block_swap(self, num_blocks: int, device: torch.device, supports_backward: bool):
+    def enable_block_swap(self, num_blocks: int, device: torch.device, supports_backward: bool, use_pinned_memory: bool = False):
         self.blocks_to_swap = num_blocks
         self.num_double_blocks = len(self.double_blocks)
         self.num_single_blocks = len(self.single_blocks)
@@ -658,10 +686,24 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
         )
 
         self.offloader_double = ModelOffloader(
-            "double", self.double_blocks, self.num_double_blocks, double_blocks_to_swap, supports_backward, device  # , debug=True
+            "double",
+            self.double_blocks,
+            self.num_double_blocks,
+            double_blocks_to_swap,
+            supports_backward,
+            device,
+            use_pinned_memory,
+            # , debug=True
         )
         self.offloader_single = ModelOffloader(
-            "single", self.single_blocks, self.num_single_blocks, single_blocks_to_swap, supports_backward, device  # , debug=True
+            "single",
+            self.single_blocks,
+            self.num_single_blocks,
+            single_blocks_to_swap,
+            supports_backward,
+            device,
+            use_pinned_memory,
+            # , debug=True
         )
         print(
             f"HYVideoDiffusionTransformer: Block swap enabled. Swapping {num_blocks} blocks, double blocks: {double_blocks_to_swap}, single blocks: {single_blocks_to_swap}."
@@ -672,14 +714,14 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
             self.offloader_double.set_forward_only(True)
             self.offloader_single.set_forward_only(True)
             self.prepare_block_swap_before_forward()
-            print(f"HYVideoDiffusionTransformer: Block swap set to forward only.")
+            print("HYVideoDiffusionTransformer: Block swap set to forward only.")
 
     def switch_block_swap_for_training(self):
         if self.blocks_to_swap:
             self.offloader_double.set_forward_only(False)
             self.offloader_single.set_forward_only(False)
             self.prepare_block_swap_before_forward()
-            print(f"HYVideoDiffusionTransformer: Block swap set to forward and backward.")
+            print("HYVideoDiffusionTransformer: Block swap set to forward and backward.")
 
     def move_to_device_except_swap_blocks(self, device: torch.device):
         # assume model is on cpu. do not move blocks to device to reduce temporary memory usage
@@ -795,6 +837,7 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
         # --------------------- Pass through DiT blocks ------------------------
+        input_device = img.device
         for block_idx, block in enumerate(self.double_blocks):
             double_block_args = [
                 img,
@@ -848,6 +891,8 @@ class HYVideoDiffusionTransformer(nn.Module):  # ModelMixin, ConfigMixin):
 
         img = x[:, :img_seq_len, ...]
         x = None
+        if img.device != input_device:
+            img = img.to(input_device)
 
         # ---------------------------- Final layer ------------------------------
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
@@ -960,8 +1005,7 @@ def load_state_dict(model, model_path):
         state_dict = state_dict[load_key]
     else:
         raise KeyError(
-            f"Missing key: `{load_key}` in the checkpoint: {model_path}. The keys in the checkpoint "
-            f"are: {list(state_dict.keys())}."
+            f"Missing key: `{load_key}` in the checkpoint: {model_path}. The keys in the checkpoint are: {list(state_dict.keys())}."
         )
     model.load_state_dict(state_dict, strict=True, assign=True)
     return model
@@ -984,15 +1028,8 @@ def load_transformer(dit_path, attn_mode, split_attn, device, dtype, in_channels
 
     if os.path.splitext(dit_path)[-1] == ".safetensors":
         # loading safetensors: may be already fp8
-        with MemoryEfficientSafeOpen(dit_path) as f:
-            state_dict = {}
-            for k in f.keys():
-                tensor = f.get_tensor(k)
-                tensor = tensor.to(device=device, dtype=dtype)
-                # TODO support comfy model
-                # if k.startswith("model.model."):
-                #     k = convert_comfy_model_key(k)
-                state_dict[k] = tensor
+        device = torch.device(device) if device is not None else None
+        state_dict = load_safetensors(dit_path, device=device, disable_mmap=True, dtype=dtype)
         transformer.load_state_dict(state_dict, strict=True, assign=True)
     else:
         transformer = load_state_dict(transformer, dit_path)
@@ -1006,14 +1043,12 @@ def get_rotary_pos_embed_by_shape(model, latents_size):
 
     if isinstance(model.patch_size, int):
         assert all(s % model.patch_size == 0 for s in latents_size), (
-            f"Latent size(last {ndim} dimensions) should be divisible by patch size({model.patch_size}), "
-            f"but got {latents_size}."
+            f"Latent size(last {ndim} dimensions) should be divisible by patch size({model.patch_size}), but got {latents_size}."
         )
         rope_sizes = [s // model.patch_size for s in latents_size]
     elif isinstance(model.patch_size, list):
         assert all(s % model.patch_size[idx] == 0 for idx, s in enumerate(latents_size)), (
-            f"Latent size(last {ndim} dimensions) should be divisible by patch size({model.patch_size}), "
-            f"but got {latents_size}."
+            f"Latent size(last {ndim} dimensions) should be divisible by patch size({model.patch_size}), but got {latents_size}."
         )
         rope_sizes = [s // model.patch_size[idx] for idx, s in enumerate(latents_size)]
 

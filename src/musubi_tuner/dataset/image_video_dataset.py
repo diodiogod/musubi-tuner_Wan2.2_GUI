@@ -1,16 +1,22 @@
 from concurrent.futures import ThreadPoolExecutor
 import glob
+from importlib.util import find_spec
 import json
 import math
 import os
 import random
 import time
-from typing import Any, Optional, Sequence, Tuple, Union
+from typing import Any, Optional, Sequence, Tuple, Union, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from multiprocessing.sharedctypes import Synchronized
+
+SharedEpoch = Optional["Synchronized[int]"]
+
 
 import numpy as np
 import torch
 from safetensors.torch import save_file, load_file
-from safetensors import safe_open
 from PIL import Image
 import cv2
 import av
@@ -24,30 +30,18 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP"]
+IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp", ".PNG", ".JPG", ".JPEG", ".WEBP", ".BMP", ".avif", ".AVIF"]
 
-try:
-    import pillow_avif
 
-    IMAGE_EXTENSIONS.extend([".avif", ".AVIF"])
-except:
-    pass
-
-# JPEG-XL on Linux
-try:
-    from jxlpy import JXLImagePlugin
+if find_spec("jxlpy") is not None:  # JPEG-XL on Linux
+    from jxlpy import JXLImagePlugin  # noqa: F401 # type: ignore
 
     IMAGE_EXTENSIONS.extend([".jxl", ".JXL"])
-except:
-    pass
 
-# JPEG-XL on Windows
-try:
-    import pillow_jxl
+if find_spec("pillow_jxl") is not None:  # JPEG-XL on Windows
+    import pillow_jxl  # noqa: F401 # type: ignore
 
     IMAGE_EXTENSIONS.extend([".jxl", ".JXL"])
-except:
-    pass
 
 VIDEO_EXTENSIONS = [
     ".mp4",
@@ -72,6 +66,7 @@ VIDEO_EXTENSIONS = [
     ".MPEG",
 ]  # some of them are not tested
 
+# Architecture short names cannot contain underscore
 ARCHITECTURE_HUNYUAN_VIDEO = "hv"
 ARCHITECTURE_HUNYUAN_VIDEO_FULL = "hunyuan_video"
 ARCHITECTURE_WAN = "wan"
@@ -82,6 +77,8 @@ ARCHITECTURE_FLUX_KONTEXT = "fk"
 ARCHITECTURE_FLUX_KONTEXT_FULL = "flux_kontext"
 ARCHITECTURE_QWEN_IMAGE = "qi"
 ARCHITECTURE_QWEN_IMAGE_FULL = "qwen_image"
+ARCHITECTURE_QWEN_IMAGE_EDIT = "qie"
+ARCHITECTURE_QWEN_IMAGE_EDIT_FULL = "qwen_image_edit"
 
 
 def glob_images(directory, base="*"):
@@ -179,7 +176,6 @@ class ItemInfo:
         self.fp_1f_clean_indices: Optional[list[int]] = None  # indices of clean latents for 1f
         self.fp_1f_target_index: Optional[int] = None  # target index for 1f clean latents
         self.fp_1f_no_post: Optional[bool] = None  # whether to add zero values as clean latent post
-        self.flux_kontext_no_resize_control: Optional[bool] = None  # whether to resize control images to the bucket resolution
 
     def __str__(self) -> str:
         return (
@@ -290,21 +286,28 @@ def save_latent_cache_flux_kontext(
     dtype_str = dtype_to_str(latent.dtype)
     sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
 
-    sd[f"varlen_control_{dtype_str}"] = control_latent.detach().cpu().contiguous()
+    _, H, W = control_latent.shape
+    F = 1
+    sd[f"latents_control_{F}x{H}x{W}_{dtype_str}"] = control_latent.detach().cpu().contiguous()
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_FLUX_KONTEXT_FULL)
 
 
-def save_latent_cache_qwen_image(
-    item_info: ItemInfo,
-    latent: torch.Tensor
-):
+def save_latent_cache_qwen_image(item_info: ItemInfo, latent: torch.Tensor, control_latent: Optional[list[torch.Tensor]]):
     """Qwen-Image architecture"""
     assert latent.dim() == 4, "latent should be 4D tensor (frame, channel, height, width)"
+    assert control_latent is None or all(cl.dim() == 4 for cl in control_latent), (
+        "control_latent should be 4D tensor (frame, channel, height, width) or None"
+    )
 
     _, F, H, W = latent.shape
     dtype_str = dtype_to_str(latent.dtype)
     sd = {f"latents_{F}x{H}x{W}_{dtype_str}": latent.detach().cpu().contiguous()}
+
+    if control_latent is not None:
+        for i, cl in enumerate(control_latent):
+            _, F, H, W = cl.shape
+            sd[f"latents_control_{i}_{F}x{H}x{W}_{dtype_str}"] = cl.detach().cpu().contiguous()
 
     save_latent_cache_common(item_info, sd, ARCHITECTURE_QWEN_IMAGE_FULL)
 
@@ -333,9 +336,9 @@ def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], a
 
 def save_text_encoder_output_cache(item_info: ItemInfo, embed: torch.Tensor, mask: Optional[torch.Tensor], is_llm: bool):
     """HunyuanVideo architecture"""
-    assert (
-        embed.dim() == 1 or embed.dim() == 2
-    ), f"embed should be 2D tensor (feature, hidden_size) or (hidden_size,), got {embed.shape}"
+    assert embed.dim() == 1 or embed.dim() == 2, (
+        f"embed should be 2D tensor (feature, hidden_size) or (hidden_size,), got {embed.shape}"
+    )
     assert mask is None or mask.dim() == 1, f"mask should be 1D tensor (feature), got {mask.shape}"
 
     sd = {}
@@ -366,7 +369,7 @@ def save_text_encoder_output_cache_framepack(
     sd = {}
     dtype_str = dtype_to_str(llama_vec.dtype)
     sd[f"llama_vec_{dtype_str}"] = llama_vec.detach().cpu()
-    sd[f"llama_attention_mask"] = llama_attention_mask.detach().cpu()
+    sd["llama_attention_mask"] = llama_attention_mask.detach().cpu()
     dtype_str = dtype_to_str(clip_l_pooler.dtype)
     sd[f"clip_l_pooler_{dtype_str}"] = clip_l_pooler.detach().cpu()
 
@@ -436,6 +439,16 @@ class BucketSelector:
     RESOLUTION_STEPS_FRAMEPACK = 16
     RESOLUTION_STEPS_FLUX_KONTEXT = 16
     RESOLUTION_STEPS_QWEN_IMAGE = 16
+    RESOLUTION_STEPS_QWEN_IMAGE_EDIT = 16
+
+    ARCHITECTURE_STEPS_MAP = {
+        ARCHITECTURE_HUNYUAN_VIDEO: RESOLUTION_STEPS_HUNYUAN,
+        ARCHITECTURE_WAN: RESOLUTION_STEPS_WAN,
+        ARCHITECTURE_FRAMEPACK: RESOLUTION_STEPS_FRAMEPACK,
+        ARCHITECTURE_FLUX_KONTEXT: RESOLUTION_STEPS_FLUX_KONTEXT,
+        ARCHITECTURE_QWEN_IMAGE: RESOLUTION_STEPS_QWEN_IMAGE,
+        ARCHITECTURE_QWEN_IMAGE_EDIT: RESOLUTION_STEPS_QWEN_IMAGE_EDIT,
+    }
 
     def __init__(
         self, resolution: Tuple[int, int], enable_bucket: bool = True, no_upscale: bool = False, architecture: str = "no_default"
@@ -444,18 +457,10 @@ class BucketSelector:
         self.bucket_area = resolution[0] * resolution[1]
         self.architecture = architecture
 
-        if self.architecture == ARCHITECTURE_HUNYUAN_VIDEO:
-            self.reso_steps = BucketSelector.RESOLUTION_STEPS_HUNYUAN
-        elif self.architecture == ARCHITECTURE_WAN:
-            self.reso_steps = BucketSelector.RESOLUTION_STEPS_WAN
-        elif self.architecture == ARCHITECTURE_FRAMEPACK:
-            self.reso_steps = BucketSelector.RESOLUTION_STEPS_FRAMEPACK
-        elif self.architecture == ARCHITECTURE_FLUX_KONTEXT:
-            self.reso_steps = BucketSelector.RESOLUTION_STEPS_FLUX_KONTEXT
-        elif self.architecture == ARCHITECTURE_QWEN_IMAGE:
-            self.reso_steps = BucketSelector.RESOLUTION_STEPS_QWEN_IMAGE
+        if architecture in BucketSelector.ARCHITECTURE_STEPS_MAP:
+            self.reso_steps = BucketSelector.ARCHITECTURE_STEPS_MAP[architecture]
         else:
-            raise ValueError(f"Invalid architecture: {self.architecture}")
+            raise ValueError(f"Invalid architecture: {architecture}")
 
         if not enable_bucket:
             # only define one bucket
@@ -493,6 +498,50 @@ class BucketSelector:
         ar_errors = self.aspect_ratios - aspect_ratio
         bucket_id = np.abs(ar_errors).argmin()
         return self.bucket_resolutions[bucket_id]
+
+    @classmethod
+    def calculate_bucket_resolution(
+        cls,
+        image_size: tuple[int, int],
+        resolution: tuple[int, int],
+        reso_steps: Optional[int] = None,
+        architecture: Optional[str] = None,
+    ) -> tuple[int, int]:
+        """
+        Get the bucket resolution for the given image size, resolution and resolution steps.
+        Return (width, height).
+        """
+        if reso_steps is None and architecture is None:
+            raise ValueError("resolution steps or architecture must be provided")
+        if reso_steps is None and architecture is not None:
+            if architecture in BucketSelector.ARCHITECTURE_STEPS_MAP:
+                reso_steps = BucketSelector.ARCHITECTURE_STEPS_MAP[architecture]
+            else:
+                raise ValueError(f"Invalid architecture: {architecture}")
+
+        max_area = resolution[0] * resolution[1]
+        width, height = image_size
+        aspect_ratio = width / height
+        bucket_width = int(math.sqrt(max_area * aspect_ratio))
+        bucket_height = int(math.sqrt(max_area / aspect_ratio))
+        bucket_width = divisible_by(bucket_width, reso_steps)
+        bucket_height = divisible_by(bucket_height, reso_steps)
+
+        # find appropriate resolutions
+        best_resolution = None
+        best_aspect_ratio_diff = float("inf")
+        for i in range(-2, 3):
+            w = bucket_width + i * reso_steps
+            h = divisible_by(max_area // w, reso_steps)
+            current_aspect_ratio_diff = abs((w / h) - aspect_ratio)
+            if current_aspect_ratio_diff < best_aspect_ratio_diff:
+                best_aspect_ratio_diff = current_aspect_ratio_diff
+                best_resolution = (w, h)
+
+        if best_resolution is not None:
+            return best_resolution
+
+        return bucket_width, bucket_height
 
 
 def load_video(
@@ -620,7 +669,6 @@ def load_video(
 
 
 class BucketBatchManager:
-
     def __init__(
         self, bucketed_item_info: dict[tuple[Any], list[ItemInfo]], batch_size: int, num_timestep_buckets: Optional[int] = None
     ):
@@ -784,7 +832,7 @@ class ImageDirectoryDatasource(ImageDatasource):
         image_directory: str,
         caption_extension: Optional[str] = None,
         control_directory: Optional[str] = None,
-        control_count_per_image: int = 1,
+        control_count_per_image: Optional[int] = None,
     ):
         super().__init__()
         self.image_directory = image_directory
@@ -803,10 +851,28 @@ class ImageDirectoryDatasource(ImageDatasource):
             logger.info(f"glob control images in {self.control_directory}")
             self.has_control = True
             self.control_paths = {}
-            for image_path in self.image_paths:
+
+            # sort image paths for matching control images properly: longer names first
+            image_paths_sorted = sorted(self.image_paths, key=lambda p: len(os.path.basename(p)), reverse=True)
+
+            # glob control images first
+            all_control_image_paths = set(glob_images(self.control_directory))
+
+            for image_path in image_paths_sorted:
                 image_basename = os.path.basename(image_path)
                 image_basename_no_ext = os.path.splitext(image_basename)[0]
-                potential_paths = glob.glob(os.path.join(self.control_directory, os.path.splitext(image_basename)[0] + "*.*"))
+
+                # find matching control images
+                potential_paths = [
+                    p
+                    for p in all_control_image_paths
+                    if os.path.basename(p).startswith(image_basename_no_ext + ".")
+                    or os.path.basename(p).startswith(image_basename_no_ext + "_")
+                ]
+
+                # remove to avoid duplicate matching
+                all_control_image_paths.difference_update(potential_paths)
+
                 if potential_paths:
                     # sort by the digits (`_0000`) suffix, prefer the one without the suffix
                     def sort_key(path):
@@ -820,7 +886,7 @@ class ImageDirectoryDatasource(ImageDatasource):
                         return int(digits_suffix) + 1
 
                     potential_paths.sort(key=sort_key)
-                    if len(potential_paths) < control_count_per_image:
+                    if control_count_per_image is not None and len(potential_paths) < control_count_per_image:
                         logger.error(
                             f"Not enough control images for {image_path}: found {len(potential_paths)}, expected {control_count_per_image}"
                         )
@@ -829,8 +895,22 @@ class ImageDirectoryDatasource(ImageDatasource):
                         )
 
                     # take the first `control_count_per_image` paths
-                    self.control_paths[image_path] = potential_paths[:control_count_per_image]
-            logger.info(f"found {len(self.control_paths)} matching control images")
+                    self.control_paths[image_path] = (
+                        potential_paths[:control_count_per_image] if control_count_per_image is not None else potential_paths
+                    )
+            logger.info(
+                f"found {len(self.control_paths)} matching control images for {'arbitrary' if control_count_per_image is None else control_count_per_image} images"
+            )
+
+            # log the distribution of number of control images
+            count_of_num_control_images = {}
+            for paths in self.control_paths.values():
+                count = len(paths)
+                if count not in count_of_num_control_images:
+                    count_of_num_control_images[count] = 0
+                count_of_num_control_images[count] += 1
+            for count, num_images in count_of_num_control_images.items():
+                logger.info(f"  {num_images} images have {count} control images")
 
             missing_controls = len(self.image_paths) - len(self.control_paths)
             if missing_controls > 0:
@@ -897,7 +977,7 @@ class ImageDirectoryDatasource(ImageDatasource):
 
 
 class ImageJsonlDatasource(ImageDatasource):
-    def __init__(self, image_jsonl_file: str, control_count_per_image: int = 1):
+    def __init__(self, image_jsonl_file: str, control_count_per_image: Optional[int] = None):
         super().__init__()
         self.image_jsonl_file = image_jsonl_file
         self.control_count_per_image = control_count_per_image
@@ -931,15 +1011,20 @@ class ImageJsonlDatasource(ImageDatasource):
         # Check if there are control paths in the JSONL
         self.has_control = any("control_path_0" in item for item in self.data)
         if self.has_control:
-            missing_control_images = [
-                item["image_path"]
-                for item in self.data
-                if sum(f"control_path_{i}" not in item for i in range(self.control_count_per_image)) > 0
-            ]
-            if missing_control_images:
-                logger.error(f"Some images do not have control paths in JSONL data: {missing_control_images}")
-                raise ValueError(f"Some images do not have control paths in JSONL data: {missing_control_images}")
-            logger.info(f"found {len(self.data)} images with {self.control_count_per_image} control images per image in JSONL data")
+            if self.control_count_per_image is None:
+                logger.info(f"found {len(self.data)} images with arbitrary control images per image in JSONL data")
+            else:
+                missing_control_images = [
+                    item["image_path"]
+                    for item in self.data
+                    if sum(f"control_path_{i}" not in item for i in range(self.control_count_per_image)) > 0
+                ]
+                if missing_control_images:
+                    logger.error(f"Some images do not have control paths in JSONL data: {missing_control_images}")
+                    raise ValueError(f"Some images do not have control paths in JSONL data: {missing_control_images}")
+                logger.info(
+                    f"found {len(self.data)} images with {self.control_count_per_image} control images per image in JSONL data"
+                )
 
     def is_indexable(self):
         return True
@@ -957,7 +1042,9 @@ class ImageJsonlDatasource(ImageDatasource):
         controls = None
         if self.has_control:
             controls = []
-            for i in range(self.control_count_per_image):
+            for i in range(self.control_count_per_image or 1000):  # arbitrary large number if control_count_per_image is None
+                if f"control_path_{i}" not in data:
+                    break
                 control_path = data[f"control_path_{i}"]
                 control = Image.open(control_path)
                 if control.mode != "RGB" and control.mode != "RGBA":
@@ -1284,6 +1371,7 @@ class BaseDataset(torch.utils.data.Dataset):
         self.architecture = architecture
         self.seed = None
         self.current_epoch = 0
+        self.shared_epoch = None
 
         if not self.enable_bucket:
             self.bucket_no_upscale = False
@@ -1335,24 +1423,13 @@ class BaseDataset(torch.utils.data.Dataset):
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
         pass
 
-    def set_seed(self, seed: int):
+    def set_seed(self, seed: int, shared_epoch: SharedEpoch):
         self.seed = seed
+        self.shared_epoch = shared_epoch
 
     def set_current_epoch(self, epoch):
-        if not self.current_epoch == epoch:  # shuffle buckets when epoch is incremented
-            if epoch > self.current_epoch:
-                logger.info("epoch is incremented. current_epoch: {}, epoch: {}".format(self.current_epoch, epoch))
-                num_epochs = epoch - self.current_epoch
-                for _ in range(num_epochs):
-                    self.current_epoch += 1
-                    self.shuffle_buckets()
-                # self.current_epoch seem to be set to 0 again in the next epoch. it may be caused by skipped_dataloader?
-            else:
-                logger.warning("epoch is not incremented. current_epoch: {}, epoch: {}".format(self.current_epoch, epoch))
-                self.current_epoch = epoch
-
-    def set_current_step(self, step):
-        self.current_step = step
+        assert self.shared_epoch is not None, "shared_epoch is None"
+        assert self.shared_epoch.value == epoch, "shared_epoch does not match"
 
     def set_max_train_steps(self, max_train_steps):
         self.max_train_steps = max_train_steps
@@ -1364,7 +1441,17 @@ class BaseDataset(torch.utils.data.Dataset):
         return NotImplementedError
 
     def __getitem__(self, idx):
-        raise NotImplementedError
+        assert self.shared_epoch is not None, "shared_epoch is None"
+        epoch = self.shared_epoch.value
+        if epoch > self.current_epoch:
+            logger.info(f"epoch is incremented. current_epoch: {self.current_epoch}, epoch: {epoch}")
+            num_epochs = epoch - self.current_epoch
+            for _ in range(num_epochs):
+                self.current_epoch += 1
+                self.shuffle_buckets()
+        elif epoch < self.current_epoch:
+            logger.warning(f"epoch is not incremented. current_epoch: {self.current_epoch}, epoch: {epoch}")
+            self.current_epoch = epoch
 
     def _default_retrieve_text_encoder_output_cache_batches(self, datasource: ContentDatasource, batch_size: int, num_workers: int):
         datasource.set_caption_only(True)
@@ -1440,6 +1527,8 @@ class ImageDataset(BaseDataset):
         fp_1f_target_index: Optional[int] = None,
         fp_1f_no_post: Optional[bool] = False,
         flux_kontext_no_resize_control: Optional[bool] = False,
+        qwen_image_edit_no_resize_control: Optional[bool] = False,
+        qwen_image_edit_control_resolution: Optional[Tuple[int, int]] = None,
         debug_dataset: bool = False,
         architecture: str = "no_default",
     ):
@@ -1462,10 +1551,19 @@ class ImageDataset(BaseDataset):
         self.fp_1f_target_index = fp_1f_target_index
         self.fp_1f_no_post = fp_1f_no_post
         self.flux_kontext_no_resize_control = flux_kontext_no_resize_control
+        self.qwen_image_edit_no_resize_control = qwen_image_edit_no_resize_control
+        self.qwen_image_edit_control_resolution = qwen_image_edit_control_resolution
 
-        control_count_per_image = 1
-        if fp_1f_clean_indices is not None:
-            control_count_per_image = len(fp_1f_clean_indices)
+        control_count_per_image: Optional[int] = 1
+        if self.architecture == ARCHITECTURE_FRAMEPACK or self.architecture == ARCHITECTURE_WAN:
+            if fp_1f_clean_indices is not None:
+                control_count_per_image = len(fp_1f_clean_indices)
+            else:
+                control_count_per_image = 1
+        elif self.architecture == ARCHITECTURE_FLUX_KONTEXT:
+            control_count_per_image = 1
+        elif self.architecture == ARCHITECTURE_QWEN_IMAGE_EDIT:
+            control_count_per_image = None  # can be multiple control images
 
         if image_directory is not None:
             self.datasource = ImageDirectoryDatasource(
@@ -1522,11 +1620,14 @@ class ImageDataset(BaseDataset):
 
                     item_info = ItemInfo(item_key, caption, original_size, bucket_reso, content=image)
                     item_info.latent_cache_path = self.get_latent_cache_path(item_info)
+
+                    # for VLM, which require image in addition to text, like Qwen-Image-Edit
+                    item_info.text_encoder_output_cache_path = self.get_text_encoder_output_cache_path(item_info)
+
                     item_info.fp_latent_window_size = self.fp_latent_window_size
                     item_info.fp_1f_clean_indices = self.fp_1f_clean_indices
                     item_info.fp_1f_target_index = self.fp_1f_target_index
                     item_info.fp_1f_no_post = self.fp_1f_no_post
-                    item_info.flux_kontext_no_resize_control = self.flux_kontext_no_resize_control
 
                     if self.architecture == ARCHITECTURE_FRAMEPACK or self.architecture == ARCHITECTURE_WAN:
                         # we need to split the bucket with latent window size and optional 1f clean indices, zero post
@@ -1538,6 +1639,16 @@ class ImageDataset(BaseDataset):
 
                     if controls is not None:
                         item_info.control_content = controls
+                        if (
+                            self.flux_kontext_no_resize_control
+                            or self.qwen_image_edit_no_resize_control
+                            or self.qwen_image_edit_control_resolution is not None
+                        ):
+                            # Add control size to bucket_reso to make different control resolutions to different batch
+                            bucket_reso = list(bucket_reso)
+                            for control in controls:
+                                bucket_reso = bucket_reso + list(control.shape[0:2])
+                            bucket_reso = tuple(bucket_reso)
 
                     if bucket_reso not in batches:
                         batches[bucket_reso] = []
@@ -1558,7 +1669,6 @@ class ImageDataset(BaseDataset):
             return None, None
 
         for fetch_op in self.datasource:
-
             # fetch and resize image in a separate thread
             def fetch_and_resize(op: callable) -> tuple[tuple[int, int], str, Image.Image, str, Optional[Image.Image]]:
                 image_key, image, caption, controls = op()
@@ -1570,12 +1680,25 @@ class ImageDataset(BaseDataset):
 
                 resized_controls = None
                 if controls is not None:
-                    if self.flux_kontext_no_resize_control:
-                        resized_controls = controls
-                    else:
-                        resized_controls = []
+                    resized_controls = []
+                    if self.flux_kontext_no_resize_control or self.qwen_image_edit_no_resize_control:
                         for control in controls:
-                            resized_control = resize_image_to_bucket(control, bucket_reso)  # returns np.ndarray
+                            # divisible by bucket reso steps
+                            width, height = control.size
+                            width = width - (width % buckset_selector.reso_steps)
+                            height = height - (height % buckset_selector.reso_steps)
+                            resized_control = resize_image_to_bucket(control, (width, height))  # returns np.ndarray
+                            resized_controls.append(resized_control)
+                    elif self.qwen_image_edit_control_resolution is not None:
+                        for control in controls:
+                            control_bucket_reso = BucketSelector.calculate_bucket_resolution(
+                                control.size, self.qwen_image_edit_control_resolution, architecture=self.architecture
+                            )
+                            resized_control = resize_image_to_bucket(control, control_bucket_reso)
+                            resized_controls.append(resized_control)
+                    else:
+                        for control in controls:
+                            resized_control = resize_image_to_bucket(control, bucket_reso)
                             resized_controls.append(resized_control)
 
                 return image_size, image_key, image, caption, resized_controls
@@ -1608,7 +1731,8 @@ class ImageDataset(BaseDataset):
         latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
 
         # assign cache files to item info
-        bucketed_item_info: dict[tuple[int, int], list[ItemInfo]] = {}  # (width, height) -> [ItemInfo]
+        # (width, height) -> [ItemInfo] or (width, height, other conds...) -> [ItemInfo]
+        bucketed_item_info: dict[Union[tuple[int, int], Any], list[ItemInfo]] = {}
         for cache_file in latent_cache_files:
             tokens = os.path.basename(cache_file).split("_")
 
@@ -1631,6 +1755,16 @@ class ImageDataset(BaseDataset):
                     bucket_reso.append(len(self.fp_1f_clean_indices))
                     bucket_reso.append(self.fp_1f_no_post)
                 bucket_reso = tuple(bucket_reso)
+            if (
+                self.flux_kontext_no_resize_control
+                or self.qwen_image_edit_no_resize_control
+                or self.qwen_image_edit_control_resolution is not None
+            ):
+                # we also need to split the bucket with control resolutions
+                control_key = safetensors_utils.find_key(cache_file, starts_with="latents_control_")  # latents_control_FxHxW_dtype
+                if control_key is not None:
+                    control_shape = control_key.rsplit("_", 3)[-2]  # FxHxW
+                    bucket_reso = tuple(list(bucket_reso) + [control_shape])  # (int, int, str)
 
             item_info = ItemInfo(item_key, "", image_size, bucket_reso, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = text_encoder_output_cache_file
@@ -1657,6 +1791,7 @@ class ImageDataset(BaseDataset):
         return len(self.batch_manager)
 
     def __getitem__(self, idx):
+        super().__getitem__(idx)
         return self.batch_manager[idx]
 
 
@@ -1984,6 +2119,7 @@ class VideoDataset(BaseDataset):
         return len(self.batch_manager)
 
     def __getitem__(self, idx):
+        super().__getitem__(idx)
         return self.batch_manager[idx]
 
 
@@ -1998,10 +2134,6 @@ class DatasetGroup(torch.utils.data.ConcatDataset):
     def set_current_epoch(self, epoch):
         for dataset in self.datasets:
             dataset.set_current_epoch(epoch)
-
-    def set_current_step(self, step):
-        for dataset in self.datasets:
-            dataset.set_current_step(step)
 
     def set_max_train_steps(self, max_train_steps):
         for dataset in self.datasets:

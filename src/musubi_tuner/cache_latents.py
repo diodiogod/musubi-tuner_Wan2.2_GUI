@@ -1,6 +1,5 @@
 import argparse
 import os
-import glob
 from typing import Optional, Union
 
 import numpy as np
@@ -144,7 +143,7 @@ def show_datasets(
     fps: int = 24,
 ):
     if debug_mode != "video":
-        print(f"d: next dataset, q: quit")
+        print("d: next dataset, q: quit")
 
     num_workers = max(1, os.cpu_count() - 1)
     for i, dataset in enumerate(datasets):
@@ -366,6 +365,9 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="debug mode: not interactive, number of images to show for each dataset",
+    )
+    parser.add_argument(
+        "--disable_cudnn_backend", action="store_true", help="Disable CUDNN PyTorch backend. May be useful for AMD GPUs."
     )
     return parser
 

@@ -5,12 +5,16 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer
+from transformers import Qwen2_5_VLConfig, Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwen2VLProcessor
+from transformers.image_utils import ImageInput
 from accelerate import init_empty_weights
 from diffusers.utils.torch_utils import randn_tensor
+from PIL import Image
 
+from musubi_tuner.dataset.image_video_dataset import BucketSelector, ARCHITECTURE_QWEN_IMAGE_EDIT
 from musubi_tuner.flux.flux_utils import is_fp8
 from musubi_tuner.qwen_image.qwen_image_autoencoder_kl import AutoencoderKLQwenImage
+from musubi_tuner.utils import image_utils
 from musubi_tuner.utils.safetensors_utils import load_safetensors, load_split_weights
 
 logger = logging.getLogger(__name__)
@@ -28,7 +32,8 @@ VAE_SCALE_FACTOR = 8  # Qwen Image uses 8x compression
 # endregion constants
 
 # region text encoder
-QWEN2_TOKENIZER_ID = "Qwen/Qwen-Image"
+QWEN_IMAGE_ID = "Qwen/Qwen-Image"
+QWEN_IMAGE_EDIT_ID = "Qwen/Qwen-Image-Edit"
 
 GENERATION_CONFIG_JSON = """
 {
@@ -222,8 +227,8 @@ def load_qwen2_5_vl(
 
     if dtype is not None:
         if is_fp8(dtype):
-            logger.info(f"prepare Qwen2.5-VL for fp8: set to {dtype}")
-            org_dtype = qwen2_5_vl.dtype
+            org_dtype = torch.bfloat16  # model weight is fp8 in loading, but original dtype is bfloat16
+            logger.info(f"prepare Qwen2.5-VL for fp8: set to {dtype} from {org_dtype}")
             qwen2_5_vl.to(dtype)
 
             # prepare LLM for fp8
@@ -251,7 +256,6 @@ def load_qwen2_5_vl(
                         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
                         **kwargs,
                     ) -> tuple[torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]]:
-
                         residual = hidden_states
 
                         hidden_states = module.input_layernorm(hidden_states)
@@ -297,43 +301,25 @@ def load_qwen2_5_vl(
                     if module.__class__.__name__ in ["Qwen2_5_VLDecoderLayer"]:
                         # print("set", module.__class__.__name__, "hooks")
                         module.forward = decoder_forward_hook(module)
+                    if module.__class__.__name__ in ["Qwen2_5_VisionRotaryEmbedding"]:
+                        # print("set", module.__class__.__name__, "hooks")
+                        module.to(target_dtype)
 
             prepare_fp8(qwen2_5_vl, org_dtype)
-
-            from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import rotate_half
-            import transformers.models.qwen2_5_vl as qwen2_5_vl_module
-
-            def create_fn():
-                def _apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section, unsqueeze_dim=1):
-                    mrope_section = mrope_section * 2
-                    cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(mrope_section, dim=-1))], dim=-1).unsqueeze(
-                        unsqueeze_dim
-                    )
-                    sin = torch.cat([m[i % 3] for i, m in enumerate(sin.split(mrope_section, dim=-1))], dim=-1).unsqueeze(
-                        unsqueeze_dim
-                    )
-
-                    input_dtype = q.dtype
-                    q = q.to(torch.float32)
-                    k = k.to(torch.float32)
-                    cos = cos.to(torch.float32)
-                    sin = sin.to(torch.float32)
-                    q_embed = (q * cos) + (rotate_half(q) * sin)
-                    k_embed = (k * cos) + (rotate_half(k) * sin)
-                    return q_embed.to(input_dtype), k_embed.to(input_dtype)
-
-                return _apply_multimodal_rotary_pos_emb
-
-            qwen2_5_vl_module.modeling_qwen2_5_vl.apply_multimodal_rotary_pos_emb = create_fn()
 
         else:
             logger.info(f"Setting Qwen2.5-VL to dtype: {dtype}")
             qwen2_5_vl.to(dtype)
 
     # Load tokenizer
-    logger.info(f"Loading tokenizer from {QWEN2_TOKENIZER_ID}")
-    tokenizer = Qwen2Tokenizer.from_pretrained(QWEN2_TOKENIZER_ID, subfolder="tokenizer")
+    logger.info(f"Loading tokenizer from {QWEN_IMAGE_ID}")
+    tokenizer = Qwen2Tokenizer.from_pretrained(QWEN_IMAGE_ID, subfolder="tokenizer")
     return tokenizer, qwen2_5_vl
+
+
+def load_vl_processor() -> Qwen2VLProcessor:
+    logger.info(f"Loading VL processor from {QWEN_IMAGE_EDIT_ID}")
+    return Qwen2VLProcessor.from_pretrained(QWEN_IMAGE_EDIT_ID, subfolder="processor")
 
 
 def extract_masked_hidden(hidden_states: torch.Tensor, mask: torch.Tensor):
@@ -376,7 +362,120 @@ def get_qwen_prompt_embeds(
                 input_ids=txt_tokens.input_ids, attention_mask=txt_tokens.attention_mask, output_hidden_states=True
             )
     hidden_states = encoder_hidden_states.hidden_states[-1]
+    if hidden_states.shape[1] > tokenizer_max_length + drop_idx:
+        logger.warning(f"Hidden states shape {hidden_states.shape} exceeds max length {tokenizer_max_length + drop_idx}")
+
     split_hidden_states = extract_masked_hidden(hidden_states, txt_tokens.attention_mask)
+    split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
+    attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]
+    max_seq_len = max([e.size(0) for e in split_hidden_states])
+    prompt_embeds = torch.stack([torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in split_hidden_states])
+    encoder_attention_mask = torch.stack([torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attn_mask_list])
+
+    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+
+    return prompt_embeds, encoder_attention_mask
+
+
+def get_qwen_prompt_embeds_with_image(
+    vl_processor: Qwen2VLProcessor,
+    vlm: Qwen2_5_VLForConditionalGeneration,
+    prompt: Union[str, List[str]],
+    image: Union[List[ImageInput], ImageInput] = None,
+    mode: str = "edit",
+):
+    r"""
+    Args:
+        prompt (`str` or `List[str]`, *optional*):
+            prompt to be encoded
+        image (`PIL.Image.Image`, `np.ndarray`, `torch.Tensor`):
+            image to be encoded
+        mode (`str`, *optional*, defaults to "edit"):
+            mode of the prompt, can be "edit" or "edit-plus"
+    """
+    if mode == "edit":
+        prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
+    elif mode == "edit-plus":
+        prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+    prompt_template_encode_start_idx = 64
+    # default_sample_size = 128
+
+    device = vlm.device
+    dtype = vlm.dtype
+
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+
+    if isinstance(image, list):
+        if len(image) == 0:
+            image = None
+        else:
+            if isinstance(image[0], list):
+                pass  # list of list, it's ok
+            else:
+                assert len(prompt) == 1, "Image must be a list of list when multiple prompts are provided."
+                image = [image]  # wrap to list of list
+
+    elif image is not None:
+        image = [[image]]  # wrap to list of list, not necessary, but for consistency
+
+    assert image is None or len(image) == len(prompt), (
+        f"Number of images {len(image) if image is not None else 0} must match number of prompts {len(prompt)} for batch processing"
+    )
+
+    base_img_prompts = [""] * len(prompt)
+    if image is not None:
+        vl_image_inputs = []  # flat list of images
+        if mode == "edit":
+            for i, img in enumerate(image):
+                if img is None or len(img) == 0:
+                    logger.warning(f"No image provided for prompt {i}, but mode is {mode}, this may cause issues.")
+                    continue
+                if len(img) > 1:
+                    logger.warning(
+                        f"Multiple images {len(img)} provided for prompt {i}, but mode is {mode}, 2nd and later images will be ignored."
+                    )
+                vl_image_inputs.append(img[0])
+        else:
+            img_prompt_template = "Picture {}: <|vision_start|><|image_pad|><|vision_end|>"
+            for i, img in enumerate(image):
+                if img is None or len(img) == 0:
+                    continue
+                for j in range(len(img)):
+                    base_img_prompts[i] += img_prompt_template.format(j + 1)
+                vl_image_inputs.extend(img)
+    else:
+        vl_image_inputs = None
+
+    template = prompt_template_encode
+    drop_idx = prompt_template_encode_start_idx
+    txt = [template.format(base + e) for base, e in zip(base_img_prompts, prompt)]
+
+    model_inputs = vl_processor(text=txt, images=vl_image_inputs, padding=True, return_tensors="pt").to(device)
+
+    if is_fp8(dtype):
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            encoder_hidden_states = vlm(
+                input_ids=model_inputs.input_ids,
+                attention_mask=model_inputs.attention_mask,
+                pixel_values=model_inputs.pixel_values,
+                image_grid_thw=model_inputs.image_grid_thw,
+                output_hidden_states=True,
+            )
+    else:
+        with torch.no_grad():
+            encoder_hidden_states = vlm(
+                input_ids=model_inputs.input_ids,
+                attention_mask=model_inputs.attention_mask,
+                pixel_values=model_inputs.pixel_values if vl_image_inputs is not None else None,
+                image_grid_thw=model_inputs.image_grid_thw if vl_image_inputs is not None else None,
+                output_hidden_states=True,
+            )
+
+    hidden_states = encoder_hidden_states.hidden_states[-1]
+    # if hidden_states.shape[1] > tokenizer_max_length + drop_idx:
+    #     logger.warning(f"Hidden states shape {hidden_states.shape} exceeds max length {tokenizer_max_length + drop_idx}")
+
+    split_hidden_states = extract_masked_hidden(hidden_states, model_inputs.attention_mask)
     split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
     attn_mask_list = [torch.ones(e.size(0), dtype=torch.long, device=e.device) for e in split_hidden_states]
     max_seq_len = max([e.size(0) for e in split_hidden_states])
@@ -483,7 +582,7 @@ def load_vae(vae_path: str, device: Union[str, torch.device] = "cpu", disable_mm
   "z_dim": 16
 }
 """
-    logger.info(f"Initializing VAE")
+    logger.info("Initializing VAE")
     config = json.loads(VAE_CONFIG_JSON)
     vae = AutoencoderKLQwenImage(
         base_dim=config["base_dim"],
@@ -535,11 +634,16 @@ def unpack_latents(latents, height, width, vae_scale_factor=VAE_SCALE_FACTOR) ->
 #     return latent_image_ids.to(device=device, dtype=dtype)
 
 
-def pack_latents(latents, batch_size, num_channels_latents, height, width):
+def pack_latents(latents: torch.Tensor) -> torch.Tensor:
     """
-    This function handles (B, 1, C, H, W) and (B, C, H, W) latents. So the logic is a bit weird.
-    It packs the latents into a shape of (B, H/2, W/2, C*4, 2, 2) and then reshapes it to (B, H/2 * W/2, C*4) = (B, Seq, In-Channels)
+    This function handles (B, C, 1, H, W) and (B, C, H, W) latents. So the logic is a bit weird.
+    It packs the latents into a shape of (B, H/2, W/2, C, 2, 2) and then reshapes it to (B, H/2 * W/2, C*4) = (B, Seq, In-Channels)
     """
+    batch_size = latents.shape[0]
+    num_channels_latents = latents.shape[1]
+    height = latents.shape[-2]
+    width = latents.shape[-1]
+
     latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
     latents = latents.permute(0, 2, 4, 1, 3, 5)
     latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
@@ -555,7 +659,8 @@ def prepare_latents(batch_size, num_channels_latents, height, width, dtype, devi
     width = 2 * (int(width) // (vae_scale_factor * 2))
 
     # kohya-ss: This is original implementations, but it will be better (B, C, 1, H, W). The latents is packed to (B,S,D) though.
-    shape = (batch_size, 1, num_channels_latents, height, width) 
+    # shape = (batch_size, 1, num_channels_latents, height, width)
+    shape = (batch_size, num_channels_latents, 1, height, width)
 
     if isinstance(generator, list) and len(generator) != batch_size:
         raise ValueError(
@@ -564,9 +669,50 @@ def prepare_latents(batch_size, num_channels_latents, height, width, dtype, devi
         )
 
     latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-    latents = pack_latents(latents, batch_size, num_channels_latents, height, width)
-
+    latents = pack_latents(latents)
     return latents
+
+
+CONDITION_IMAGE_RESOLUTION = (384, 384)
+VAE_IMAGE_RESOLUTION = (1024, 1024)
+
+
+def preprocess_control_image(
+    control_image_path: str, resize_to_prefered: bool = True, resize_size: Optional[Tuple[int, int]] = None
+) -> tuple[torch.Tensor, np.ndarray, Optional[np.ndarray]]:
+    """
+    Preprocess the control image for the model. See `preprocess_image` for details.
+
+    Args:
+        control_image_path (str): Path to the control image.
+        resize_to_prefered (bool): Whether to resize the image to the preferred resolution (based on the model's requirements).
+        resize_size (Optional[Tuple[int, int]]): Override target size for resizing if resize_to_prefered is False, with (width, height).
+
+    Returns:
+        Tuple[torch.Tensor, np.ndarray, Optional[np.ndarray]]: same as `preprocess_image`, but alpha is always None
+    """
+    # See:
+    # https://github.com/huggingface/diffusers/pull/12188
+    # https://github.com/huggingface/diffusers/pull/12190
+
+    control_image = Image.open(control_image_path)
+
+    if resize_to_prefered or resize_size is None:
+        resolution = VAE_IMAGE_RESOLUTION if resize_to_prefered else control_image.size
+        resize_size = BucketSelector.calculate_bucket_resolution(
+            control_image.size, resolution, architecture=ARCHITECTURE_QWEN_IMAGE_EDIT
+        )
+
+        cond_resolution = CONDITION_IMAGE_RESOLUTION if resize_to_prefered else control_image.size
+        cond_resize_size = BucketSelector.calculate_bucket_resolution(
+            control_image.size, cond_resolution, architecture=ARCHITECTURE_QWEN_IMAGE_EDIT
+        )
+    else:
+        cond_resize_size = resize_size
+
+    control_image_tensor, _, _ = image_utils.preprocess_image(control_image, *resize_size)
+    _, control_image_np, _ = image_utils.preprocess_image(control_image, *cond_resize_size)
+    return control_image_tensor, control_image_np, None
 
 
 # endregion vae and latents

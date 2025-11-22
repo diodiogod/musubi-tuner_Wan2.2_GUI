@@ -7,12 +7,14 @@ import logging
 
 from tqdm import tqdm
 
+from musubi_tuner.utils.device_utils import synchronize_device
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-from musubi_tuner.modules.fp8_optimization_utils import load_safetensors_with_fp8_optimization, optimize_state_dict_with_fp8
-from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen, load_safetensors
+from musubi_tuner.modules.fp8_optimization_utils import load_safetensors_with_fp8_optimization
+from musubi_tuner.utils.safetensors_utils import MemoryEfficientSafeOpen
 
 
 def filter_lora_state_dict(
@@ -38,7 +40,7 @@ def filter_lora_state_dict(
         remaining_keys.sort()
         logger.info(f"Remaining LoRA modules after filtering: {remaining_keys}")
         if len(weights_sd) == 0:
-            logger.warning(f"No keys left after filtering.")
+            logger.warning("No keys left after filtering.")
 
     return weights_sd
 
@@ -53,6 +55,7 @@ def load_safetensors_with_lora_and_fp8(
     dit_weight_dtype: Optional[torch.dtype] = None,
     target_keys: Optional[List[str]] = None,
     exclude_keys: Optional[List[str]] = None,
+    disable_numpy_memmap: bool = False,
 ) -> dict[str, torch.Tensor]:
     """
     Merge LoRA weights into the state dict of a model with fp8 optimization if needed.
@@ -81,7 +84,7 @@ def load_safetensors_with_lora_and_fp8(
             count = int(match.group(3))
             state_dict = {}
             for i in range(count):
-                filename = f"{prefix}{i+1:05d}-of-{count:05d}.safetensors"
+                filename = f"{prefix}{i + 1:05d}-of-{count:05d}.safetensors"
                 filepath = os.path.join(os.path.dirname(model_file), filename)
                 if os.path.exists(filepath):
                     extended_model_files.append(filepath)
@@ -115,7 +118,7 @@ def load_safetensors_with_lora_and_fp8(
         logger.info(f"Merging LoRA weights into state dict. multipliers: {lora_multipliers}")
 
         # make hook for LoRA merging
-        def weight_hook_func(model_weight_key, model_weight):
+        def weight_hook_func(model_weight_key, model_weight: torch.Tensor, keep_on_calc_device=False):
             nonlocal list_of_lora_weight_keys, lora_weights_list, lora_multipliers, calc_device
 
             if not model_weight_key.endswith(".weight"):
@@ -146,6 +149,13 @@ def load_safetensors_with_lora_and_fp8(
                 down_weight = down_weight.to(calc_device)
                 up_weight = up_weight.to(calc_device)
 
+                original_dtype = model_weight.dtype
+                if original_dtype.itemsize == 1:  # fp8
+                    # temporarily convert to float16 for calculation
+                    model_weight = model_weight.to(torch.float16)
+                    down_weight = down_weight.to(torch.float16)
+                    up_weight = up_weight.to(torch.float16)
+
                 # W <- W + U * D
                 if len(model_weight.size()) == 2:
                     # linear
@@ -167,13 +177,17 @@ def load_safetensors_with_lora_and_fp8(
                     # logger.info(conved.size(), weight.size(), module.stride, module.padding)
                     model_weight = model_weight + multiplier * conved * scale
 
+                if original_dtype.itemsize == 1:  # fp8
+                    model_weight = model_weight.to(original_dtype)  # convert back to original dtype
+
                 # remove LoRA keys from set
                 lora_weight_keys.remove(down_key)
                 lora_weight_keys.remove(up_key)
                 if alpha_key in lora_weight_keys:
                     lora_weight_keys.remove(alpha_key)
 
-            model_weight = model_weight.to(original_device)  # move back to original device
+            if not keep_on_calc_device and original_device != calc_device:
+                model_weight = model_weight.to(original_device)  # move back to original device
             return model_weight
 
         weight_hook = weight_hook_func
@@ -187,6 +201,7 @@ def load_safetensors_with_lora_and_fp8(
         target_keys,
         exclude_keys,
         weight_hook=weight_hook,
+        disable_numpy_memmap=disable_numpy_memmap,
     )
 
     for lora_weight_keys in list_of_lora_weight_keys:
@@ -208,6 +223,7 @@ def load_safetensors_with_fp8_optimization_and_hook(
     target_keys: Optional[List[str]] = None,
     exclude_keys: Optional[List[str]] = None,
     weight_hook: callable = None,
+    disable_numpy_memmap: bool = False,
 ) -> dict[str, torch.Tensor]:
     """
     Load state dict from safetensors files and merge LoRA weights into the state dict with fp8 optimization if needed.
@@ -218,7 +234,13 @@ def load_safetensors_with_fp8_optimization_and_hook(
         )
         # dit_weight_dtype is not used because we use fp8 optimization
         state_dict = load_safetensors_with_fp8_optimization(
-            model_files, calc_device, target_keys, exclude_keys, move_to_device=move_to_device, weight_hook=weight_hook
+            model_files,
+            calc_device,
+            target_keys,
+            exclude_keys,
+            move_to_device=move_to_device,
+            weight_hook=weight_hook,
+            disable_numpy_memmap=disable_numpy_memmap,
         )
     else:
         logger.info(
@@ -226,19 +248,21 @@ def load_safetensors_with_fp8_optimization_and_hook(
         )
         state_dict = {}
         for model_file in model_files:
-            with MemoryEfficientSafeOpen(model_file) as f:
+            with MemoryEfficientSafeOpen(model_file, disable_numpy_memmap=disable_numpy_memmap) as f:
                 for key in tqdm(f.keys(), desc=f"Loading {os.path.basename(model_file)}", leave=False):
-                    value = f.get_tensor(key)
-                    if weight_hook is not None:
-                        value = weight_hook(key, value)
-                    if move_to_device:
-                        if dit_weight_dtype is None:
-                            value = value.to(calc_device)
-                        else:
-                            value = value.to(calc_device, dtype=dit_weight_dtype)
-                    elif dit_weight_dtype is not None:
-                        value = value.to(dit_weight_dtype)
+                    if weight_hook is None and move_to_device:
+                        value = f.get_tensor(key, device=calc_device, dtype=dit_weight_dtype)
+                    else:
+                        value = f.get_tensor(key)  # we cannot directly load to device because get_tensor does non-blocking transfer
+                        if weight_hook is not None:
+                            value = weight_hook(key, value, keep_on_calc_device=move_to_device)
+                        if move_to_device:
+                            value = value.to(calc_device, dtype=dit_weight_dtype, non_blocking=True)
+                        elif dit_weight_dtype is not None:
+                            value = value.to(dit_weight_dtype)
 
                     state_dict[key] = value
+        if move_to_device:
+            synchronize_device(calc_device)
 
     return state_dict

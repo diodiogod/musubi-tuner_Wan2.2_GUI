@@ -1,12 +1,7 @@
 import argparse
-import os
-from typing import Optional, Union
 
-import numpy as np
 import torch
-from tqdm import tqdm
-from transformers import CLIPConfig, CLIPTextModel, T5Config, T5EncoderModel, CLIPTokenizer, T5Tokenizer
-import accelerate
+from transformers import CLIPTextModel, T5EncoderModel, CLIPTokenizer, T5Tokenizer
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
@@ -22,7 +17,6 @@ from musubi_tuner.flux import flux_utils
 import musubi_tuner.cache_text_encoder_outputs as cache_text_encoder_outputs
 import logging
 
-from musubi_tuner.utils.model_utils import str_to_dtype
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -94,9 +88,10 @@ def main():
     tokenizer2, text_encoder2 = flux_utils.load_clip_l(args.text_encoder2, dtype=torch.bfloat16, device=device, disable_mmap=True)
 
     # Encode with T5 and CLIP text encoders
-    logger.info(f"Encoding with T5 and CLIP text encoders")
+    logger.info("Encoding with T5 and CLIP text encoders")
 
     def encode_for_text_encoder(batch: list[ItemInfo]):
+        nonlocal tokenizer1, text_encoder1, tokenizer2, text_encoder2
         encode_and_save_batch(tokenizer1, text_encoder1, tokenizer2, text_encoder2, batch, device)
 
     cache_text_encoder_outputs.process_text_encoder_batches(

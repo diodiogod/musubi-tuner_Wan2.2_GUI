@@ -16,6 +16,7 @@ import numpy as np
 
 from musubi_tuner.modules.custom_offloading_utils import ModelOffloader
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
+from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 from musubi_tuner.utils.safetensors_utils import load_split_weights
 from musubi_tuner.modules.fp8_optimization_utils import apply_fp8_monkey_patch, optimize_state_dict_with_fp8
 from accelerate import init_empty_weights
@@ -794,7 +795,9 @@ def attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seq
             x = torch.cat(x, dim=0)
             return x
 
-        assert attn_mode is None or attn_mode == "torch", f"Unsupported attention mode: {attn_mode}. Supported modes: 'sageattn', 'flash', 'xformers', 'torch'."
+        assert (
+            attn_mode is None or attn_mode == "torch"
+        ), f"Unsupported attention mode: {attn_mode}. Supported modes: 'sageattn', 'flash', 'xformers', 'torch'."
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
@@ -1060,11 +1063,11 @@ class HunyuanVideoIndividualTokenRefinerBlock(nn.Module):
         del norm_hidden_states  # free memory
 
         gate_msa, gate_mlp = self.norm_out(temb)
-        hidden_states = hidden_states + attn_output * gate_msa
+        hidden_states = torch.addcmul(hidden_states, attn_output, gate_msa)
         del attn_output, gate_msa  # free memory
 
         ff_output = self.ff(self.norm2(hidden_states))
-        hidden_states = hidden_states + ff_output * gate_mlp
+        hidden_states = torch.addcmul(hidden_states, ff_output, gate_mlp)
         del ff_output, gate_mlp  # free memory
 
         return hidden_states
@@ -1431,9 +1434,9 @@ class HunyuanVideoTransformerBlock(nn.Module):
         del norm_hidden_states, norm_encoder_hidden_states, freqs_cis  # free memory
 
         # 3. Modulation and residual connection
-        hidden_states = hidden_states + attn_output * gate_msa
+        hidden_states = torch.addcmul(hidden_states, attn_output, gate_msa)
         del attn_output, gate_msa  # free memory
-        encoder_hidden_states = encoder_hidden_states + context_attn_output * c_gate_msa
+        encoder_hidden_states = torch.addcmul(encoder_hidden_states, context_attn_output, c_gate_msa)
         del context_attn_output, c_gate_msa  # free memory
 
         norm_hidden_states = self.norm2(hidden_states)
@@ -1441,7 +1444,7 @@ class HunyuanVideoTransformerBlock(nn.Module):
 
         norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
         del shift_mlp, scale_mlp  # free memory
-        norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp) + c_shift_mlp
+        norm_encoder_hidden_states = torch.addcmul(c_shift_mlp, norm_encoder_hidden_states, (1 + c_scale_mlp))
         del c_shift_mlp, c_scale_mlp  # free memory
 
         # 4. Feed-forward
@@ -1450,9 +1453,9 @@ class HunyuanVideoTransformerBlock(nn.Module):
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
         del norm_encoder_hidden_states  # free memory
 
-        hidden_states = hidden_states + gate_mlp * ff_output
+        hidden_states = torch.addcmul(hidden_states, gate_mlp, ff_output)
         del ff_output, gate_mlp  # free memory
-        encoder_hidden_states = encoder_hidden_states + c_gate_mlp * context_ff_output
+        encoder_hidden_states = torch.addcmul(encoder_hidden_states, c_gate_mlp, context_ff_output)
         del context_ff_output, c_gate_mlp  # free memory
 
         return hidden_states, encoder_hidden_states
@@ -1591,6 +1594,7 @@ class HunyuanVideoTransformer3DModelPacked(nn.Module):  # (PreTrainedModelMixin,
 
         self.inner_dim = inner_dim
         self.use_gradient_checkpointing = False
+        self.activation_cpu_offloading = False
         self.enable_teacache = False
 
         # if has_image_proj:
@@ -1623,12 +1627,16 @@ class HunyuanVideoTransformer3DModelPacked(nn.Module):  # (PreTrainedModelMixin,
     def dtype(self):
         return next(self.parameters()).dtype
 
-    def enable_gradient_checkpointing(self):
+    def enable_gradient_checkpointing(self, activation_cpu_offloading=False):
         self.use_gradient_checkpointing = True
-        print("Gradient checkpointing enabled for HunyuanVideoTransformer3DModelPacked.")  # Logging
+        self.activation_cpu_offloading = activation_cpu_offloading
+        print(
+            f"Gradient checkpointing enabled for HunyuanVideoTransformer3DModelPacked. Activation CPU offloading: {activation_cpu_offloading}"
+        )  # Logging
 
     def disable_gradient_checkpointing(self):
         self.use_gradient_checkpointing = False
+        self.activation_cpu_offloading = False
         print("Gradient checkpointing disabled for HunyuanVideoTransformer3DModelPacked.")  # Logging
 
     def initialize_teacache(self, enable_teacache=True, num_steps=25, rel_l1_thresh=0.15):
@@ -1647,12 +1655,14 @@ class HunyuanVideoTransformer3DModelPacked(nn.Module):  # (PreTrainedModelMixin,
 
     def gradient_checkpointing_method(self, block, *args):
         if self.use_gradient_checkpointing:
+            if self.activation_cpu_offloading:
+                block = create_cpu_offloading_wrapper(block, self.proj_out.weight.device)
             result = torch.utils.checkpoint.checkpoint(block, *args, use_reentrant=False)
         else:
             result = block(*args)
         return result
 
-    def enable_block_swap(self, num_blocks: int, device: torch.device, supports_backward: bool):
+    def enable_block_swap(self, num_blocks: int, device: torch.device, supports_backward: bool, use_pinned_memory: bool = False):
         self.blocks_to_swap = num_blocks
         self.num_double_blocks = len(self.transformer_blocks)
         self.num_single_blocks = len(self.single_transformer_blocks)
@@ -1671,6 +1681,7 @@ class HunyuanVideoTransformer3DModelPacked(nn.Module):  # (PreTrainedModelMixin,
             double_blocks_to_swap,
             supports_backward,
             device,
+            use_pinned_memory,
             # debug=True # Optional debugging
         )
         self.offloader_single = ModelOffloader(
@@ -1680,6 +1691,7 @@ class HunyuanVideoTransformer3DModelPacked(nn.Module):  # (PreTrainedModelMixin,
             single_blocks_to_swap,
             supports_backward,
             device,  # , debug=True
+            use_pinned_memory,
         )
         print(
             f"HunyuanVideoTransformer3DModelPacked: Block swap enabled. Swapping {num_blocks} blocks, "
@@ -1835,6 +1847,8 @@ class HunyuanVideoTransformer3DModelPacked(nn.Module):  # (PreTrainedModelMixin,
         post_patch_width = width // p
         original_context_length = post_patch_num_frames * post_patch_height * post_patch_width
 
+        input_device = hidden_states.device
+
         hidden_states, rope_freqs = self.process_input_hidden_states(
             hidden_states,
             latent_indices,
@@ -1973,6 +1987,9 @@ class HunyuanVideoTransformer3DModelPacked(nn.Module):  # (PreTrainedModelMixin,
 
         hidden_states = self.gradient_checkpointing_method(self.proj_out, hidden_states)
 
+        if hidden_states.device != input_device:
+            hidden_states = hidden_states.to(input_device)
+
         hidden_states = einops.rearrange(
             hidden_states,
             "b (t h w) (c pt ph pw) -> b c (t pt) (h ph) (w pw)",
@@ -2028,6 +2045,7 @@ def load_packed_model(
     for_inference: bool = False,
     lora_weights_list: Optional[Dict[str, torch.Tensor]] = None,
     lora_multipliers: Optional[List[float]] = None,
+    disable_numpy_memmap: bool = False,
 ) -> HunyuanVideoTransformer3DModelPacked:
     """
     Load a packed DiT model from a given path.
@@ -2043,6 +2061,7 @@ def load_packed_model(
         for_inference (bool): Whether to create the model for inference.
         lora_weights_list (Optional[Dict[str, torch.Tensor]]): List of state_dicts for LoRA weights.
         lora_multipliers (Optional[List[float]]): List of multipliers for LoRA weights.
+        disable_numpy_memmap (bool): Whether to disable numpy memory mapping when loading weights.
 
     Returns:
         HunyuanVideoTransformer3DModelPacked: The loaded DiT model.
@@ -2104,6 +2123,7 @@ def load_packed_model(
         move_to_device=(loading_device == device),
         target_keys=FP8_OPTIMIZATION_TARGET_KEYS,
         exclude_keys=FP8_OPTIMIZATION_EXCLUDE_KEYS,
+        disable_numpy_memmap=disable_numpy_memmap,
     )
 
     if fp8_scaled:

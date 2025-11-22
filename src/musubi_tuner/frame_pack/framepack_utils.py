@@ -1,10 +1,8 @@
 import os
 import logging
-from types import SimpleNamespace
 from typing import Optional, Union
 
-import accelerate
-from accelerate import Accelerator, init_empty_weights
+from accelerate import init_empty_weights
 import torch
 from safetensors.torch import load_file
 from transformers import (
@@ -22,14 +20,17 @@ from transformers import (
 from musubi_tuner.utils.safetensors_utils import load_split_weights
 from musubi_tuner.hunyuan_model.vae import load_vae as hunyuan_load_vae
 
-import logging
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
 def load_vae(
-    vae_path: str, vae_chunk_size: Optional[int], vae_spatial_tile_sample_min_size: Optional[int], device: Union[str, torch.device]
+    vae_path: str,
+    vae_chunk_size: Optional[int],
+    vae_spatial_tile_sample_min_size: Optional[int],
+    vae_tiling: bool,
+    device: Union[str, torch.device],
 ):
     # single file and directory (contains 'vae') support
     if os.path.isdir(vae_path):
@@ -53,8 +54,7 @@ def load_vae(
         vae.tile_sample_min_size = vae_spatial_tile_sample_min_size
         vae.tile_latent_min_size = vae_spatial_tile_sample_min_size // 8
         logger.info(f"Enabled spatial tiling with min size {vae_spatial_tile_sample_min_size}")
-    # elif vae_tiling:
-    else:
+    elif vae_tiling:
         vae.enable_spatial_tiling(True)
 
     return vae
@@ -121,7 +121,7 @@ def load_text_encoder1(
     args, fp8_llm: Optional[bool] = False, device: Optional[Union[str, torch.device]] = None
 ) -> tuple[LlamaTokenizerFast, LlamaModel]:
     # single file, split file and directory (contains 'text_encoder') support
-    logger.info(f"Loading text encoder 1 tokenizer")
+    logger.info("Loading text encoder 1 tokenizer")
     tokenizer1 = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="tokenizer")
 
     logger.info(f"Loading text encoder 1 from {args.text_encoder1}")
@@ -189,7 +189,7 @@ def load_text_encoder1(
 
 def load_text_encoder2(args) -> tuple[CLIPTokenizer, CLIPTextModel]:
     # single file and directory (contains 'text_encoder_2') support
-    logger.info(f"Loading text encoder 2 tokenizer")
+    logger.info("Loading text encoder 2 tokenizer")
     tokenizer2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="tokenizer_2")
 
     logger.info(f"Loading text encoder 2 from {args.text_encoder2}")
@@ -248,7 +248,7 @@ IMAGE_ENCODER_CONFIG = {
 
 
 def load_image_encoders(args):
-    logger.info(f"Loading image encoder feature extractor")
+    logger.info("Loading image encoder feature extractor")
     feature_extractor = SiglipImageProcessor(**FEATURE_EXTRACTOR_CONFIG)
 
     # single file, split file and directory (contains 'image_encoder') support

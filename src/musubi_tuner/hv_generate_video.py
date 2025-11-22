@@ -1,12 +1,11 @@
 import argparse
 from datetime import datetime
 import gc
-from pathlib import Path
+from importlib.util import find_spec
 import random
-import sys
 import os
 import time
-from typing import Optional, Union
+from typing import Union
 
 import numpy as np
 import torch
@@ -30,37 +29,20 @@ from musubi_tuner.hunyuan_model.fp8_optimization import convert_fp8_linear
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 from musubi_tuner.networks import lora
 
-try:
+lycoris_available = find_spec("lycoris") is not None
+if lycoris_available:
     from lycoris.kohya import create_network_from_weights
-except:
-    pass
 
+from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.model_utils import str_to_dtype
+from musubi_tuner.utils.device_utils import clean_memory_on_device, synchronize_device
 from musubi_tuner.utils.safetensors_utils import mem_eff_save_file
-from musubi_tuner.dataset.image_video_dataset import load_video, glob_images, resize_image_to_bucket
+from musubi_tuner.dataset.image_video_dataset import load_video, resize_image_to_bucket
 
 import logging
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-
-def clean_memory_on_device(device):
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    elif device.type == "cpu":
-        pass
-    elif device.type == "mps":  # not tested
-        torch.mps.empty_cache()
-
-
-def synchronize_device(device: torch.device):
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    elif device.type == "xpu":
-        torch.xpu.synchronize()
-    elif device.type == "mps":
-        torch.mps.synchronize()
 
 
 def get_time_flag():
@@ -295,7 +277,7 @@ def encode_input_prompt(prompt: Union[str, list[str]], args, device, fp8_llm=Fal
     text_encoder_2.eval()
 
     # encode prompt
-    logger.info(f"Encoding prompt with text encoder 1")
+    logger.info("Encoding prompt with text encoder 1")
     text_encoder.to(device=device)
     if fp8_llm:
         with accelerator.autocast():
@@ -306,7 +288,7 @@ def encode_input_prompt(prompt: Union[str, list[str]], args, device, fp8_llm=Fal
     gc.collect()  # transformers==4.54.1 needs this
     clean_memory_on_device(device)
 
-    logger.info(f"Encoding prompt with text encoder 2")
+    logger.info("Encoding prompt with text encoder 2")
     text_encoder_2.to(device=device)
     prompt_embeds_2, prompt_mask_2 = encode_prompt(prompt, device, num_videos, text_encoder_2)
 
@@ -395,6 +377,46 @@ def decode_latents(args, latents, device):
     return image
 
 
+def setup_parser_compile(parser: argparse.ArgumentParser):
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Enable torch.compile (requires Triton) / torch.compileを有効にする（Tritonが必要）",
+    )
+    parser.add_argument(
+        "--compile_backend",
+        type=str,
+        default="inductor",
+        help="torch.compile backend (default: inductor) / torch.compileのバックエンド（デフォルト: inductor）",
+    )
+    parser.add_argument(
+        "--compile_mode",
+        type=str,
+        default="default",  # 学習用のデフォルト
+        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+        help="torch.compile mode (default: default) / torch.compileのモード（デフォルト: default）",
+    )
+    parser.add_argument(
+        "--compile_dynamic",
+        type=str,
+        default=None,
+        choices=["true", "false", "auto"],
+        help="Dynamic shapes mode for torch.compile (default: None, same as auto)"
+        " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
+    )
+    parser.add_argument(
+        "--compile_fullgraph",
+        action="store_true",
+        help="Enable fullgraph mode in torch.compile / torch.compileでフルグラフモードを有効にする",
+    )
+    parser.add_argument(
+        "--compile_cache_size_limit",
+        type=int,
+        default=None,
+        help="Set torch._dynamo.config.cache_size_limit (default: PyTorch default, typically 8-32) / torch._dynamo.config.cache_size_limitを設定（デフォルト: PyTorchのデフォルト、通常8-32）",
+    )
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="HunyuanVideo inference script")
 
@@ -467,22 +489,30 @@ def parse_args():
         "--vae_spatial_tile_sample_min_size", type=int, default=None, help="spatial tile sample min size for VAE, default 256"
     )
     parser.add_argument("--blocks_to_swap", type=int, default=None, help="number of blocks to swap in the model")
+    parser.add_argument(
+        "--use_pinned_memory_for_block_swap",
+        action="store_true",
+        help="use pinned memory for block swapping, which may speed up data transfer between CPU and GPU but uses more shared GPU memory on Windows",
+    )
     parser.add_argument("--img_in_txt_in_offloading", action="store_true", help="offload img_in and txt_in to cpu")
     parser.add_argument(
         "--output_type", type=str, default="video", choices=["video", "images", "latent", "both"], help="output type"
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
-    parser.add_argument("--lycoris", action="store_true", help="use lycoris for inference")
+    parser.add_argument(
+        "--lycoris", action="store_true", help=f"use lycoris for inference{'' if lycoris_available else ' (not available)'}"
+    )
     parser.add_argument("--fp8_fast", action="store_true", help="Enable fast FP8 arthimetic(RTX 4XXX+)")
-    parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
     parser.add_argument(
         "--compile_args",
         nargs=4,
         metavar=("BACKEND", "MODE", "DYNAMIC", "FULLGRAPH"),
-        default=["inductor", "max-autotune-no-cudagraphs", "False", "False"],
-        help="Torch.compile settings",
+        # default=["inductor", "max-autotune-no-cudagraphs", "False", "False"],
+        default=None,
+        help="[Deprecated] Torch.compile settings. Use individual args instead.",
     )
+    setup_parser_compile(parser)
 
     args = parser.parse_args()
 
@@ -494,6 +524,9 @@ def parse_args():
 
     if args.fp8_fast and not args.fp8:
         raise ValueError("--fp8_fast requires --fp8")
+
+    if args.lycoris and not lycoris_available:
+        raise ValueError("install lycoris: https://github.com/KohakuBlueleaf/LyCORIS")
 
     return args
 
@@ -587,7 +620,7 @@ def main():
             video = torch.from_numpy(video).permute(3, 0, 1, 2).unsqueeze(0).float()  # 1, C, F, H, W
             video = video / 255.0
 
-            logger.info(f"Encoding video to latents")
+            logger.info("Encoding video to latents")
             video_latents = encode_to_latents(args, video, device)
             video_latents = video_latents.to(device=device, dtype=dit_dtype)
 
@@ -604,7 +637,7 @@ def main():
             image = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).unsqueeze(2).float()  # 1, C, 1, H, W
             image = image / 255.0
 
-            logger.info(f"Encoding image to latents")
+            logger.info("Encoding image to latents")
             image_latents = encode_to_latents(args, image, device)  # 1, C, 1, H, W
             image_latents = image_latents.to(device=device, dtype=dit_dtype)
 
@@ -695,34 +728,11 @@ def main():
                 param.to(dtype=dtype_to_use)
             convert_fp8_linear(transformer, dit_dtype, params_to_keep=params_to_keep)
 
-        if args.compile:
-            compile_backend, compile_mode, compile_dynamic, compile_fullgraph = args.compile_args
-            logger.info(
-                f"Torch Compiling[Backend: {compile_backend}; Mode: {compile_mode}; Dynamic: {compile_dynamic}; Fullgraph: {compile_fullgraph}]"
-            )
-            torch._dynamo.config.cache_size_limit = 32
-            for i, block in enumerate(transformer.single_blocks):
-                compiled_block = torch.compile(
-                    block,
-                    backend=compile_backend,
-                    mode=compile_mode,
-                    dynamic=compile_dynamic.lower() in "true",
-                    fullgraph=compile_fullgraph.lower() in "true",
-                )
-                transformer.single_blocks[i] = compiled_block
-            for i, block in enumerate(transformer.double_blocks):
-                compiled_block = torch.compile(
-                    block,
-                    backend=compile_backend,
-                    mode=compile_mode,
-                    dynamic=compile_dynamic.lower() in "true",
-                    fullgraph=compile_fullgraph.lower() in "true",
-                )
-                transformer.double_blocks[i] = compiled_block
-
         if blocks_to_swap > 0:
             logger.info(f"Enable swap {blocks_to_swap} blocks to CPU from device: {device}")
-            transformer.enable_block_swap(blocks_to_swap, device, supports_backward=False)
+            transformer.enable_block_swap(
+                blocks_to_swap, device, supports_backward=False, use_pinned_memory=args.use_pinned_memory_for_block_swap
+            )
             transformer.move_to_device_except_swap_blocks(device)
             transformer.prepare_block_swap_before_forward()
         else:
@@ -732,8 +742,20 @@ def main():
             logger.info("Enable offloading img_in and txt_in to CPU")
             transformer.enable_img_in_txt_in_offloading()
 
+        if args.compile:
+            if args.compile_args is not None:
+                # deprecated
+                args.compile_backend, args.compile_mode, args.compile_dynamic, compile_fullgraph = args.compile_args
+                args.compile_dynamic = args.compile_dynamic.lower()
+                args.compile_fullgraph = compile_fullgraph.lower() in "true"
+                args.compile_cache_size_limit = 32  # old default value
+
+            transformer = model_utils.compile_transformer(
+                args, transformer, [transformer.double_blocks, transformer.single_blocks], disable_linear=blocks_to_swap > 0
+            )
+
         # load scheduler
-        logger.info(f"Loading scheduler")
+        logger.info("Loading scheduler")
         scheduler = FlowMatchDiscreteScheduler(shift=args.flow_shift, reverse=True, solver="euler")
 
         # Prepare timesteps

@@ -9,8 +9,13 @@ from textwrap import dedent, indent
 import json
 from pathlib import Path
 
-# from toolz import curry
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from multiprocessing.sharedctypes import Synchronized
+
+SharedEpoch = Optional["Synchronized[int]"]
+
 
 import toml
 import voluptuous
@@ -49,6 +54,8 @@ class ImageDatasetParams(BaseDatasetParams):
     fp_1f_target_index: Optional[int] = None
     fp_1f_no_post: Optional[bool] = False
     flux_kontext_no_resize_control: Optional[bool] = False  # if True, control images are not resized to target resolution
+    qwen_image_edit_no_resize_control: Optional[bool] = False  # if True, control images are not resized to target resolution
+    qwen_image_edit_control_resolution: Optional[Tuple[int, int]] = None  # if set, control images are resized to this resolution
 
 
 @dataclass
@@ -119,6 +126,8 @@ class ConfigSanitizer:
         "fp_1f_target_index": int,
         "fp_1f_no_post": bool,
         "flux_kontext_no_resize_control": bool,
+        "qwen_image_edit_no_resize_control": bool,
+        "qwen_image_edit_control_resolution": functools.partial(__validate_and_convert_scalar_or_twodim.__func__, int),
     }
     VIDEO_DATASET_DISTINCT_SCHEMA = {
         "video_directory": str,
@@ -256,7 +265,10 @@ class BlueprintGenerator:
 
 # if training is True, it will return a dataset group for training, otherwise for caching
 def generate_dataset_group_by_blueprint(
-    dataset_group_blueprint: DatasetGroupBlueprint, training: bool = False, num_timestep_buckets: Optional[int] = None
+    dataset_group_blueprint: DatasetGroupBlueprint,
+    training: bool = False,
+    num_timestep_buckets: Optional[int] = None,
+    shared_epoch: SharedEpoch = None,
 ) -> DatasetGroup:
     datasets: List[Union[ImageDataset, VideoDataset]] = []
 
@@ -308,6 +320,8 @@ def generate_dataset_group_by_blueprint(
         fp_1f_target_index: {dataset.fp_1f_target_index}
         fp_1f_no_post: {dataset.fp_1f_no_post}
         flux_kontext_no_resize_control: {dataset.flux_kontext_no_resize_control}
+        qwen_image_edit_no_resize_control: {dataset.qwen_image_edit_no_resize_control}
+        qwen_image_edit_control_resolution: {dataset.qwen_image_edit_control_resolution}
     \n"""
                 ),
                 "    ",
@@ -337,7 +351,7 @@ def generate_dataset_group_by_blueprint(
     seed = random.randint(0, 2**31)  # actual seed is seed + epoch_no
     for i, dataset in enumerate(datasets):
         # logger.info(f"[Dataset {i}]")
-        dataset.set_seed(seed)
+        dataset.set_seed(seed, shared_epoch)
         if training:
             dataset.prepare_for_training(num_timestep_buckets=num_timestep_buckets)
 

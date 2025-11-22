@@ -1,10 +1,6 @@
 import argparse
-import os
-from typing import Optional, Union
 
-import numpy as np
 import torch
-from tqdm import tqdm
 from transformers import LlamaTokenizerFast, LlamaModel, CLIPTokenizer, CLIPTextModel
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
@@ -97,7 +93,9 @@ def main():
     )
 
     # remove cache files not in dataset
-    cache_text_encoder_outputs.post_process_cache_files(datasets, all_cache_files_for_dataset, all_cache_paths_for_dataset, args.keep_cache)
+    cache_text_encoder_outputs.post_process_cache_files(
+        datasets, all_cache_files_for_dataset, all_cache_paths_for_dataset, args.keep_cache
+    )
 
 
 def framepack_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:

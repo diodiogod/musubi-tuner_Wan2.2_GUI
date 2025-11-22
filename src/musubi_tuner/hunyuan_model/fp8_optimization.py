@@ -1,7 +1,8 @@
-#based on ComfyUI's and MinusZoneAI's fp8_linear optimization
-#further borrowed from HunyuanVideoWrapper for Musubi Tuner
+# based on ComfyUI's and MinusZoneAI's fp8_linear optimization
+# further borrowed from HunyuanVideoWrapper for Musubi Tuner
 import torch
 import torch.nn as nn
+
 
 def fp8_linear_forward(cls, original_dtype, input):
     weight_dtype = cls.weight.dtype
@@ -28,9 +29,10 @@ def fp8_linear_forward(cls, original_dtype, input):
     else:
         return cls.original_forward(input)
 
+
 def convert_fp8_linear(module, original_dtype, params_to_keep={}):
     setattr(module, "fp8_matmul_enabled", True)
-   
+
     for name, module in module.named_modules():
         if not any(keyword in name for keyword in params_to_keep):
             if isinstance(module, nn.Linear):

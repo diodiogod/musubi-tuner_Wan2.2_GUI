@@ -1,15 +1,10 @@
 import argparse
-import os
-import glob
-from typing import Optional, Union
+from typing import Optional
 
-import numpy as np
 import torch
-from tqdm import tqdm
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
-from PIL import Image
 
 import logging
 
@@ -88,9 +83,17 @@ def encode_and_save_batch(vae: WanVAE, clip: Optional[CLIPModel], i2v: bool, bat
         clip_context = None
         y = None
 
-    # control videos
+    # control videos/images
     if batch[0].control_content is not None:
-        control_contents = torch.stack([torch.from_numpy(item.control_content) for item in batch])
+        # Check if control_content is a list (for images) or ndarray (for videos)
+        if isinstance(batch[0].control_content, list):
+            # For images with control images: control_content is list[np.ndarray]
+            # We take the first control image from each item
+            control_contents = torch.stack([torch.from_numpy(item.control_content[0]) for item in batch])
+        else:
+            # For videos with control videos: control_content is np.ndarray
+            control_contents = torch.stack([torch.from_numpy(item.control_content) for item in batch])
+
         if len(control_contents.shape) == 4:
             control_contents = control_contents.unsqueeze(1)
         control_contents = control_contents.permute(0, 4, 1, 2, 3).contiguous()  # B, C, F, H, W
@@ -208,7 +211,7 @@ def encode_and_save_batch_one_frame(vae: WanVAE, clip: Optional[CLIPModel], batc
 
         logger.info(f"Saving cache for item: {item.item_key} at {item.latent_cache_path}")
         logger.info(f"  control_latent_indices: {control_latent_indices}, fp_1f_target_index: {item.fp_1f_target_index}")
-        logger.info(f"  y shape: {y.shape}, mask: {y[0, :,0,0]}, l shape: {l.shape}, clip_context shape: {cctx.shape}")
+        logger.info(f"  y shape: {y.shape}, mask: {y[0, :, 0, 0]}, l shape: {l.shape}, clip_context shape: {cctx.shape}")
         logger.info(f"  f_indices: {f_indices}")
 
         save_latent_cache_wan(item, l, cctx, y, None, f_indices=f_indices)
@@ -219,6 +222,10 @@ def main():
     parser = wan_setup_parser(parser)
 
     args = parser.parse_args()
+
+    if args.disable_cudnn_backend:
+        logger.info("Disabling cuDNN PyTorch backend.")
+        torch.backends.cudnn.enabled = False
 
     if args.clip is not None:
         args.i2v = True

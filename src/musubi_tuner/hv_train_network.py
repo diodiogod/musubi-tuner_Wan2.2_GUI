@@ -39,6 +39,7 @@ from musubi_tuner.hunyuan_model.models import load_transformer, get_rotary_pos_e
 import musubi_tuner.hunyuan_model.text_encoder as text_encoder_module
 from musubi_tuner.hunyuan_model.vae import load_vae, VAE_VER
 import musubi_tuner.hunyuan_model.vae as vae_module
+from musubi_tuner.modules.lr_schedulers import RexLR
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
 import musubi_tuner.networks.lora as lora_module
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
@@ -85,9 +86,8 @@ def clean_memory_on_device(device: torch.device):
 
 # for collate_fn: epoch and step is multiprocessing.Value
 class collator_class:
-    def __init__(self, epoch, step, dataset):
+    def __init__(self, epoch, dataset):
         self.current_epoch = epoch
-        self.current_step = step
         self.dataset = dataset  # not used if worker_info is not None, in case of multiprocessing
 
     def __call__(self, examples):
@@ -98,10 +98,9 @@ class collator_class:
         else:
             dataset = self.dataset
 
-        # set epoch and step
+        # set epoch for validation
         dataset.set_current_epoch(self.current_epoch.value)
-        dataset.set_current_step(self.current_step.value)
-        return examples[0]
+        return examples[0]  # batch size is always 1, so we unwrap it here
 
 
 def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
@@ -170,7 +169,7 @@ def prepare_accelerator(args: argparse.Namespace) -> Accelerator:
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision=args.mixed_precision,
+        mixed_precision=args.mixed_precision if args.mixed_precision else None,
         log_with=log_with,
         project_dir=logging_dir,
         dynamo_plugin=dynamo_plugin,
@@ -235,23 +234,23 @@ def line_to_prompt_dict(line: str) -> dict:
 
             m = re.match(r"i (.+)", parg, re.IGNORECASE)
             if m:  # image path
-                prompt_dict["image_path"] = m.group(1)
+                prompt_dict["image_path"] = m.group(1).strip()
                 continue
 
             m = re.match(r"ei (.+)", parg, re.IGNORECASE)
             if m:  # end image path
-                prompt_dict["end_image_path"] = m.group(1)
+                prompt_dict["end_image_path"] = m.group(1).strip()
                 continue
 
             m = re.match(r"cn (.+)", parg, re.IGNORECASE)
             if m:
-                prompt_dict["control_video_path"] = m.group(1)
+                prompt_dict["control_video_path"] = m.group(1).strip()
                 continue
 
             m = re.match(r"ci (.+)", parg, re.IGNORECASE)
             if m:
                 # can be multiple control images
-                control_image_path = m.group(1)
+                control_image_path = m.group(1).strip()
                 if "control_image_path" not in prompt_dict:
                     prompt_dict["control_image_path"] = []
                 prompt_dict["control_image_path"].append(control_image_path)
@@ -259,7 +258,7 @@ def line_to_prompt_dict(line: str) -> dict:
 
             m = re.match(r"of (.+)", parg, re.IGNORECASE)
             if m:  # output folder
-                prompt_dict["one_frame"] = m.group(1)
+                prompt_dict["one_frame"] = m.group(1).strip()
                 continue
 
         except ValueError as ex:
@@ -415,7 +414,7 @@ class NetworkTrainer:
 
             logs[f"lr/{lr_desc}"] = lr
 
-            if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():
+            if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower().endswith("Prodigy".lower()):
                 # tracking d*lr value
                 logs[f"lr/d*lr/{lr_desc}"] = (
                     lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
@@ -432,7 +431,9 @@ class NetworkTrainer:
 
             for i in range(idx, len(lrs)):
                 logs[f"lr/group{i}"] = float(lrs[i])
-                if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower() == "Prodigy".lower():
+                if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower().endswith(
+                    "Prodigy".lower()
+                ):
                     logs[f"lr/d*lr/group{i}"] = (
                         lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
                     )
@@ -475,31 +476,31 @@ class NetworkTrainer:
                 optimizer_kwargs["relative_step"] = True  # default
             if not optimizer_kwargs["relative_step"] and optimizer_kwargs.get("warmup_init", False):
                 logger.info(
-                    f"set relative_step to True because warmup_init is True / warmup_initがTrueのためrelative_stepをTrueにします"
+                    "set relative_step to True because warmup_init is True / warmup_initがTrueのためrelative_stepをTrueにします"
                 )
                 optimizer_kwargs["relative_step"] = True
             logger.info(f"use Adafactor optimizer | {optimizer_kwargs}")
 
             if optimizer_kwargs["relative_step"]:
-                logger.info(f"relative_step is true / relative_stepがtrueです")
+                logger.info("relative_step is true / relative_stepがtrueです")
                 if lr != 0.0:
-                    logger.warning(f"learning rate is used as initial_lr / 指定したlearning rateはinitial_lrとして使用されます")
+                    logger.warning("learning rate is used as initial_lr / 指定したlearning rateはinitial_lrとして使用されます")
                 args.learning_rate = None
 
                 if args.lr_scheduler != "adafactor":
-                    logger.info(f"use adafactor_scheduler / スケジューラにadafactor_schedulerを使用します")
+                    logger.info("use adafactor_scheduler / スケジューラにadafactor_schedulerを使用します")
                 args.lr_scheduler = f"adafactor:{lr}"  # ちょっと微妙だけど
 
                 lr = None
             else:
                 if args.max_grad_norm != 0.0:
                     logger.warning(
-                        f"because max_grad_norm is set, clip_grad_norm is enabled. consider set to 0 / max_grad_normが設定されているためclip_grad_normが有効になります。0に設定して無効にしたほうがいいかもしれません"
+                        "because max_grad_norm is set, clip_grad_norm is enabled. consider set to 0 / max_grad_normが設定されているためclip_grad_normが有効になります。0に設定して無効にしたほうがいいかもしれません"
                     )
                 if args.lr_scheduler != "constant_with_warmup":
-                    logger.warning(f"constant_with_warmup will be good / スケジューラはconstant_with_warmupが良いかもしれません")
+                    logger.warning("constant_with_warmup will be good / スケジューラはconstant_with_warmupが良いかもしれません")
                 if optimizer_kwargs.get("clip_threshold", 1.0) != 1.0:
-                    logger.warning(f"clip_threshold=1.0 will be good / clip_thresholdは1.0が良いかもしれません")
+                    logger.warning("clip_threshold=1.0 will be good / clip_thresholdは1.0が良いかもしれません")
 
             optimizer_class = transformers.optimization.Adafactor
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
@@ -541,7 +542,7 @@ class NetworkTrainer:
     def is_schedulefree_optimizer(self, optimizer: torch.optim.Optimizer, args: argparse.Namespace) -> bool:
         return args.optimizer_type.lower().endswith("schedulefree".lower())  # or args.optimizer_schedulefree_wrapper
 
-    def get_dummy_scheduler(optimizer: torch.optim.Optimizer) -> Any:
+    def get_dummy_scheduler(self, optimizer: torch.optim.Optimizer) -> Any:
         # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
         # this scheduler is used for logging only.
         # this isn't be wrapped by accelerator because of this class is not a subclass of torch.optim.lr_scheduler._LRScheduler
@@ -606,12 +607,24 @@ class NetworkTrainer:
             return lr_scheduler
 
         if name.startswith("adafactor"):
-            assert (
-                type(optimizer) == transformers.optimization.Adafactor
-            ), f"adafactor scheduler must be used with Adafactor optimizer / adafactor schedulerはAdafactorオプティマイザと同時に使ってください"
+            assert type(optimizer) == transformers.optimization.Adafactor, (
+                "adafactor scheduler must be used with Adafactor optimizer / adafactor schedulerはAdafactorオプティマイザと同時に使ってください"
+            )
             initial_lr = float(name.split(":")[1])
             # logger.info(f"adafactor scheduler init lr {initial_lr}")
             return wrap_check_needless_num_warmup_steps(transformers.optimization.AdafactorSchedule(optimizer, initial_lr))
+
+        if name.lower() == "rex":
+            return RexLR(
+                optimizer,
+                max_lr=args.learning_rate,
+                min_lr=(  # Will start and end with min_lr, use non-zero min_lr by default
+                    args.learning_rate * min_lr_ratio if min_lr_ratio is not None else args.learning_rate * 0.01
+                ),
+                num_steps=num_training_steps,
+                num_warmup_steps=num_warmup_steps,
+                **lr_scheduler_kwargs,
+            )
 
         if name == DiffusersSchedulerType.PIECEWISE_CONSTANT.value:
             name = DiffusersSchedulerType(name)
@@ -1058,18 +1071,18 @@ class NetworkTrainer:
             max_count = max(sampled_timesteps)
             print(f"Sampled timesteps: max count={max_count}")
             for i, t in enumerate(sampled_timesteps):
-                line = f"{(i)*N_TIMESTEPS_PER_LINE:4d}-{(i+1)*N_TIMESTEPS_PER_LINE-1:4d}: "
+                line = f"{(i) * N_TIMESTEPS_PER_LINE:4d}-{(i + 1) * N_TIMESTEPS_PER_LINE - 1:4d}: "
                 line += "#" * int(t / max_count * CONSOLE_WIDTH)
                 print(line)
 
             max_weighting = max(sampled_weighting)
             print(f"Sampled loss weighting: max weighting={max_weighting}")
             for i, w in enumerate(sampled_weighting):
-                line = f"{i*N_TIMESTEPS_PER_LINE:4d}-{(i+1)*N_TIMESTEPS_PER_LINE-1:4d}: {w:8.2f} "
+                line = f"{i * N_TIMESTEPS_PER_LINE:4d}-{(i + 1) * N_TIMESTEPS_PER_LINE - 1:4d}: {w:8.2f} "
                 line += "#" * int(w / max_weighting * CONSOLE_WIDTH)
                 print(line)
 
-    def sample_images(self, accelerator, args, epoch, steps, vae, transformer, sample_parameters, dit_dtype):
+    def sample_images(self, accelerator: Accelerator, args, epoch, steps, vae, transformer, sample_parameters, dit_dtype):
         """architecture independent sample images"""
         if not should_sample_images(args, steps, epoch):
             return
@@ -1435,7 +1448,7 @@ class NetworkTrainer:
             image = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).unsqueeze(2).float()  # 1, C, 1, H, W
             image = image / 255.0
 
-            logger.info(f"Encoding image to latents")
+            logger.info("Encoding image to latents")
             image_latents = encode_to_latents(args, image, device)  # 1, C, 1, H, W
             image_latents = image_latents.to(device=device, dtype=dit_dtype)
 
@@ -1459,7 +1472,7 @@ class NetworkTrainer:
         # Wrap the inner loop with tqdm to track progress over timesteps
         prompt_idx = sample_parameter.get("enum", 0)
         with torch.no_grad():
-            for i, t in enumerate(tqdm(timesteps, desc=f"Sampling timesteps for prompt {prompt_idx+1}")):
+            for i, t in enumerate(tqdm(timesteps, desc=f"Sampling timesteps for prompt {prompt_idx + 1}")):
                 latents_input = scheduler.scale_model_input(latents, t)
 
                 if do_classifier_free_guidance:
@@ -1542,6 +1555,12 @@ class NetworkTrainer:
 
         return transformer
 
+    def compile_transformer(self, args, transformer):
+        transformer: HYVideoDiffusionTransformer = transformer
+        return model_utils.compile_transformer(
+            args, transformer, [transformer.double_blocks, transformer.single_blocks], disable_linear=self.blocks_to_swap > 0
+        )
+
     def scale_shift_latents(self, latents):
         latents = latents * vae_module.SCALING_FACTOR
         return latents
@@ -1608,6 +1627,15 @@ class NetworkTrainer:
     # endregion model specific
 
     def train(self, args):
+        if torch.cuda.is_available():
+            if args.cuda_allow_tf32:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                logger.info("Enabled TF32 on CUDA / CUDAでTF32を有効化しました")
+            if args.cuda_cudnn_benchmark:
+                torch.backends.cudnn.benchmark = True
+                logger.info("Enabled cuDNN benchmark / cuDNNベンチマークを有効化しました")
+
         # check required arguments
         if args.dataset_config is None:
             raise ValueError("dataset_config is required / dataset_configが必要です")
@@ -1619,6 +1647,12 @@ class NetworkTrainer:
             raise ValueError(
                 "SageAttention doesn't support training currently. Please use `--sdpa` or `--xformers` etc. instead."
                 " / SageAttentionは現在学習をサポートしていないようです。`--sdpa`や`--xformers`などの他のオプションを使ってください"
+            )
+
+        if args.disable_numpy_memmap:
+            logger.info(
+                "Disabling numpy memory mapping for model loading (for Wan, FramePack and Qwen-Image). This may lead to higher memory usage but can speed up loading in some cases."
+                " / モデル読み込み時のnumpyメモリマッピングを無効にします（Wan、FramePack、Qwen-Imageでのみ有効）。これによりメモリ使用量が増える可能性がありますが、場合によっては読み込みが高速化されることがあります"
             )
 
         # check model specific arguments
@@ -1642,25 +1676,31 @@ class NetworkTrainer:
             logger.info(f"Using timestep bucketing. Number of buckets: {args.num_timestep_buckets}")
         self.num_timestep_buckets = args.num_timestep_buckets  # None or int, None makes all the behavior same as before
 
+        current_epoch = Value("i", 0)  # shared between processes
+
         blueprint_generator = BlueprintGenerator(ConfigSanitizer())
         logger.info(f"Load dataset config from {args.dataset_config}")
         user_config = config_utils.load_user_config(args.dataset_config)
         blueprint = blueprint_generator.generate(user_config, args, architecture=self.architecture)
         train_dataset_group = config_utils.generate_dataset_group_by_blueprint(
-            blueprint.dataset_group, training=True, num_timestep_buckets=self.num_timestep_buckets
+            blueprint.dataset_group, training=True, num_timestep_buckets=self.num_timestep_buckets, shared_epoch=current_epoch
         )
 
         if train_dataset_group.num_train_items == 0:
-            raise ValueError("No training items found in the dataset / データセットに学習データがありません")
+            raise ValueError(
+                "No training items found in the dataset. Please ensure that the latent/Text Encoder cache has been created beforehand."
+                " / データセットに学習データがありません。latent/Text Encoderキャッシュを事前に作成したか確認してください"
+            )
 
-        current_epoch = Value("i", 0)
-        current_step = Value("i", 0)
         ds_for_collator = train_dataset_group if args.max_data_loader_n_workers == 0 else None
-        collator = collator_class(current_epoch, current_step, ds_for_collator)
+        collator = collator_class(current_epoch, ds_for_collator)
 
         # prepare accelerator
         logger.info("preparing accelerator")
         accelerator = prepare_accelerator(args)
+        if args.mixed_precision is None:
+            args.mixed_precision = accelerator.mixed_precision
+            logger.info(f"mixed precision set to {args.mixed_precision} / mixed precisionを{args.mixed_precision}に設定")
         is_main_process = accelerator.is_main_process
 
         # prepare dtype
@@ -1705,7 +1745,7 @@ class NetworkTrainer:
             attn_mode = "flash3"
         else:
             raise ValueError(
-                f"either --sdpa, --flash-attn, --flash3, --sage-attn or --xformers must be specified / --sdpa, --flash-attn, --flash3, --sage-attn, --xformersのいずれかを指定してください"
+                "either --sdpa, --flash-attn, --flash3, --sage-attn or --xformers must be specified / --sdpa, --flash-attn, --flash3, --sage-attn, --xformersのいずれかを指定してください"
             )
         transformer = self.load_transformer(
             accelerator, args, args.dit, attn_mode, args.split_attn, loading_device, dit_weight_dtype
@@ -1714,8 +1754,12 @@ class NetworkTrainer:
         transformer.requires_grad_(False)
 
         if blocks_to_swap > 0:
-            logger.info(f"enable swap {blocks_to_swap} blocks to CPU from device: {accelerator.device}")
-            transformer.enable_block_swap(blocks_to_swap, accelerator.device, supports_backward=True)
+            logger.info(
+                f"enable swap {blocks_to_swap} blocks to CPU from device: {accelerator.device}, use pinned memory: {args.use_pinned_memory_for_block_swap}"
+            )
+            transformer.enable_block_swap(
+                blocks_to_swap, accelerator.device, supports_backward=True, use_pinned_memory=args.use_pinned_memory_for_block_swap
+            )
             transformer.move_to_device_except_swap_blocks(accelerator.device)
 
         # load network model for differential training
@@ -1791,7 +1835,7 @@ class NetworkTrainer:
             accelerator.print(f"load network weights from {args.network_weights}: {info}")
 
         if args.gradient_checkpointing:
-            transformer.enable_gradient_checkpointing()
+            transformer.enable_gradient_checkpointing(args.gradient_checkpointing_cpu_offload)
             network.enable_gradient_checkpointing()  # may have no effect
 
         # prepare optimizer, data loader etc.
@@ -1837,16 +1881,16 @@ class NetworkTrainer:
         network_dtype = torch.float32
         args.full_fp16 = args.full_bf16 = False  # temporary disabled because stochastic rounding is not supported yet
         if args.full_fp16:
-            assert (
-                args.mixed_precision == "fp16"
-            ), "full_fp16 requires mixed precision='fp16' / full_fp16を使う場合はmixed_precision='fp16'を指定してください。"
+            assert args.mixed_precision == "fp16", (
+                "full_fp16 requires mixed precision='fp16' / full_fp16を使う場合はmixed_precision='fp16'を指定してください。"
+            )
             accelerator.print("enable full fp16 training.")
             network_dtype = weight_dtype
             network.to(network_dtype)
         elif args.full_bf16:
-            assert (
-                args.mixed_precision == "bf16"
-            ), "full_bf16 requires mixed precision='bf16' / full_bf16を使う場合はmixed_precision='bf16'を指定してください。"
+            assert args.mixed_precision == "bf16", (
+                "full_bf16 requires mixed precision='bf16' / full_bf16を使う場合はmixed_precision='bf16'を指定してください。"
+            )
             accelerator.print("enable full bf16 training.")
             network_dtype = weight_dtype
             network.to(network_dtype)
@@ -1861,6 +1905,10 @@ class NetworkTrainer:
             accelerator.unwrap_model(transformer).prepare_block_swap_before_forward()
         else:
             transformer = accelerator.prepare(transformer)
+
+        if args.compile:
+            transformer = self.compile_transformer(args, transformer)
+            transformer.__dict__["_orig_mod"] = transformer  # for annoying accelerator checks
 
         network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(network, optimizer, train_dataloader, lr_scheduler)
         training_model = network
@@ -1932,7 +1980,7 @@ class NetworkTrainer:
 
         # TODO refactor metadata creation and move to util
         metadata = {
-            "ss_" "ss_session_id": session_id,  # random integer indicating which group of epochs the model came from
+            "ss_session_id": session_id,  # random integer indicating which group of epochs the model came from
             "ss_training_started_at": training_started_at,  # unix timestamp
             "ss_output_name": args.output_name,
             "ss_learning_rate": args.learning_rate,
@@ -1940,6 +1988,7 @@ class NetworkTrainer:
             "ss_num_batches_per_epoch": len(train_dataloader),
             "ss_num_epochs": num_train_epochs,
             "ss_gradient_checkpointing": args.gradient_checkpointing,
+            "ss_gradient_checkpointing_cpu_offload": args.gradient_checkpointing_cpu_offload,
             "ss_gradient_accumulation_steps": args.gradient_accumulation_steps,
             "ss_max_train_steps": args.max_train_steps,
             "ss_lr_warmup_steps": args.lr_warmup_steps,
@@ -2064,12 +2113,13 @@ class NetworkTrainer:
                 self.architecture,
                 time.time(),
                 title,
-                None,
+                args.metadata_reso,
                 args.metadata_author,
                 args.metadata_description,
                 args.metadata_license,
                 args.metadata_tags,
                 timesteps=md_timesteps,
+                custom_arch=args.metadata_arch,
             )
 
             metadata_to_save.update(sai_metadata)
@@ -2100,8 +2150,10 @@ class NetworkTrainer:
 
         clean_memory_on_device(accelerator.device)
 
+        optimizer_train_fn()  # Set training mode
+
         for epoch in range(epoch_to_start, num_train_epochs):
-            accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
+            accelerator.print(f"\nepoch {epoch + 1}/{num_train_epochs}")
             current_epoch.value = epoch + 1
 
             metadata["ss_epoch"] = str(epoch + 1)
@@ -2109,9 +2161,9 @@ class NetworkTrainer:
             accelerator.unwrap_model(network).on_epoch_start(transformer)
 
             for step, batch in enumerate(train_dataloader):
+                # torch.compiler.cudagraph_mark_step_begin() # for cudagraphs
+
                 latents = batch["latents"]
-                bsz = latents.shape[0]
-                current_step.value = global_step
 
                 with accelerator.accumulate(training_model):
                     accelerator.unwrap_model(network).on_step_start()
@@ -2170,6 +2222,8 @@ class NetworkTrainer:
 
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
+                    if global_step == 0:
+                        progress_bar.reset()  # exclude first step from progress bar, because it may take long due to initializations
                     progress_bar.update(1)
                     global_step += 1
 
@@ -2292,7 +2346,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
         help="config file for dataset / データセットの設定ファイル",
     )
 
-    # training settings
+    # model settings
     parser.add_argument(
         "--sdpa",
         action="store_true",
@@ -2325,7 +2379,55 @@ def setup_parser_common() -> argparse.ArgumentParser:
         help="use split attention for attention calculation (split batch size=1, affects memory usage and speed)"
         " / attentionを分割して計算する（バッチサイズ=1に分割、メモリ使用量と速度に影響）",
     )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Enable torch.compile (requires Triton) / torch.compileを有効にする（Tritonが必要）",
+    )
+    parser.add_argument(
+        "--compile_backend",
+        type=str,
+        default="inductor",
+        help="torch.compile backend (default: inductor) / torch.compileのバックエンド（デフォルト: inductor）",
+    )
+    parser.add_argument(
+        "--compile_mode",
+        type=str,
+        default="default",  # 学習用のデフォルト
+        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+        help="torch.compile mode (default: default) / torch.compileのモード（デフォルト: default）",
+    )
+    parser.add_argument(
+        "--compile_dynamic",
+        type=str,
+        default=None,
+        choices=["true", "false", "auto"],
+        help="Dynamic shapes mode for torch.compile (default: None, same as auto)"
+        " / torch.compileの動的形状モード（デフォルト: None、autoと同じ動作）",
+    )
+    parser.add_argument(
+        "--compile_fullgraph",
+        action="store_true",
+        help="Enable fullgraph mode in torch.compile / torch.compileでフルグラフモードを有効にする",
+    )
+    parser.add_argument(
+        "--compile_cache_size_limit",
+        type=int,
+        default=None,
+        help="Set torch._dynamo.config.cache_size_limit (default: PyTorch default, typically 8-32) / torch._dynamo.config.cache_size_limitを設定（デフォルト: PyTorchのデフォルト、通常8-32）",
+    )
+    parser.add_argument(
+        "--cuda_allow_tf32",
+        action="store_true",
+        help="Allow TF32 on Ampere or higher GPUs / Ampere以降のGPUでTF32を許可する",
+    )
+    parser.add_argument(
+        "--cuda_cudnn_benchmark",
+        action="store_true",
+        help="Enable cudnn benchmark for possibly faster training / cudnnのベンチマークを有効にして学習の高速化を図る",
+    )
 
+    # training settings
     parser.add_argument("--max_train_steps", type=int, default=1600, help="training steps / 学習ステップ数")
     parser.add_argument(
         "--max_train_epochs",
@@ -2349,6 +2451,11 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--gradient_checkpointing", action="store_true", help="enable gradient checkpointing / gradient checkpointingを有効にする"
     )
     parser.add_argument(
+        "--gradient_checkpointing_cpu_offload",
+        action="store_true",
+        help="enable CPU offloading of activation for gradient checkpointing / gradient checkpointing時に活性化のCPUオフロードを有効にする",
+    )
+    parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
         default=1,
@@ -2357,7 +2464,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mixed_precision",
         type=str,
-        default="no",
+        default=None,
         choices=["no", "fp16", "bf16"],
         help="use mixed precision / 混合精度を使う場合、その精度",
     )
@@ -2470,7 +2577,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--lr_scheduler",
         type=str,
         default="constant",
-        help="scheduler to use for learning rate / 学習率のスケジューラ: linear, cosine, cosine_with_restarts, polynomial, constant (default), constant_with_warmup, adafactor",
+        help="scheduler to use for learning rate / 学習率のスケジューラ: linear, cosine, cosine_with_restarts, polynomial, constant (default), constant_with_warmup, adafactor, rex",
     )
     parser.add_argument(
         "--lr_warmup_steps",
@@ -2509,8 +2616,8 @@ def setup_parser_common() -> argparse.ArgumentParser:
         "--lr_scheduler_min_lr_ratio",
         type=float,
         default=None,
-        help="The minimum learning rate as a ratio of the initial learning rate for cosine with min lr scheduler and warmup decay scheduler"
-        + " / 初期学習率の比率としての最小学習率を指定する、cosine with min lr と warmup decay スケジューラ で有効",
+        help="The minimum learning rate as a ratio of the initial learning rate for cosine with min lr scheduler, warmup decay scheduler and rex scheduler"
+        + " / 初期学習率の比率としての最小学習率を指定する、cosine with min lr スケジューラ、warmup decay スケジューラ、rex スケジューラ で有効",
     )
     parser.add_argument("--lr_scheduler_type", type=str, default="", help="custom scheduler module / 使用するスケジューラ")
     parser.add_argument(
@@ -2560,9 +2667,21 @@ def setup_parser_common() -> argparse.ArgumentParser:
         help="number of blocks to swap in the model, max XXX / モデル内のブロックの数、最大XXX",
     )
     parser.add_argument(
+        "--use_pinned_memory_for_block_swap",
+        action="store_true",
+        help="use pinned memory for block swapping, which may speed up data transfer between CPU and GPU but uses more shared GPU memory on Windows"
+        " / ブロックスワッピングにピン留めメモリを使用する。これによりCPUとGPU間のデータ転送が高速化される可能性があるが、Windowsではより多くの共有GPUメモリを使用する。",
+    )
+    parser.add_argument(
         "--img_in_txt_in_offloading",
         action="store_true",
         help="offload img_in and txt_in to cpu / img_inとtxt_inをCPUにオフロードする",
+    )
+    parser.add_argument(
+        "--disable_numpy_memmap",
+        action="store_true",
+        help="Disable numpy memory mapping for model loading. Only for Wan, FramePack and Qwen-Image. Increases RAM usage but speeds up model loading in some cases."
+        " / モデル読み込み時のnumpyメモリマッピングを無効にします。Wan、FramePack、Qwen-Imageで有効です。RAM使用量が増えますが、場合によってはモデルの読み込みが高速化されます。",
     )
 
     # parser.add_argument("--flow_shift", type=float, default=7.0, help="Shift factor for flow matching schedulers")
@@ -2593,8 +2712,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=str,
         default="none",
         choices=["logit_normal", "mode", "cosmap", "sigma_sqrt", "none"],
-        help="weighting scheme for timestep distribution. Default is none"
-        " / タイムステップ分布の重み付けスキーム、デフォルトはnone",
+        help="weighting scheme for timestep distribution. Default is none / タイムステップ分布の重み付けスキーム、デフォルトはnone",
     )
     parser.add_argument(
         "--logit_mean",
@@ -2814,6 +2932,18 @@ def setup_parser_common() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="tags for model metadata, separated by comma / メタデータに書き込まれるモデルタグ、カンマ区切り",
+    )
+    parser.add_argument(
+        "--metadata_reso",
+        type=str,
+        default=None,
+        help="resolution for model metadata (e.g., `1024,1024`) / メタデータに書き込まれるモデル解像度（例: `1024,1024`）",
+    )
+    parser.add_argument(
+        "--metadata_arch",
+        type=str,
+        default=None,
+        help="architecture for model metadata / メタデータに書き込まれるモデルアーキテクチャ",
     )
 
     # huggingface settings

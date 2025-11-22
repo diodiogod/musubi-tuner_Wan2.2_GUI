@@ -2,14 +2,13 @@ import argparse
 import logging
 import math
 import os
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from transformers import SiglipImageProcessor, SiglipVisionModel
-from PIL import Image
 
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
@@ -66,7 +65,7 @@ def encode_and_save_batch(
     if total_latent_sections < 1:
         min_frames_needed = latent_window_size * 4 + 1
         raise ValueError(
-            f"Not enough frames for FramePack: {batch[0].frame_count} frames ({latent_f} latent frames), minimum required: {min_frames_needed} frames ({latent_window_size+1} latent frames)"
+            f"Not enough frames for FramePack: {batch[0].frame_count} frames ({latent_f} latent frames), minimum required: {min_frames_needed} frames ({latent_window_size + 1} latent frames)"
         )
 
     # actual latent frame count (aligned to section boundaries)
@@ -380,6 +379,10 @@ def main():
 
     args = parser.parse_args()
 
+    if args.disable_cudnn_backend:
+        logger.info("Disabling cuDNN PyTorch backend.")
+        torch.backends.cudnn.enabled = False
+
     if args.vae_dtype is not None:
         raise ValueError("VAE dtype is not supported in FramePack")
     # if args.batch_size != 1:
@@ -407,7 +410,7 @@ def main():
     assert args.vae is not None, "vae checkpoint is required"
 
     logger.info(f"Loading VAE model from {args.vae}")
-    vae = load_vae(args.vae, args.vae_chunk_size, args.vae_spatial_tile_sample_min_size, device=device)
+    vae = load_vae(args.vae, args.vae_chunk_size, args.vae_spatial_tile_sample_min_size, args.vae_tiling, device=device)
     vae.to(device)
 
     logger.info(f"Loading image encoder from {args.image_encoder}")

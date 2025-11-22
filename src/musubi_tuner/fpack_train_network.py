@@ -8,12 +8,10 @@ from PIL import Image
 
 import numpy as np
 import torch
-import torchvision.transforms.functional as TF
-from tqdm import tqdm
-from accelerate import Accelerator, init_empty_weights
+from accelerate import Accelerator
 
 from musubi_tuner.dataset import image_video_dataset
-from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_FRAMEPACK, ARCHITECTURE_FRAMEPACK_FULL, load_video
+from musubi_tuner.dataset.image_video_dataset import ARCHITECTURE_FRAMEPACK, ARCHITECTURE_FRAMEPACK_FULL
 from musubi_tuner.fpack_generate_video import decode_latent
 from musubi_tuner.frame_pack import hunyuan
 from musubi_tuner.frame_pack.clip_vision import hf_clip_vision_encode
@@ -23,15 +21,20 @@ from musubi_tuner.frame_pack.hunyuan_video_packed import HunyuanVideoTransformer
 from musubi_tuner.frame_pack.k_diffusion_hunyuan import sample_hunyuan
 from musubi_tuner.frame_pack.utils import crop_or_pad_yield_mask
 from musubi_tuner.dataset.image_video_dataset import resize_image_to_bucket
-from musubi_tuner.hv_train_network import NetworkTrainer, load_prompts, clean_memory_on_device, setup_parser_common, read_config_from_file
+from musubi_tuner.hv_train_network import (
+    NetworkTrainer,
+    load_prompts,
+    clean_memory_on_device,
+    setup_parser_common,
+    read_config_from_file,
+)
 
 import logging
 
+from musubi_tuner.utils import model_utils
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-from musubi_tuner.utils import model_utils
-from musubi_tuner.utils.safetensors_utils import load_safetensors, MemoryEfficientSafeOpen
 
 
 class FramePackNetworkTrainer(NetworkTrainer):
@@ -182,7 +185,7 @@ class FramePackNetworkTrainer(NetworkTrainer):
         latent_f = (frame_count - 1) // 4 + 1
         total_latent_sections = math.floor((latent_f - 1) / latent_window_size)
         if total_latent_sections < 1 and not one_frame_mode:
-            logger.warning(f"Not enough frames for FramePack: {latent_f}, minimum: {latent_window_size*4+1}")
+            logger.warning(f"Not enough frames for FramePack: {latent_f}, minimum: {latent_window_size * 4 + 1}")
             return None
 
         latent_f = total_latent_sections * latent_window_size + 1
@@ -206,7 +209,7 @@ class FramePackNetworkTrainer(NetworkTrainer):
             return hunyuan.vae_encode(image, vae).to("cpu"), alpha
 
         # VAE encoding
-        logger.info(f"Encoding image to latent space")
+        logger.info("Encoding image to latent space")
         vae.to(device)
 
         start_latent, _ = (
@@ -363,13 +366,13 @@ class FramePackNetworkTrainer(NetworkTrainer):
                 return mask_image
 
             if control_latents is None or len(control_latents) == 0:
-                logger.info(f"No control images provided for one frame inference. Use zero latents for control images.")
+                logger.info("No control images provided for one frame inference. Use zero latents for control images.")
                 control_latents = [torch.zeros(1, 16, 1, height // 8, width // 8, dtype=torch.float32)]
 
             if "no_post" not in one_frame_inference:
                 # add zero latents as clean latents post
                 control_latents.append(torch.zeros((1, 16, 1, height // 8, width // 8), dtype=torch.float32))
-                logger.info(f"Add zero latents as clean latents post for one frame inference.")
+                logger.info("Add zero latents as clean latents post for one frame inference.")
 
             # kisekaeichi and 1f-mc: both are using control images, but indices are different
             clean_latents = torch.cat(control_latents, dim=2)  # (1, 16, num_control_images, H//8, W//8)
@@ -382,7 +385,7 @@ class FramePackNetworkTrainer(NetworkTrainer):
                 control_alpha = control_alphas[i]
                 if control_alpha is not None:
                     latent_mask = get_latent_mask(control_alpha)
-                    logger.info(f"Apply mask for clean latents 1x for {i+1}: shape: {latent_mask.shape}")
+                    logger.info(f"Apply mask for clean latents 1x for {i + 1}: shape: {latent_mask.shape}")
                     clean_latents[:, :, i : i + 1, :, :] = clean_latents[:, :, i : i + 1, :, :] * latent_mask
 
             for one_frame_param in one_frame_inference:
@@ -402,7 +405,7 @@ class FramePackNetworkTrainer(NetworkTrainer):
             if "no_2x" in one_frame_inference:
                 clean_latents_2x = None
                 clean_latent_2x_indices = None
-                logger.info(f"No clean_latents_2x")
+                logger.info("No clean_latents_2x")
             else:
                 clean_latents_2x = torch.zeros((1, 16, 2, height // 8, width // 8), dtype=torch.float32)
                 index = 1 + latent_window_size + 1
@@ -411,7 +414,7 @@ class FramePackNetworkTrainer(NetworkTrainer):
             if "no_4x" in one_frame_inference:
                 clean_latents_4x = None
                 clean_latent_4x_indices = None
-                logger.info(f"No clean_latents_4x")
+                logger.info("No clean_latents_4x")
             else:
                 clean_latents_4x = torch.zeros((1, 16, 16, height // 8, width // 8), dtype=torch.float32)
                 index = 1 + latent_window_size + 1 + 2
@@ -485,7 +488,7 @@ class FramePackNetworkTrainer(NetworkTrainer):
     def load_vae(self, args: argparse.Namespace, vae_dtype: torch.dtype, vae_path: str):
         vae_path = args.vae
         logger.info(f"Loading VAE model from {vae_path}")
-        vae = load_framepack_vae(args.vae, args.vae_chunk_size, args.vae_spatial_tile_sample_min_size, "cpu")
+        vae = load_framepack_vae(args.vae, args.vae_chunk_size, args.vae_spatial_tile_sample_min_size, args.vae_tiling, "cpu")
         return vae
 
     def load_transformer(
@@ -500,8 +503,19 @@ class FramePackNetworkTrainer(NetworkTrainer):
     ):
         logger.info(f"Loading DiT model from {dit_path}")
         device = accelerator.device
-        model = load_packed_model(device, dit_path, attn_mode, loading_device, args.fp8_scaled, split_attn)
+        model = load_packed_model(
+            device, dit_path, attn_mode, loading_device, args.fp8_scaled, split_attn, disable_numpy_memmap=args.disable_numpy_memmap
+        )
         return model
+
+    def compile_transformer(self, args, transformer):
+        transformer: HunyuanVideoTransformer3DModelPacked = transformer
+        return model_utils.compile_transformer(
+            args,
+            transformer,
+            [transformer.transformer_blocks, transformer.single_transformer_blocks],
+            disable_linear=self.blocks_to_swap > 0,
+        )
 
     def scale_shift_latents(self, latents):
         # FramePack VAE includes scaling
@@ -584,6 +598,11 @@ def framepack_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argument
     parser.add_argument("--fp8_llm", action="store_true", help="use fp8 for LLM / LLMにfp8を使う")
     parser.add_argument("--text_encoder1", type=str, help="Text Encoder 1 directory / テキストエンコーダ1のディレクトリ")
     parser.add_argument("--text_encoder2", type=str, help="Text Encoder 2 directory / テキストエンコーダ2のディレクトリ")
+    parser.add_argument(
+        "--vae_tiling",
+        action="store_true",
+        help="enable spatial tiling for VAE, default is False. If vae_spatial_tile_sample_min_size is set, this is automatically enabled",
+    )
     parser.add_argument("--vae_chunk_size", type=int, default=None, help="chunk size for CausalConv3d in VAE")
     parser.add_argument(
         "--vae_spatial_tile_sample_min_size", type=int, default=None, help="spatial tile sample min size for VAE, default 256"
@@ -603,9 +622,9 @@ def main():
     args = parser.parse_args()
     args = read_config_from_file(args, parser)
 
-    assert (
-        args.vae_dtype is None or args.vae_dtype == "float16"
-    ), "VAE dtype must be float16 / VAEのdtypeはfloat16でなければなりません"
+    assert args.vae_dtype is None or args.vae_dtype == "float16", (
+        "VAE dtype must be float16 / VAEのdtypeはfloat16でなければなりません"
+    )
     args.vae_dtype = "float16"  # fixed
     args.dit_dtype = "bfloat16"  # fixed
     args.sample_solver = "unipc"  # for sample generation, fixed to unipc

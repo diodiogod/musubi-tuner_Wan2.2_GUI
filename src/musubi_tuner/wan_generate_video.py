@@ -1,13 +1,13 @@
 import argparse
-from datetime import datetime
 import gc
+from importlib.util import find_spec
 import random
 import os
 import re
 import time
 import math
 import copy
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from typing import Tuple, Optional, List, Union, Any, Dict
 
 import torch
@@ -23,10 +23,10 @@ from tqdm import tqdm
 
 from musubi_tuner.dataset import image_video_dataset
 from musubi_tuner.networks import lora_wan
+from musubi_tuner.utils import model_utils
 from musubi_tuner.utils.lora_utils import filter_lora_state_dict
-from musubi_tuner.utils.safetensors_utils import mem_eff_save_file, load_safetensors
+from musubi_tuner.utils.safetensors_utils import mem_eff_save_file
 from musubi_tuner.wan.configs import WAN_CONFIGS, SUPPORTED_SIZES
-import musubi_tuner.wan as wan
 from musubi_tuner.wan.modules.model import WanModel, load_wan_model, detect_wan_sd_dtype
 from musubi_tuner.wan.modules.vae import WanVAE
 from musubi_tuner.wan.modules.t5 import T5EncoderModel
@@ -35,14 +35,13 @@ from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscret
 from musubi_tuner.wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
 from musubi_tuner.wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
-try:
+lycoris_available = find_spec("lycoris") is not None
+if lycoris_available:
     from lycoris.kohya import create_network_from_weights
-except:
-    pass
 
 from musubi_tuner.utils.model_utils import str_to_dtype
-from musubi_tuner.utils.device_utils import clean_memory_on_device
-from musubi_tuner.hv_generate_video import get_time_flag, save_images_grid, save_videos_grid, synchronize_device
+from musubi_tuner.utils.device_utils import clean_memory_on_device, synchronize_device
+from musubi_tuner.hv_generate_video import get_time_flag, save_images_grid, save_videos_grid, setup_parser_compile
 from musubi_tuner.dataset.image_video_dataset import load_video
 
 import logging
@@ -75,8 +74,14 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--dit", type=str, default=None, help="DiT checkpoint path")
     parser.add_argument("--dit_high_noise", type=str, default=None, help="DiT checkpoint path for high noise (optional)")
+    parser.add_argument(
+        "--force_v2_1_time_embedding", action="store_true", help="Force using 2.1 style time embedding even for Wan 2.2"
+    )
     parser.add_argument("--offload_inactive_dit", action="store_true", help="Offload DiT model to CPU")
     parser.add_argument("--lazy_loading", action="store_true", help="Enable lazy loading for DiT models")
+    parser.add_argument(
+        "--disable_numpy_memmap", action="store_true", help="Disable numpy memmap when loading safetensors. Default is False."
+    )
     parser.add_argument("--vae", type=str, default=None, help="VAE checkpoint path")
     parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default is bfloat16")
     parser.add_argument("--vae_cache_cpu", action="store_true", help="cache features in VAE on CPU")
@@ -211,6 +216,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--blocks_to_swap", type=int, default=0, help="number of blocks to swap in the model")
     parser.add_argument(
+        "--use_pinned_memory_for_block_swap",
+        action="store_true",
+        help="use pinned memory for block swapping, which may speed up data transfer between CPU and GPU but uses more shared GPU memory on Windows",
+    )
+    parser.add_argument(
         "--output_type",
         type=str,
         default="video",
@@ -219,15 +229,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no_metadata", action="store_true", help="do not save metadata")
     parser.add_argument("--latent_path", type=str, nargs="*", default=None, help="path to latent for decode. no inference")
-    parser.add_argument("--lycoris", action="store_true", help="use lycoris for inference")
-    parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
+    parser.add_argument(
+        "--lycoris", action="store_true", help=f"use lycoris for inference{'' if lycoris_available else ' (not available)'}"
+    )
     parser.add_argument(
         "--compile_args",
         nargs=4,
         metavar=("BACKEND", "MODE", "DYNAMIC", "FULLGRAPH"),
-        default=["inductor", "max-autotune-no-cudagraphs", "False", "False"],
-        help="Torch.compile settings",
+        # default=["inductor", "max-autotune-no-cudagraphs", "False", "False"],
+        default=None,
+        help="[Deprecated] Torch.compile settings. Use individual arguments instead.",
     )
+    setup_parser_compile(parser)
 
     # New arguments for batch and interactive modes
     parser.add_argument("--from_file", type=str, default=None, help="Read prompts from a file")
@@ -245,6 +258,9 @@ def parse_args() -> argparse.Namespace:
     assert (args.latent_path is None or len(args.latent_path) == 0) or (
         args.output_type == "images" or args.output_type == "video"
     ), "latent_path is only supported for images or video output"
+
+    if args.lycoris and not lycoris_available:
+        raise ValueError("install lycoris: https://github.com/KohakuBlueleaf/LyCORIS")
 
     return args
 
@@ -555,14 +571,14 @@ def load_dit_models(
     """
     use_high_model = args.dit_high_noise is not None and len(args.dit_high_noise) > 0
     if use_high_model and args.lazy_loading:
-        logger.info(f"Using lazy loading")
+        logger.info("Using lazy loading")
         return [None, None]  # lazy loading will load models on demand
 
     model = load_dit_model(args, args.dit, args.lora_weight, args.lora_multiplier, config, device, dit_weight_dtype)
 
     if use_high_model:
         if args.offload_inactive_dit:
-            logger.warning(f"Offloading low noise DiT model to CPU, high noise DiT will be loaded on GPU")
+            logger.warning("Offloading low noise DiT model to CPU, high noise DiT will be loaded on GPU")
             model.to("cpu")
 
         logger.info(f"Loading high noise DiT model from {args.dit_high_noise}")
@@ -639,7 +655,10 @@ def load_dit_model(
         lora_weights_list=lora_weights_list,
         lora_multipliers=lora_multipliers,
         use_scaled_mm=args.fp8_fast,
+        disable_numpy_memmap=args.disable_numpy_memmap,
     )
+    if args.force_v2_1_time_embedding:
+        model.set_time_embedding_v2_1(True)
 
     # merge LoRA weights
     if args.lycoris:
@@ -686,29 +705,26 @@ def load_dit_model(
 
         model.to(target_device, target_dtype)  # move and cast  at the same time. this reduces redundant copy operations
 
-    if args.compile:
-        compile_backend, compile_mode, compile_dynamic, compile_fullgraph = args.compile_args
-        logger.info(
-            f"Torch Compiling[Backend: {compile_backend}; Mode: {compile_mode}; Dynamic: {compile_dynamic}; Fullgraph: {compile_fullgraph}]"
-        )
-        torch._dynamo.config.cache_size_limit = 32
-        for i in range(len(model.blocks)):
-            model.blocks[i] = torch.compile(
-                model.blocks[i],
-                backend=compile_backend,
-                mode=compile_mode,
-                dynamic=compile_dynamic.lower() in "true",
-                fullgraph=compile_fullgraph.lower() in "true",
-            )
-
     if args.blocks_to_swap > 0:
         logger.info(f"Enable swap {args.blocks_to_swap} blocks to CPU from device: {device}")
-        model.enable_block_swap(args.blocks_to_swap, device, supports_backward=False)
+        model.enable_block_swap(
+            args.blocks_to_swap, device, supports_backward=False, use_pinned_memory=args.use_pinned_memory_for_block_swap
+        )
         model.move_to_device_except_swap_blocks(device)
         model.prepare_block_swap_before_forward()
     else:
         # make sure the model is on the right device
         model.to(device)
+
+    if args.compile:
+        if args.compile_args is not None:
+            # deprecated
+            args.compile_backend, args.compile_mode, compile_dynamic, compile_fullgraph = args.compile_args
+            args.compile_dynamic = compile_dynamic.lower()
+            args.compile_fullgraph = compile_fullgraph.lower() in "true"
+            args.compile_cache_size_limit = 32  # old default value
+
+        model = model_utils.compile_transformer(args, model, [model.blocks], disable_linear=args.blocks_to_swap > 0)
 
     model.eval().requires_grad_(False)
     clean_memory_on_device(device)
@@ -776,7 +792,7 @@ def merge_lora_weights(
             remaining_keys.sort()
             logger.info(f"Remaining LoRA modules after filtering: {remaining_keys}")
             if len(weights_sd) == 0:
-                logger.warning(f"No keys left after filtering.")
+                logger.warning("No keys left after filtering.")
 
         if lycoris:
             lycoris_net, _ = create_network_from_weights(
@@ -870,7 +886,7 @@ def prepare_t2v_inputs(
     # Fun-Control: encode control video to latent space
     if config.is_fun_control:
         # TODO use same resizing as for image
-        logger.info(f"Encoding control video to latent space")
+        logger.info("Encoding control video to latent space")
         # C, F, H, W
         control_video = load_control_video(args.control_path, frames, height, width).to(device)
         vae.to_device(device)
@@ -930,7 +946,6 @@ def prepare_one_frame_inference(
     height: int,
     width: int,
 ) -> Tuple[int, torch.Tensor, List[int]]:
-
     target_index, _, f_indices, one_frame_inference_index = parse_one_frame_inference_args(args.one_frame_inference)
 
     # prepare image
@@ -968,7 +983,7 @@ def prepare_one_frame_inference(
     control_latents = []
     if control_image_tensors is not None:
         # encode image to latent space with VAE
-        logger.info(f"Encoding image to latent space")
+        logger.info("Encoding image to latent space")
 
         for ctrl_image_tensor in control_image_tensors:
             # encode image one by one
@@ -1088,7 +1103,7 @@ def prepare_i2v_inputs(
             clip.model.to(device)
 
             # encode image to CLIP context
-            logger.info(f"Encoding image to CLIP context")
+            logger.info("Encoding image to CLIP context")
             with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
                 clip_context = clip.visual([img_tensor[:, None, :, :]])
                 # I2V end image is not officially supported, so no additional CLIP context
@@ -1096,7 +1111,7 @@ def prepare_i2v_inputs(
                     end_img_tensor = TF.to_tensor(end_img).sub_(0.5).div_(0.5).to(device)
                     end_clip_context = clip.visual([end_img_tensor[:, None, :, :]])
                     clip_context = torch.concat([clip_context, end_clip_context], dim=0)
-            logger.info(f"Encoding complete")
+            logger.info("Encoding complete")
 
             # free CLIP model and clean memory
             del clip
@@ -1119,7 +1134,7 @@ def prepare_i2v_inputs(
         one_frame_inference_index, f_indices = None, None
 
         # encode image to latent space with VAE
-        logger.info(f"Encoding image to latent space")
+        logger.info("Encoding image to latent space")
         vae.to_device(device)
 
         # resize image
@@ -1140,7 +1155,10 @@ def prepare_i2v_inputs(
         msk[:, 0] = 1
         if has_end_image:
             # this process is confirmed by official code for FLF2V
-            msk[:, -1] = 1
+            if config.flf2v:
+                msk[-1, -1] = 1
+            else:
+                msk[:, -1] = 1
 
         # encode image to latent space
         with accelerator.autocast(), torch.no_grad():
@@ -1162,12 +1180,12 @@ def prepare_i2v_inputs(
                 y = vae.encode([img_resized])[0]
 
         y = torch.concat([msk, y])
-        logger.info(f"Encoding complete")
+        logger.info("Encoding complete")
 
         # Fun-Control: encode control video to latent space
         if config.is_fun_control:
             # TODO use same resizing as for image
-            logger.info(f"Encoding control video to latent space")
+            logger.info("Encoding control video to latent space")
             # C, F, H, W
             control_video = load_control_video(args.control_path, frames + (1 if has_end_image else 0), height, width).to(device)
             with accelerator.autocast(), torch.no_grad():
@@ -1400,7 +1418,7 @@ def run_sampling(
                     time.sleep(5)
 
                 if args.offload_inactive_dit:
-                    logger.info(f"Switching model to CPU/GPU for both low and high noise models")
+                    logger.info("Switching model to CPU/GPU for both low and high noise models")
                     models[0].to("cpu")
 
                     if args.blocks_to_swap > 0:
@@ -1419,8 +1437,10 @@ def run_sampling(
         if model is None:
             # lazy loading
             dit_path = args.dit_high_noise if is_high_noise else args.dit
+            lora_weight = args.lora_weight_high_noise if is_high_noise else args.lora_weight
+            lora_multiplier = args.lora_multiplier_high_noise if is_high_noise else args.lora_multiplier
             model = load_dit_model(
-                args, dit_path, args.lora_weight, args.lora_multiplier, gen_settings.cfg, device, gen_settings.dit_weight_dtype
+                args, dit_path, lora_weight, lora_multiplier, gen_settings.cfg, device, gen_settings.dit_weight_dtype
             )
 
         prev_high_noise = is_high_noise
@@ -1475,6 +1495,11 @@ def run_sampling(
 
             # update latent
             latent = temp_x0.squeeze(0)
+
+    if len(models) > 1 and args.lazy_loading:  # lazy loading
+        del model
+        gc.collect()
+        clean_memory_on_device(device)
 
     return latent
 
@@ -1620,7 +1645,7 @@ def decode_latent(latent: torch.Tensor, args: argparse.Namespace, cfg) -> torch.
     del videos
     video = video.to(torch.float32).cpu()
 
-    logger.info(f"Decoding complete")
+    logger.info("Decoding complete")
     return video
 
 
@@ -1831,13 +1856,14 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
         vae = load_vae(args, cfg, device, vae_dtype)
         vae.to_device(device)
 
+        clip = None
         if not cfg.v2_2:
             clip = load_clip_model(args, cfg, device)
             clip.model.to(device)
 
         # Process each image and encode with CLIP
         for prompt_data in prompts_data:
-            if "image_path" not in prompt_data:
+            if "image_path" not in prompt_data and args.image_path is None:
                 continue
 
             if not cfg.v2_2:
@@ -1856,7 +1882,8 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
                 if prompt_args.end_image_path is not None and os.path.exists(prompt_args.end_image_path):
                     end_img = Image.open(prompt_args.end_image_path).convert("RGB")
                     end_img_tensor = TF.to_tensor(end_img).sub_(0.5).div_(0.5).to(device)
-                    end_clip_context = clip.visual([end_img_tensor[:, None, :, :]])
+                    with torch.amp.autocast(device_type=device.type, dtype=torch.float16), torch.no_grad():
+                        end_clip_context = clip.visual([end_img_tensor[:, None, :, :]])
                     clip_context = torch.concat([clip_context, end_clip_context], dim=0)
             else:
                 clip_context = None
@@ -1890,7 +1917,7 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
     all_prompt_args = []
 
     for i, prompt_data in enumerate(prompts_data):
-        logger.info(f"Processing prompt {i+1}/{len(prompts_data)}: {prompt_data['prompt'][:50]}...")
+        logger.info(f"Processing prompt {i + 1}/{len(prompts_data)}: {prompt_data['prompt'][:50]}...")
 
         # Apply overrides for this prompt
         prompt_args = apply_overrides(args, prompt_data)
@@ -1929,7 +1956,7 @@ def process_batch_prompts(prompts_data: List[Dict], args: argparse.Namespace) ->
         vae.to_device(device)
 
         for i, (latent, prompt_args) in enumerate(zip(all_latents, all_prompt_args)):
-            logger.info(f"Decoding output {i+1}/{len(all_latents)}")
+            logger.info(f"Decoding output {i + 1}/{len(all_latents)}")
 
             # Decode latent
             video = decode_latent(latent.unsqueeze(0), prompt_args, cfg)
@@ -2096,7 +2123,8 @@ def process_interactive(args: argparse.Namespace) -> None:
 
                 # Move model to CPU after generation
                 for model in models:
-                    model.to("cpu")
+                    if model is not None:  # not lazy loading
+                        model.to("cpu")
 
                 # Save latent if needed
                 height, width, _ = check_inputs(prompt_args)
@@ -2186,9 +2214,9 @@ def main():
     # Parse arguments
     args = parse_args()
 
-    assert not (
-        args.offload_inactive_dit and args.lazy_loading
-    ), "--offload_inactive_dit and --lazy_loading cannot be used together"
+    assert not (args.offload_inactive_dit and args.lazy_loading), (
+        "--offload_inactive_dit and --lazy_loading cannot be used together"
+    )
 
     # Check if latents are provided
     latents_mode = args.latent_path is not None and len(args.latent_path) > 0
