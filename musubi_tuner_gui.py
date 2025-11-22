@@ -182,7 +182,7 @@ class MusubiTunerGUI:
         self._add_widget(dataset_frame, "dataset_config", "Dataset Config (TOML):", "Path to .toml dataset configuration file.", kind='path_entry', options=[("TOML files", "*.toml")], is_required=True, is_path=True)
         
         dit_frame = ttk.LabelFrame(frame, text="DiT Model Selection"); dit_frame.pack(fill="x", padx=10, pady=10)
-        self._add_widget(dit_frame, "is_i2v", "Is I2V Training?", "Enables Image-to-Video training mode. This changes some default behaviors and adds the --i2v flag.", kind='checkbox', command=self.update_button_states)
+        self._add_widget(dit_frame, "is_i2v", "Is I2V Training?", "IMPORTANT: I2V models REQUIRE VIDEO data (multiple frames per sample), not static images. If you only have images, use T2V task instead. I2V is for training with video datasets.", kind='checkbox', command=self.update_button_states)
         
         high_noise_frame = ttk.LabelFrame(dit_frame, text="High Noise Model (T2V: 875-1000 / I2V: 900-1000)"); high_noise_frame.pack(fill="x", padx=5, pady=5)
         self._add_widget(high_noise_frame, "train_high_noise", "Train High Noise Model", "Enable to train the high noise model.", kind='checkbox', command=self.update_button_states)
@@ -198,7 +198,7 @@ class MusubiTunerGUI:
 
         models_frame = ttk.LabelFrame(frame, text="Other Model Paths"); models_frame.pack(fill="x", padx=10, pady=10)
         self._add_widget(models_frame, "vae_model", "VAE Model:", "Path to VAE model (.safetensors or .pt). Required for training and caching.", kind='path_entry', options=[("Model files", "*.safetensors *.pt")], is_required=True, is_path=True)
-        self._add_widget(models_frame, "clip_model", "CLIP Model (Optional):", "Path to optional CLIP model. Required for I2V training.", kind='path_entry', options=[("Model files", "*.safetensors *.pt")], is_path=True)
+        self._add_widget(models_frame, "clip_model", "CLIP Model (Optional):", "Path to optional CLIP model. Required for Wan2.1 I2V training (not needed for Wan2.2). Only needed if you're doing I2V with video data.", kind='path_entry', options=[("Model files", "*.safetensors *.pt")], is_path=True)
         self._add_widget(models_frame, "t5_model", "T5 Text Encoder:", "Path to T5 text encoder model. Required.", kind='path_entry', options=[("Model files", "*.safetensors *.pt")], is_required=True, is_path=True)
         
         output_frame = ttk.LabelFrame(frame, text="Output Configuration"); output_frame.pack(fill="x", padx=10, pady=10)
@@ -532,11 +532,14 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
         except Exception as e: print(f"Error saving settings to {filepath}: {e}"); return False
 
     def save_settings(self):
-        file_path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
+        initial_dir = self.entries["output_dir"].get() if self.entries["output_dir"].get() else os.getcwd()
+        file_path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")], initialdir=initial_dir)
         if file_path and self._save_settings_to_file(file_path): messagebox.showinfo("Success", "Settings saved successfully!")
 
     def load_settings(self, filepath=None):
-        if filepath is None: filepath = filedialog.askopenfilename(filetypes=[("JSON files", "*.json")])
+        if filepath is None:
+            initial_dir = self.entries["output_dir"].get() if self.entries["output_dir"].get() else os.getcwd()
+            filepath = filedialog.askopenfilename(filetypes=[("JSON files", "*.json")], initialdir=initial_dir)
         if filepath and os.path.exists(filepath):
             try:
                 with open(filepath, "r") as f: settings = json.load(f)
@@ -622,6 +625,10 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
     def process_console_output(self, line, output_widget):
         is_progress_line = line.endswith('\r')
         clean_line = line.strip()
+
+        # Check if user is at the bottom of the text widget
+        is_at_bottom = output_widget.yview()[1] >= 0.99
+
         if is_progress_line:
             if self.last_line_was_progress: output_widget.delete("end-2l", "end-1l")
             output_widget.insert(tk.END, clean_line + '\n')
@@ -629,7 +636,10 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
         else:
             output_widget.insert(tk.END, line)
             self.last_line_was_progress = False
-        output_widget.see(tk.END)
+
+        # Only auto-scroll if user was already at the bottom
+        if is_at_bottom:
+            output_widget.see(tk.END)
 
     def read_output(self, on_complete, output_widget):
         if not self.current_process: 
