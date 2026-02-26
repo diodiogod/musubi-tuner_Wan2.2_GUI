@@ -284,7 +284,45 @@ class MusubiTunerGUI:
         self._add_widget(self.hidden_frames['high_noise_lora_params'], "network_alpha_high", "Network Alpha:", "Leave blank to use the same as the Low Noise model.", is_required=False, validate_num=True)
 
         optimizer_frame = ttk.LabelFrame(frame, text="Optimizer Settings"); optimizer_frame.pack(fill="x", padx=10, pady=10)
-        self._add_widget(optimizer_frame, "optimizer_type", "Optimizer Type:", "'adamw8bit' is a memory-efficient and stable default. 'prodigy' can also work well.", kind='combobox', options=["adamw", "adamw8bit", "adafactor", "lion", "prodigy"])
+        # Optimizer Type: preset dropdown + optional custom path entry
+        _opt_presets = ["adamw", "adamw8bit", "adafactor", "lion", "prodigy",
+                        "prodigyplus.prodigy_plus_schedulefree.ProdigyPlusScheduleFree", "Custom..."]
+        _opt_frame = ttk.Frame(optimizer_frame); _opt_frame.pack(fill="x", padx=5, pady=(5, 0))
+        ttk.Label(_opt_frame, text="Optimizer Type:").pack(anchor="w")
+        _opt_var = tk.StringVar(value="adamw8bit")   # what get_settings() reads
+        self.entries["optimizer_type"] = _opt_var
+        _opt_combo_var = tk.StringVar(value="adamw8bit")
+        _opt_combo = ttk.Combobox(_opt_frame, textvariable=_opt_combo_var,
+                                  values=_opt_presets, state="readonly")
+        _opt_combo.pack(fill="x", pady=(2, 0)); _opt_combo.bind("<MouseWheel>", lambda e: "break")
+        ToolTip(_opt_combo, "'adamw8bit' is a memory-efficient and stable default. 'prodigy' can also work well. Choose 'Custom...' to type any full import path.")
+        _custom_frame = ttk.Frame(_opt_frame)
+        _custom_entry = ttk.Entry(_custom_frame)
+        _custom_entry.pack(fill="x")
+        ToolTip(_custom_entry, "Full Python import path, e.g. prodigyplus.prodigy_plus_schedulefree.ProdigyPlusScheduleFree")
+        def _on_opt_combo_change(*_):
+            sel = _opt_combo_var.get()
+            if sel == "Custom...":
+                _custom_frame.pack(fill="x", pady=(2, 4))
+                _opt_var.set(_custom_entry.get())
+            else:
+                _custom_frame.forget()
+                _opt_var.set(sel)
+        def _on_custom_entry_change(*_):
+            if _opt_combo_var.get() == "Custom...":
+                _opt_var.set(_custom_entry.get())
+        _opt_combo.bind("<<ComboboxSelected>>", _on_opt_combo_change)
+        _custom_entry.bind("<KeyRelease>", _on_custom_entry_change)
+        # restore helper: called by set_values via StringVar — we also need to sync combo
+        def _opt_var_trace(*_):
+            v = _opt_var.get()
+            if v in _opt_presets and v != "Custom...":
+                _opt_combo_var.set(v); _custom_frame.forget()
+            elif v not in _opt_presets or v == "Custom...":
+                _opt_combo_var.set("Custom...")
+                _custom_frame.pack(fill="x", pady=(2, 4))
+                _custom_entry.delete(0, tk.END); _custom_entry.insert(0, v)
+        _opt_var.trace_add("write", _opt_var_trace)
         # --- ADDED --- max_grad_norm widget
         self._add_widget(optimizer_frame, "max_grad_norm", "Max Grad Norm:", "Clips the gradient norm to prevent gradients from exploding, which can stabilize training. '1.0' is a good default. '0' disables it.", validate_num=True)
         self._add_widget(optimizer_frame, "optimizer_args", "Optimizer Args:", "Additional arguments for the optimizer, e.g., 'weight_decay=0.1'. Can be left blank.", kind='entry')
