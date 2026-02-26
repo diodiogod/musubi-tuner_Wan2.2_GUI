@@ -736,11 +736,34 @@ class MusubiTunerGUI:
     def create_convert_lora_tab(self):
         tab_frame = ttk.Frame(self.notebook); self.notebook.add(tab_frame, text="Convert LoRA")
         main_frame = ttk.Frame(tab_frame); main_frame.pack(fill='both', expand=True, padx=10, pady=10)
+
+        info_frame = ttk.LabelFrame(main_frame, text="Format Reference"); info_frame.pack(fill='x', pady=(0, 10))
+        info_text = tk.Text(info_frame, wrap=tk.WORD, bg='#2B2B2B', fg='#AAAAAA', font=('Consolas', 9),
+                            relief=tk.FLAT, bd=0, height=7, state='normal', cursor='arrow')
+        info_text.insert(tk.END,
+            "musubi-tuner format  (ComfyUI-compatible, trained by this tool)\n"
+            "  Keys: lora_unet_...lora_down.weight / lora_up.weight\n"
+            "  Alpha: lora_unet_...alpha\n\n"
+            "Diffusers format  (HuggingFace Diffusers-based tools)\n"
+            "  Keys: diffusion_model....lora_A.weight / lora_B.weight\n"
+            "  No alpha key (rank is used instead)"
+        )
+        info_text.config(state='disabled')
+        info_text.pack(fill='x', padx=8, pady=(6, 8))
+
         settings_frame = ttk.LabelFrame(main_frame, text="Conversion Settings"); settings_frame.pack(fill='x', pady=(0,10))
         self._add_widget(settings_frame, "convert_lora_path", "LoRA to Convert:", "Path to the .safetensors LoRA file you want to convert.", kind='path_entry', options=[("Safetensors", "*.safetensors")], is_path=True)
-        # --- MODIFIED --- Changed to directory selector
         self._add_widget(settings_frame, "convert_output_dir", "Output Directory:", "Folder to save the converted LoRA file.", kind='path_entry', is_dir=True)
-        
+
+        dir_frame = ttk.Frame(settings_frame); dir_frame.pack(fill='x', padx=5, pady=(5, 0))
+        ttk.Label(dir_frame, text="Conversion Direction:").pack(anchor='w')
+        self._convert_target_var = tk.StringVar(value="default")
+        dir_inner = ttk.Frame(dir_frame); dir_inner.pack(anchor='w', pady=(3, 0))
+        ttk.Radiobutton(dir_inner, text="Diffusers → musubi-tuner  (lora_A/B  →  lora_down/up)",
+                        variable=self._convert_target_var, value="default").pack(anchor='w')
+        ttk.Radiobutton(dir_inner, text="musubi-tuner → Diffusers  (lora_down/up  →  lora_A/B)",
+                        variable=self._convert_target_var, value="other").pack(anchor='w')
+
         button = ttk.Button(settings_frame, text="Start Conversion", command=self.start_conversion); button.pack(pady=10)
 
         console_frame = ttk.LabelFrame(main_frame, text="Conversion Output"); console_frame.pack(fill='both', expand=True)
@@ -1274,8 +1297,10 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
 
         self.convert_output_text.delete("1.0", tk.END)
         python_executable = sys.executable or "python"
+        target = getattr(self, '_convert_target_var', None)
+        target = target.get() if target else "default"
         command = [python_executable, "src/musubi_tuner/convert_lora.py",
-                   "--input", lora_path, "--output", str(final_output_path), "--target", "default"]
+                   "--input", lora_path, "--output", str(final_output_path), "--target", target]
         
         self.run_process(command, on_complete=self.on_conversion_complete, output_widget=self.convert_output_text)
 
