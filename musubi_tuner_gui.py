@@ -9,6 +9,9 @@ import time
 import sys
 from pathlib import Path
 
+from backends import wan as wan_backend, flux2 as flux2_backend
+from backends.flux2 import FLUX2_VERSION_MAP
+
 # --- Dependency Check ---
 try:
     from matplotlib.figure import Figure
@@ -64,8 +67,9 @@ class MusubiTunerGUI:
 
         self.entries = {}
         self.hidden_frames = {}
+        self.training_mode_var = tk.StringVar(value="Wan 2.2")
         self.setup_styles()
-        
+
         self.current_process = None
         self.monitoring_active = False
         self.vram_thread = None
@@ -74,6 +78,12 @@ class MusubiTunerGUI:
         self.command_sequence = []
         self.last_line_was_progress = False
         self.current_step = 0
+        self.sample_watcher_active = False
+        self._sample_watcher_thread = None
+        self._last_sample_files = []
+        self._sample_list_frame = None
+        self._sample_prompts_data = []  # list of dicts
+        self._temp_prompts_file = None  # path to auto-written temp .txt
 
         self.create_interface()
         self.load_default_settings()
@@ -118,16 +128,31 @@ class MusubiTunerGUI:
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.grid(row=0, column=0, sticky="nsew"); scrollbar.grid(row=0, column=1, sticky="ns")
         self.root.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
-        
+
         main_frame = ttk.Frame(scrollable_frame); main_frame.pack(fill="both", expand=True, padx=10, pady=10)
-        ttk.Label(main_frame, text="Musubi Tuner - WAN 2.2 LoRA Training", style='Title.TLabel').pack(pady=(0, 20), anchor='w')
+        self.title_label = ttk.Label(main_frame, text="Musubi Tuner - WAN 2.2 LoRA Training", style='Title.TLabel')
+        self.title_label.pack(pady=(0, 10), anchor='w')
+
+        # Training Mode selector
+        mode_frame = ttk.LabelFrame(main_frame, text="Training Mode"); mode_frame.pack(fill="x", pady=(0, 10))
+        mode_inner = ttk.Frame(mode_frame); mode_inner.pack(fill="x", padx=10, pady=8)
+        ttk.Label(mode_inner, text="Mode:").pack(side="left", padx=(0, 8))
+        self.mode_combo = ttk.Combobox(mode_inner, textvariable=self.training_mode_var,
+                                       values=["Wan 2.2", "Flux.2 Klein", "Flux.2 Dev"],
+                                       state="readonly", width=20)
+        self.mode_combo.pack(side="left"); self.mode_combo.bind("<MouseWheel>", lambda e: "break")
+        self.mode_combo.bind("<<ComboboxSelected>>", self.on_training_mode_change)
+        self.mode_note_label = ttk.Label(mode_inner, text="", foreground="#AAAAAA")
+        self.mode_note_label.pack(side="left", padx=(15, 0))
+
         self.create_settings_buttons(main_frame)
-        
+
         self.notebook = ttk.Notebook(main_frame); self.notebook.pack(fill="both", expand=True, pady=(10, 0))
-        
+
         self.create_model_paths_tab()
         self.create_training_params_tab()
         self.create_advanced_tab()
+        self.create_samples_tab()
         self.create_run_monitor_tab()
         self.create_convert_lora_tab()
         self.create_accelerate_config_tab()
@@ -177,30 +202,59 @@ class MusubiTunerGUI:
     
     def create_model_paths_tab(self):
         frame = ttk.Frame(self.notebook); self.notebook.add(frame, text="Model Paths & Dataset")
-        
+
         dataset_frame = ttk.LabelFrame(frame, text="Dataset Configuration"); dataset_frame.pack(fill="x", padx=10, pady=10)
         self._add_widget(dataset_frame, "dataset_config", "Dataset Config (TOML):", "Path to .toml dataset configuration file.", kind='path_entry', options=[("TOML files", "*.toml")], is_required=True, is_path=True)
-        
-        dit_frame = ttk.LabelFrame(frame, text="DiT Model Selection"); dit_frame.pack(fill="x", padx=10, pady=10)
-        self._add_widget(dit_frame, "is_i2v", "Is I2V Training?", "IMPORTANT: I2V models REQUIRE VIDEO data (multiple frames per sample), not static images. If you only have images, use T2V task instead. I2V is for training with video datasets.", kind='checkbox', command=self.update_button_states)
-        
-        high_noise_frame = ttk.LabelFrame(dit_frame, text="High Noise Model (T2V: 875-1000 / I2V: 900-1000)"); high_noise_frame.pack(fill="x", padx=5, pady=5)
+
+        # ---- WAN 2.2 DiT section ----
+        self.hidden_frames['wan_dit'] = ttk.LabelFrame(frame, text="DiT Model Selection")
+        self.hidden_frames['wan_dit'].pack(fill="x", padx=10, pady=10)
+        self._add_widget(self.hidden_frames['wan_dit'], "is_i2v", "Is I2V Training?", "IMPORTANT: I2V models REQUIRE VIDEO data (multiple frames per sample), not static images. If you only have images, use T2V task instead. I2V is for training with video datasets.", kind='checkbox', command=self.update_button_states)
+
+        high_noise_frame = ttk.LabelFrame(self.hidden_frames['wan_dit'], text="High Noise Model (T2V: 875-1000 / I2V: 900-1000)"); high_noise_frame.pack(fill="x", padx=5, pady=5)
         self._add_widget(high_noise_frame, "train_high_noise", "Train High Noise Model", "Enable to train the high noise model.", kind='checkbox', command=self.update_button_states)
         self._add_widget(high_noise_frame, "dit_high_noise", "DiT High Noise Model Path:", "Path to the high noise DiT model.", kind='path_entry', options=[("Model files", "*.safetensors *.pt")], is_path=True)
         self._add_widget(high_noise_frame, "min_timestep_high", "Min Timestep:", "Minimum timestep for this model. (e.g., 875)", validate_num=True)
         self._add_widget(high_noise_frame, "max_timestep_high", "Max Timestep:", "Maximum timestep for this model. (e.g., 1000)", validate_num=True)
 
-        low_noise_frame = ttk.LabelFrame(dit_frame, text="Low Noise Model (T2V: 0-875 / I2V: 0-900)"); low_noise_frame.pack(fill="x", padx=5, pady=(5,10))
+        low_noise_frame = ttk.LabelFrame(self.hidden_frames['wan_dit'], text="Low Noise Model (T2V: 0-875 / I2V: 0-900)"); low_noise_frame.pack(fill="x", padx=5, pady=(5, 10))
         self._add_widget(low_noise_frame, "train_low_noise", "Train Low Noise Model", "Enable to train the low noise model.", kind='checkbox', command=self.update_button_states)
         self._add_widget(low_noise_frame, "dit_low_noise", "DiT Low Noise Model Path:", "Path to the low noise DiT model.", kind='path_entry', options=[("Model files", "*.safetensors *.pt")], is_path=True)
         self._add_widget(low_noise_frame, "min_timestep_low", "Min Timestep:", "Minimum timestep for this model. (e.g., 0)", validate_num=True)
         self._add_widget(low_noise_frame, "max_timestep_low", "Max Timestep:", "Maximum timestep for this model. (e.g., 875)", validate_num=True)
 
-        models_frame = ttk.LabelFrame(frame, text="Other Model Paths"); models_frame.pack(fill="x", padx=10, pady=10)
+        # ---- WAN 2.2 other model paths ----
+        self.hidden_frames['wan_models'] = ttk.LabelFrame(frame, text="Text Encoder & CLIP")
+        self.hidden_frames['wan_models'].pack(fill="x", padx=10, pady=10)
+        self._add_widget(self.hidden_frames['wan_models'], "clip_model", "CLIP Model (Optional):", "Path to optional CLIP model. Required for Wan2.1 I2V training (not needed for Wan2.2). Only needed if you're doing I2V with video data.", kind='path_entry', options=[("Model files", "*.safetensors *.pt")], is_path=True)
+        self._add_widget(self.hidden_frames['wan_models'], "t5_model", "T5 Text Encoder:", "Path to T5 text encoder model. Required.", kind='path_entry', options=[("Model files", "*.safetensors *.pt")], is_required=True, is_path=True)
+
+        # ---- FLUX.2 model paths section ----
+        self.hidden_frames['flux2_model_paths'] = ttk.LabelFrame(frame, text="Flux.2 Model Paths")
+        # (packed/hidden by on_training_mode_change)
+
+        flux2_ver_frame = ttk.Frame(self.hidden_frames['flux2_model_paths']); flux2_ver_frame.pack(fill="x", padx=5, pady=(8, 2))
+        ttk.Label(flux2_ver_frame, text="Model Version:").pack(anchor="w")
+        flux2_ver_combo = ttk.Combobox(flux2_ver_frame, values=list(FLUX2_VERSION_MAP.keys()), state="readonly")
+        flux2_ver_combo.set("Klein Base 4B ★"); flux2_ver_combo.pack(fill="x", pady=(2, 0))
+        flux2_ver_combo.bind("<MouseWheel>", lambda e: "break")
+        flux2_ver_combo.bind("<<ComboboxSelected>>", self.update_button_states)
+        self.entries["flux2_model_version"] = flux2_ver_combo
+
+        self.flux2_note_label = ttk.Label(self.hidden_frames['flux2_model_paths'],
+                                           text="★ Base variants recommended for training — distilled models (4B/9B) are for inference only.",
+                                           foreground="#FFCC66", font=("Calibri", 9, "italic"))
+        self.flux2_note_label.pack(anchor="w", padx=8, pady=(0, 4))
+
+        self._add_widget(self.hidden_frames['flux2_model_paths'], "flux2_dit_model", "DiT Model:", "Path to the Flux.2 DiT model (.safetensors).", kind='path_entry', options=[("Model files", "*.safetensors *.pt")], is_required=True, is_path=True)
+        self._add_widget(self.hidden_frames['flux2_model_paths'], "flux2_text_encoder", "Text Encoder (Qwen3 or Mistral3):", "Path to the Qwen3 or Mistral3 text encoder directory or safetensors file.", kind='path_entry', options=[("Model files", "*.safetensors *.pt")], is_required=True, is_path=True)
+        self._add_widget(self.hidden_frames['flux2_model_paths'], "fp8_text_encoder", "FP8 Text Encoder", "Load the text encoder in FP8 precision to reduce VRAM.", kind='checkbox')
+
+        # VAE shared by both modes — store reference for pack ordering
+        models_frame = ttk.LabelFrame(frame, text="VAE Model"); models_frame.pack(fill="x", padx=10, pady=10)
+        self._vae_frame = models_frame
         self._add_widget(models_frame, "vae_model", "VAE Model:", "Path to VAE model (.safetensors or .pt). Required for training and caching.", kind='path_entry', options=[("Model files", "*.safetensors *.pt")], is_required=True, is_path=True)
-        self._add_widget(models_frame, "clip_model", "CLIP Model (Optional):", "Path to optional CLIP model. Required for Wan2.1 I2V training (not needed for Wan2.2). Only needed if you're doing I2V with video data.", kind='path_entry', options=[("Model files", "*.safetensors *.pt")], is_path=True)
-        self._add_widget(models_frame, "t5_model", "T5 Text Encoder:", "Path to T5 text encoder model. Required.", kind='path_entry', options=[("Model files", "*.safetensors *.pt")], is_required=True, is_path=True)
-        
+
         output_frame = ttk.LabelFrame(frame, text="Output Configuration"); output_frame.pack(fill="x", padx=10, pady=10)
         self._add_widget(output_frame, "output_dir", "Output Directory:", "Base directory to save trained LoRAs. A subfolder will be automatically created.", kind='path_entry', is_dir=True, is_required=True, is_path=True)
         self._add_widget(output_frame, "output_name", "Output Name:", "Base filename for output LoRA (e.g., 'my_character'). Suffixes like '_LowNoise' will be added automatically.", is_required=True)
@@ -281,7 +335,9 @@ class MusubiTunerGUI:
         fp8_frame = ttk.Frame(other_frame); fp8_frame.pack(fill='x')
         self._add_widget(fp8_frame, "fp8_base", "FP8 Base", "Use FP8 precision for the base model. Select a compatible mixed precision (fp16 or bf16).", kind='checkbox')
         self._add_widget(fp8_frame, "fp8_scaled", "FP8 Scaled", "Use scaled FP8 training with block-wise quantization for better accuracy.", kind='checkbox')
-        self._add_widget(fp8_frame, "fp8_t5", "FP8 T5", "Use FP8 precision for the T5 text encoder.", kind='checkbox')
+        self.hidden_frames['fp8_t5_frame'] = ttk.Frame(fp8_frame)
+        self.hidden_frames['fp8_t5_frame'].pack(fill='x')
+        self._add_widget(self.hidden_frames['fp8_t5_frame'], "fp8_t5", "FP8 T5", "Use FP8 precision for the T5 text encoder.", kind='checkbox')
         self._add_widget(fp8_frame, "fp8_llm", "FP8 LLM", "Use FP8 precision for LLM components. Only helps if NOT using cached text encoder outputs (rarely useful for WAN training).", kind='checkbox')
 
         # WAN 2.2 specific options
@@ -293,6 +349,318 @@ class MusubiTunerGUI:
         resume_frame = ttk.LabelFrame(frame, text="Resume Training"); resume_frame.pack(fill="x", padx=10, pady=10)
         self._add_widget(resume_frame, "resume_path", "Resume from State:", "Path to a saved state folder to continue a previous training run.", kind='path_entry', is_dir=True, is_path=True)
         self._add_widget(resume_frame, "network_weights", "Network Weights:", "Load pre-trained LoRA weights to continue training from them (fine-tuning a LoRA).", kind='path_entry', options=[("Weight files", "*.safetensors")], is_path=True)
+
+    def create_samples_tab(self):
+        tab_frame = ttk.Frame(self.notebook); self.notebook.add(tab_frame, text="Samples")
+
+        # --- Frequency controls ---
+        freq_frame = ttk.LabelFrame(tab_frame, text="Sampling Frequency"); freq_frame.pack(fill="x", padx=10, pady=10)
+        freq_inner = ttk.Frame(freq_frame); freq_inner.pack(fill="x", padx=8, pady=8)
+        vcmd = (self.root.register(self.validate_number), '%P')
+
+        ttk.Label(freq_inner, text="Every N Epochs:").pack(side="left", padx=(0, 4))
+        ep_entry = ttk.Entry(freq_inner, width=7, validate="key", validatecommand=vcmd)
+        ep_entry.pack(side="left", padx=(0, 18))
+        ep_entry.bind("<FocusOut>", self.update_button_states); ep_entry.bind("<KeyRelease>", self.update_button_states)
+        ep_entry.is_required = False; ep_entry.is_path = False
+        self.entries["sample_every_n_epochs"] = ep_entry
+        ToolTip(ep_entry, "Generate a sample every N training epochs.")
+
+        ttk.Label(freq_inner, text="Every N Steps:").pack(side="left", padx=(0, 4))
+        st_entry = ttk.Entry(freq_inner, width=7, validate="key", validatecommand=vcmd)
+        st_entry.pack(side="left", padx=(0, 18))
+        st_entry.bind("<FocusOut>", self.update_button_states); st_entry.bind("<KeyRelease>", self.update_button_states)
+        st_entry.is_required = False; st_entry.is_path = False
+        self.entries["sample_every_n_steps"] = st_entry
+        ToolTip(st_entry, "Generate a sample every N training steps.")
+
+        af_var = tk.BooleanVar(value=False)
+        af_cb = ttk.Checkbutton(freq_inner, text="Sample at First", variable=af_var,
+                                command=self.update_button_states)
+        af_cb.var = af_var; af_cb.pack(side="left")
+        af_cb.is_required = False; af_cb.is_path = False
+        self.entries["sample_at_first"] = af_cb
+        ToolTip(af_cb, "Generate one sample before training starts (step 0).")
+
+        # --- Prompt editor ---
+        prompts_frame = ttk.LabelFrame(tab_frame, text="Sample Prompts"); prompts_frame.pack(fill="x", padx=10, pady=(0, 10))
+
+        prompt_btn_row = ttk.Frame(prompts_frame); prompt_btn_row.pack(fill="x", padx=5, pady=(6, 4))
+        ttk.Button(prompt_btn_row, text="+ Add Prompt", command=self._add_sample_prompt_dialog).pack(side="left")
+        ttk.Label(prompt_btn_row, text="Leave empty to disable sampling.",
+                  foreground="#888888", font=("Calibri", 9, "italic")).pack(side="left", padx=(12, 0))
+
+        plist_container = ttk.Frame(prompts_frame); plist_container.pack(fill="x", padx=5, pady=(0, 6))
+        plist_canvas = tk.Canvas(plist_container, bg='#2B2B2B', highlightthickness=0, height=160)
+        plist_sb = ttk.Scrollbar(plist_container, orient="vertical", command=plist_canvas.yview)
+        self._prompt_list_inner = ttk.Frame(plist_canvas)
+        self._prompt_list_inner.bind("<Configure>", lambda e: plist_canvas.configure(scrollregion=plist_canvas.bbox("all")))
+        plist_canvas.create_window((0, 0), window=self._prompt_list_inner, anchor="nw", tags="pframe")
+        plist_canvas.bind("<Configure>", lambda e: plist_canvas.itemconfig("pframe", width=e.width))
+        plist_canvas.configure(yscrollcommand=plist_sb.set)
+        plist_canvas.pack(side="left", fill="x", expand=True); plist_sb.pack(side="right", fill="y")
+        self._prompt_list_canvas = plist_canvas
+        self._rebuild_prompt_list()
+
+        # --- Outputs section ---
+        outputs_frame = ttk.LabelFrame(tab_frame, text="Sample Outputs"); outputs_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        btn_row = ttk.Frame(outputs_frame); btn_row.pack(fill="x", padx=5, pady=5)
+        ttk.Button(btn_row, text="Open Output Folder", command=self._open_output_folder).pack(side="left", padx=(0, 5))
+        ttk.Button(btn_row, text="Refresh", command=self._refresh_sample_list).pack(side="right")
+
+        list_container = ttk.Frame(outputs_frame); list_container.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+        canvas = tk.Canvas(list_container, bg='#2B2B2B', highlightthickness=0, height=200)
+        scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=canvas.yview)
+        self._sample_list_frame = ttk.Frame(canvas)
+        self._sample_list_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self._sample_list_frame, anchor="nw", tags="sframe")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig("sframe", width=e.width))
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True); scrollbar.pack(side="right", fill="y")
+        self._sample_canvas = canvas
+
+        ttk.Label(self._sample_list_frame, text="No samples yet. Start training to generate samples.",
+                  foreground="#777777").pack(padx=10, pady=10)
+
+    # ---------- Prompt list helpers ----------
+
+    def _rebuild_prompt_list(self):
+        for w in self._prompt_list_inner.winfo_children():
+            w.destroy()
+        if not self._sample_prompts_data:
+            ttk.Label(self._prompt_list_inner, text="No prompts added yet.",
+                      foreground="#777777").pack(padx=10, pady=8)
+            return
+        for idx, p in enumerate(self._sample_prompts_data):
+            row = ttk.Frame(self._prompt_list_inner); row.pack(fill="x", padx=4, pady=2)
+            # Summary label
+            summary = p.get("prompt", "")[:55] + ("…" if len(p.get("prompt", "")) > 55 else "")
+            params = []
+            if p.get("width") or p.get("height"):
+                params.append(f"{p.get('width','?')}×{p.get('height','?')}")
+            if p.get("frames"): params.append(f"{p['frames']}f")
+            if p.get("steps"): params.append(f"s{p['steps']}")
+            if p.get("guidance"): params.append(f"g{p['guidance']}")
+            if p.get("seed"): params.append(f"seed={p['seed']}")
+            tag = "  |  " + "  ".join(params) if params else ""
+            ttk.Label(row, text=summary + tag, anchor="w",
+                      foreground="#CCCCCC").pack(side="left", fill="x", expand=True)
+            ttk.Button(row, text="Edit", width=5,
+                       command=lambda i=idx: self._edit_sample_prompt_dialog(i)).pack(side="right", padx=(3, 0))
+            ttk.Button(row, text="Del", width=4,
+                       command=lambda i=idx: self._delete_sample_prompt(i)).pack(side="right", padx=(3, 0))
+
+    def _delete_sample_prompt(self, idx):
+        self._sample_prompts_data.pop(idx)
+        self._rebuild_prompt_list()
+
+    def _add_sample_prompt_dialog(self):
+        self._open_prompt_dialog(None)
+
+    def _edit_sample_prompt_dialog(self, idx):
+        self._open_prompt_dialog(idx)
+
+    def _open_prompt_dialog(self, idx):
+        """Open a modal dialog to add/edit a sample prompt."""
+        existing = self._sample_prompts_data[idx] if idx is not None else {}
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Edit Sample Prompt" if idx is not None else "Add Sample Prompt")
+        dlg.geometry("560x480")
+        dlg.configure(bg='#2B2B2B')
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        def lbl(parent, text):
+            ttk.Label(parent, text=text).pack(anchor="w", padx=10, pady=(8, 1))
+
+        def entry(parent, default="", width=None):
+            kw = {"width": width} if width else {}
+            e = ttk.Entry(parent, **kw)
+            if default: e.insert(0, str(default))
+            e.pack(fill="x", padx=10, pady=(0, 2))
+            return e
+
+        lbl(dlg, "Prompt text *")
+        e_prompt = ttk.Entry(dlg)
+        e_prompt.insert(0, existing.get("prompt", ""))
+        e_prompt.pack(fill="x", padx=10, pady=(0, 2))
+
+        lbl(dlg, "Negative prompt  (optional)")
+        e_neg = ttk.Entry(dlg)
+        e_neg.insert(0, existing.get("neg", ""))
+        e_neg.pack(fill="x", padx=10, pady=(0, 2))
+
+        row1 = ttk.Frame(dlg); row1.pack(fill="x", padx=10, pady=(8, 0))
+        for text, key, default, w in [
+            ("Width", "width", "512", 6),
+            ("Height", "height", "512", 6),
+            ("Frames", "frames", "25", 5),
+            ("Steps", "steps", "20", 5),
+        ]:
+            col = ttk.Frame(row1); col.pack(side="left", padx=(0, 12))
+            ttk.Label(col, text=text).pack(anchor="w")
+            e = ttk.Entry(col, width=w)
+            e.insert(0, str(existing.get(key, default)))
+            e.pack()
+            row1.__dict__[f"e_{key}"] = e
+
+        row2 = ttk.Frame(dlg); row2.pack(fill="x", padx=10, pady=(8, 0))
+        for text, key, default, w in [
+            ("Guidance", "guidance", "5.0", 6),
+            ("Flow Shift", "flow_shift", "", 6),
+            ("CFG Scale", "cfg_scale", "", 6),
+            ("Seed", "seed", "", 8),
+        ]:
+            col = ttk.Frame(row2); col.pack(side="left", padx=(0, 12))
+            ttk.Label(col, text=text).pack(anchor="w")
+            e = ttk.Entry(col, width=w)
+            val = existing.get(key, default)
+            if val: e.insert(0, str(val))
+            e.pack()
+            row2.__dict__[f"e_{key}"] = e
+
+        lbl(dlg, "Image path  (I2V only — optional)")
+        e_img = ttk.Frame(dlg); e_img.pack(fill="x", padx=10, pady=(0, 2))
+        e_img_entry = ttk.Entry(e_img)
+        e_img_entry.insert(0, existing.get("image_path", ""))
+        e_img_entry.pack(side="left", fill="x", expand=True)
+        def _browse_img():
+            p = filedialog.askopenfilename(filetypes=[("Images", "*.png *.jpg *.jpeg *.webp")])
+            if p: e_img_entry.delete(0, tk.END); e_img_entry.insert(0, p)
+        ttk.Button(e_img, text="Browse", command=_browse_img).pack(side="right", padx=(5, 0))
+
+        def _save():
+            prompt_text = e_prompt.get().strip()
+            if not prompt_text:
+                messagebox.showerror("Validation", "Prompt text cannot be empty.", parent=dlg); return
+            data = {"prompt": prompt_text}
+            data["neg"]        = e_neg.get().strip()
+            data["width"]      = row1.e_width.get().strip()
+            data["height"]     = row1.e_height.get().strip()
+            data["frames"]     = row1.e_frames.get().strip()
+            data["steps"]      = row1.e_steps.get().strip()
+            data["guidance"]   = row2.e_guidance.get().strip()
+            data["flow_shift"] = row2.e_flow_shift.get().strip()
+            data["cfg_scale"]  = row2.e_cfg_scale.get().strip()
+            data["seed"]       = row2.e_seed.get().strip()
+            data["image_path"] = e_img_entry.get().strip()
+            # Remove empty optional keys
+            data = {k: v for k, v in data.items() if v != ""}
+            if idx is not None:
+                self._sample_prompts_data[idx] = data
+            else:
+                self._sample_prompts_data.append(data)
+            self._rebuild_prompt_list()
+            dlg.destroy()
+
+        btn_row = ttk.Frame(dlg); btn_row.pack(pady=14)
+        ttk.Button(btn_row, text="Save", command=_save).pack(side="left", padx=6)
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side="left", padx=6)
+        dlg.bind("<Return>", lambda e: _save())
+        e_prompt.focus_set()
+
+    def _build_sample_prompts_txt(self):
+        """Serialise self._sample_prompts_data to a temp .txt file, return path or ''."""
+        if not self._sample_prompts_data:
+            return ""
+        import tempfile
+        lines = []
+        for p in self._sample_prompts_data:
+            line = p.get("prompt", "")
+            if p.get("width"):      line += f" --w {p['width']}"
+            if p.get("height"):     line += f" --h {p['height']}"
+            if p.get("frames"):     line += f" --f {p['frames']}"
+            if p.get("steps"):      line += f" --s {p['steps']}"
+            if p.get("guidance"):   line += f" --g {p['guidance']}"
+            if p.get("flow_shift"): line += f" --fs {p['flow_shift']}"
+            if p.get("cfg_scale"):  line += f" --l {p['cfg_scale']}"
+            if p.get("seed"):       line += f" --d {p['seed']}"
+            if p.get("neg"):        line += f" --n {p['neg']}"
+            if p.get("image_path"): line += f" --i {p['image_path']}"
+            lines.append(line)
+        tf = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
+        tf.write("\n".join(lines))
+        tf.close()
+        self._temp_prompts_file = tf.name
+        return tf.name
+
+    def _open_output_folder(self):
+        output_dir = self.entries["output_dir"].get()
+        if not output_dir or not os.path.isdir(output_dir):
+            messagebox.showinfo("Output Folder", "Output directory is not set or does not exist."); return
+        if sys.platform == "win32":
+            os.startfile(output_dir)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", output_dir])
+        else:
+            subprocess.Popen(["xdg-open", output_dir])
+
+    def _get_sample_files(self):
+        output_dir = self.entries["output_dir"].get()
+        if not output_dir or not os.path.isdir(output_dir):
+            return []
+        results = []
+        for root_dir, _, files in os.walk(output_dir):
+            for fname in files:
+                if fname.lower().endswith(('.png', '.jpg', '.jpeg', '.mp4', '.webp')):
+                    fpath = os.path.join(root_dir, fname)
+                    try:
+                        results.append((os.path.getmtime(fpath), fpath))
+                    except OSError:
+                        pass
+        results.sort(key=lambda x: x[0])
+        return results
+
+    def _refresh_sample_list(self):
+        files = self._get_sample_files()
+        if files == self._last_sample_files:
+            return
+        self._last_sample_files = files
+
+        for w in self._sample_list_frame.winfo_children():
+            w.destroy()
+
+        if not files:
+            ttk.Label(self._sample_list_frame, text="No samples yet. Start training to generate samples.",
+                      foreground="#777777").pack(padx=10, pady=10)
+            return
+
+        for mtime, fpath in reversed(files):
+            row = ttk.Frame(self._sample_list_frame); row.pack(fill="x", padx=5, pady=1)
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+            ttk.Label(row, text=ts, width=17, anchor="w").pack(side="left")
+            short = Path(fpath).name
+            if len(short) > 50:
+                short = short[:22] + "..." + short[-22:]
+            ttk.Label(row, text=short, anchor="w").pack(side="left", fill="x", expand=True)
+            def _open(p=fpath):
+                if sys.platform == "win32":
+                    os.startfile(p)
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", p])
+                else:
+                    subprocess.Popen(["xdg-open", p])
+            ttk.Button(row, text="Open", width=6, command=_open).pack(side="right", padx=(5, 0))
+
+    def _start_sample_watcher(self):
+        if not self._sample_prompts_data:
+            return
+        self._last_sample_files = []
+        self.sample_watcher_active = True
+
+        def _watch():
+            while self.sample_watcher_active:
+                new_files = self._get_sample_files()
+                if new_files != self._last_sample_files:
+                    self.root.after(0, self._refresh_sample_list)
+                time.sleep(3)
+
+        self._sample_watcher_thread = threading.Thread(target=_watch, daemon=True)
+        self._sample_watcher_thread.start()
+
+    def _stop_sample_watcher(self):
+        self.sample_watcher_active = False
 
     def create_run_monitor_tab(self):
         tab_frame = ttk.Frame(self.notebook); self.notebook.add(tab_frame, text="Run & Monitor")
@@ -369,6 +737,38 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
         button = ttk.Button(action_frame, text="Run Accelerate Config", command=self.run_accelerate_config)
         button.pack(pady=20)
 
+    def on_training_mode_change(self, event=None):
+        mode = self.training_mode_var.get()
+        is_wan = (mode == "Wan 2.2")
+
+        if is_wan:
+            self.title_label.config(text="Musubi Tuner - WAN 2.2 LoRA Training")
+            self.root.title("Musubi Tuner GUI - WAN 2.2 LoRA Training")
+            self.mode_note_label.config(text="")
+            self.hidden_frames['flux2_model_paths'].pack_forget()
+            self.hidden_frames['wan_dit'].pack(fill="x", padx=10, pady=10, before=self._vae_frame)
+            self.hidden_frames['wan_models'].pack(fill="x", padx=10, pady=10, before=self._vae_frame)
+        else:
+            title_txt = "Musubi Tuner - Flux.2 Klein LoRA Training" if mode == "Flux.2 Klein" else "Musubi Tuner - Flux.2 Dev LoRA Training"
+            self.title_label.config(text=title_txt)
+            self.root.title(f"Musubi Tuner GUI - {mode} LoRA Training")
+            self.mode_note_label.config(text="Single DiT, Qwen3/Mistral3 text encoder" if mode == "Flux.2 Klein" else "Single DiT, Mistral3 text encoder")
+            self.hidden_frames['wan_dit'].pack_forget()
+            self.hidden_frames['wan_models'].pack_forget()
+            self.hidden_frames['flux2_model_paths'].pack(fill="x", padx=10, pady=10, before=self._vae_frame)
+            # Update version choices
+            ver_combo = self.entries["flux2_model_version"]
+            if mode == "Flux.2 Dev":
+                ver_combo.config(values=["Dev"])
+                ver_combo.set("Dev")
+            else:
+                klein_versions = [k for k in FLUX2_VERSION_MAP if k != "Dev"]
+                ver_combo.config(values=klein_versions)
+                if ver_combo.get() == "Dev":
+                    ver_combo.set("Klein Base 4B ★")
+
+        self.update_button_states()
+
     def setup_graph_style(self):
         self.fig.patch.set_facecolor('#2B2B2B'); self.ax.set_facecolor('#3C3F41')
         self.ax.tick_params(axis='x', colors='white'); self.ax.tick_params(axis='y', colors='white')
@@ -412,13 +812,31 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             self._update_dynamic_widgets()
             if self.entries["resume_path"].get(): self.run_status_var.set("🟢 Resuming Training RUN")
             else: self.run_status_var.set("⚪ New Training RUN")
-        except (KeyError, AttributeError): pass 
+        except (KeyError, AttributeError): pass
 
+        mode = self.training_mode_var.get()
+        is_wan = (mode == "Wan 2.2")
         all_valid = True
-        train_high = self.entries["train_high_noise"].var.get(); train_low = self.entries["train_low_noise"].var.get()
-        self.entries["dit_high_noise"].is_required = train_high; self.entries["dit_low_noise"].is_required = train_low
-        self.entries["network_dim_low"].is_required = train_low; self.entries["network_alpha_low"].is_required = train_low
-        self.entries["clip_model"].is_required = self.entries["is_i2v"].var.get()
+
+        if is_wan:
+            train_high = self.entries["train_high_noise"].var.get(); train_low = self.entries["train_low_noise"].var.get()
+            self.entries["dit_high_noise"].is_required = train_high; self.entries["dit_low_noise"].is_required = train_low
+            self.entries["network_dim_low"].is_required = train_low; self.entries["network_alpha_low"].is_required = train_low
+            self.entries["clip_model"].is_required = self.entries["is_i2v"].var.get()
+            self.entries["t5_model"].is_required = True
+            self.entries["flux2_dit_model"].is_required = False
+            self.entries["flux2_text_encoder"].is_required = False
+        else:
+            # Flux.2: single DiT + text encoder required; Wan fields not required
+            self.entries["flux2_dit_model"].is_required = True
+            self.entries["flux2_text_encoder"].is_required = True
+            self.entries["t5_model"].is_required = False
+            self.entries["dit_high_noise"].is_required = False
+            self.entries["dit_low_noise"].is_required = False
+            self.entries["clip_model"].is_required = False
+            self.entries["network_dim_low"].is_required = True
+            self.entries["network_alpha_low"].is_required = True
+            train_high = False; train_low = True  # for combined-run logic below
 
         log_with = self.entries["log_with"].get(); self.entries["logging_dir"].is_required = log_with != "none"
 
@@ -440,34 +858,52 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
                 style = "Valid.TEntry" if is_valid else "Invalid.TEntry"
                 widget.config(style=style)
                 if not is_valid: all_valid = False
-        
-        if not (train_high or train_low): all_valid = False
+
+        if is_wan:
+            if not (train_high or train_low): all_valid = False
         self.start_btn.config(state="normal" if all_valid else "disabled")
         try:
-            self.entries["recache_latents"].config(state="normal" if all(self.entries[key].get() and os.path.exists(self.entries[key].get()) for key in ["dataset_config", "vae_model"]) else "disabled")
-            self.entries["recache_text"].config(state="normal" if all(self.entries[key].get() and os.path.exists(self.entries[key].get()) for key in ["dataset_config", "t5_model"]) else "disabled")
+            can_cache_latents = all(self.entries[key].get() and os.path.exists(self.entries[key].get()) for key in ["dataset_config", "vae_model"])
+            self.entries["recache_latents"].config(state="normal" if can_cache_latents else "disabled")
+            if is_wan:
+                can_cache_text = all(self.entries[key].get() and os.path.exists(self.entries[key].get()) for key in ["dataset_config", "t5_model"])
+            else:
+                can_cache_text = all(self.entries[key].get() and os.path.exists(self.entries[key].get()) for key in ["dataset_config", "flux2_text_encoder"])
+            self.entries["recache_text"].config(state="normal" if can_cache_text else "disabled")
         except (AttributeError, KeyError): pass
 
     def _update_dynamic_widgets(self):
-        show_low = self.entries["train_low_noise"].var.get(); show_high = self.entries["train_high_noise"].var.get()
-        is_i2v = self.entries["is_i2v"].var.get()
+        mode = self.training_mode_var.get()
+        is_wan = (mode == "Wan 2.2")
+
+        show_low = self.entries["train_low_noise"].var.get() if is_wan else False
+        show_high = self.entries["train_high_noise"].var.get() if is_wan else False
+        is_i2v = self.entries["is_i2v"].var.get() if is_wan else False
 
         net_type = self.entries.get("network_type", None)
         is_lokr = net_type and net_type.get() == "LoKr"
         if is_lokr: self.hidden_frames['lokr_factor'].pack(fill='x', pady=(0, 3))
         else: self.hidden_frames['lokr_factor'].pack_forget()
 
-        if show_low: self.hidden_frames['low_noise_lora_params'].pack(fill='x', expand=True, pady=(0, 5))
+        # Low/high noise lora params only shown in Wan mode
+        if is_wan and show_low: self.hidden_frames['low_noise_lora_params'].pack(fill='x', expand=True, pady=(0, 5))
         else: self.hidden_frames['low_noise_lora_params'].pack_forget()
-        if show_high: self.hidden_frames['high_noise_lora_params'].pack(fill='x', expand=True, pady=(0, 5))
+        if is_wan and show_high: self.hidden_frames['high_noise_lora_params'].pack(fill='x', expand=True, pady=(0, 5))
         else: self.hidden_frames['high_noise_lora_params'].pack_forget()
-        
+
+        # In Flux.2 mode always show low_noise_lora_params as the single network params section
+        if not is_wan:
+            self.hidden_frames['low_noise_lora_params'].config(text="Network Parameters")
+            self.hidden_frames['low_noise_lora_params'].pack(fill='x', expand=True, pady=(0, 5))
+        else:
+            self.hidden_frames['low_noise_lora_params'].config(text="Low Noise Network Parameters")
+
         dim_high_val = self.entries["network_dim_high"].get().strip()
         alpha_high_val = self.entries["network_alpha_high"].get().strip()
         is_separate_run = (dim_high_val and dim_high_val != "None") or \
                           (alpha_high_val and alpha_high_val != "None")
-        is_combined_run = show_low and show_high and not is_separate_run
-        
+        is_combined_run = is_wan and show_low and show_high and not is_separate_run
+
         if is_combined_run:
             self.hidden_frames['timestep_boundary'].pack(fill='x', expand=True)
             boundary_widget = self.entries["timestep_boundary"]
@@ -479,11 +915,10 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
 
         offload_widget = self.entries["offload_inactive_dit"]
         blocks_to_swap_widget = self.entries["blocks_to_swap"]
-        
         is_offloading = offload_widget.var.get()
         blocks_to_swap_widget.config(state="disabled" if is_offloading else "normal")
         if is_offloading and blocks_to_swap_widget.cget('state') == 'normal':
-             blocks_to_swap_widget.delete(0, tk.END)
+            blocks_to_swap_widget.delete(0, tk.END)
 
         scheduler = self.entries["lr_scheduler"].get()
         if scheduler == "constant_with_warmup": self.hidden_frames['lr_warmup'].pack(fill='x', expand=True)
@@ -491,16 +926,33 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
         if scheduler == "cosine_with_restarts": self.hidden_frames['lr_restarts'].pack(fill='x', expand=True)
         else: self.hidden_frames['lr_restarts'].pack_forget()
 
+        # fp8_t5 only relevant for Wan mode
+        try:
+            if is_wan: self.hidden_frames['fp8_t5_frame'].pack(fill='x')
+            else: self.hidden_frames['fp8_t5_frame'].pack_forget()
+        except KeyError: pass
+
     def get_settings(self):
-        settings = {};
+        settings = {}
         for key, widget in self.entries.items():
             if isinstance(widget, (tk.BooleanVar, tk.StringVar)): settings[key] = widget.get()
             elif hasattr(widget, 'var'): settings[key] = widget.var.get()
             else: settings[key] = widget.get()
+        settings["training_mode"] = self.training_mode_var.get()
+        settings["sample_prompts_data"] = self._sample_prompts_data
         return settings
-    
+
     def set_values(self, settings):
+        # Restore training mode first so widget visibility is correct
+        if "training_mode" in settings:
+            self.training_mode_var.set(settings["training_mode"])
+            self.on_training_mode_change()
+        if "sample_prompts_data" in settings:
+            self._sample_prompts_data = settings["sample_prompts_data"] or []
+            try: self._rebuild_prompt_list()
+            except AttributeError: pass  # UI not built yet during early init
         for key, value in settings.items():
+            if key in ("training_mode", "sample_prompts_data", "sample_prompts"): continue
             if key in self.entries:
                 widget = self.entries[key]
                 if isinstance(widget, (tk.BooleanVar, tk.StringVar)):
@@ -520,6 +972,7 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             "train_high_noise": True, "train_low_noise": True,
             "min_timestep_low": "0", "max_timestep_low": "875", "min_timestep_high": "875", "max_timestep_high": "1000",
             "vae_model": "", "clip_model": "", "t5_model": "",
+            "flux2_model_version": "Klein Base 4B ★", "flux2_dit_model": "", "flux2_text_encoder": "", "fp8_text_encoder": False,
             "output_dir": "", "output_name": "my-lora",
             "learning_rate": "2e-4", "max_train_epochs": "10", "save_every_n_epochs": "1", "save_every_n_steps": "", "seed": "42",
             "network_type": "LoRA", "lokr_factor": "", "network_dim_low": "32", "network_alpha_low": "16", "network_dim_high": "", "network_alpha_high": "",
@@ -533,7 +986,10 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             "attention_mechanism": "xformers", "resume_path": "", "network_weights": "",
             "log_with": "none", "logging_dir": "", "log_prefix": "",
             "recache_latents": False, "recache_text": False,
-            "convert_lora_path": "", "convert_output_dir": ""
+            "convert_lora_path": "", "convert_output_dir": "",
+            "training_mode": "Wan 2.2",
+            "sample_every_n_epochs": "", "sample_every_n_steps": "", "sample_at_first": False,
+            "sample_prompts_data": [],
         }
         self.set_values(defaults)
         
@@ -630,7 +1086,7 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
     
     def stop_all_activity(self):
         self.start_btn.config(state="normal"); self.stop_btn.config(state="disabled")
-        self.stop_vram_monitor(); self.current_process = None
+        self.stop_vram_monitor(); self._stop_sample_watcher(); self.current_process = None
         self.update_button_states()
 
     def process_console_output(self, line, output_widget):
@@ -710,34 +1166,27 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
 
     def start_training(self):
         self.update_button_states(); settings = self.get_settings()
+        settings["sample_prompts"] = self._build_sample_prompts_txt()
         if not self._check_logging_dependencies(settings.get("log_with")): return
         if self.start_btn['state'] == 'disabled':
-            messagebox.showerror("Validation Error", "Please fill all required fields and select at least one DiT model to train."); return
+            messagebox.showerror("Validation Error", "Please fill all required fields before training."); return
         
         self.loss_data.clear(); self.current_step = 0
-        self.update_loss_graph(); self.start_vram_monitor()
+        self.update_loss_graph(); self.start_vram_monitor(); self._start_sample_watcher()
         self.progress_var.set(0); self.progress_label_var.set("Starting sequence...")
         self.output_text.delete("1.0", tk.END); self.command_sequence = []
         python_executable = sys.executable or "python"
         
-        if settings.get("recache_latents"):
-            # For i2v caching, create a temporary config without image_directory
-            dataset_config_path = settings["dataset_config"]
-            if settings.get("is_i2v"):
-                dataset_config_path = self._create_temp_cache_config(settings["dataset_config"])
+        mode = settings.get("training_mode", "Wan 2.2")
+        is_wan = (mode == "Wan 2.2")
 
-            latents_cmd = [python_executable, "src/musubi_tuner/wan_cache_latents.py", "--dataset_config", dataset_config_path, "--vae", settings["vae_model"]]
-            if settings.get("is_i2v"):
-                latents_cmd.append("--i2v")
-            self.command_sequence.append(latents_cmd)
-        if settings.get("recache_text"):
-            # For i2v text caching, also use temporary config without image_directory
-            dataset_config_path = settings["dataset_config"]
-            if settings.get("is_i2v"):
-                dataset_config_path = self._create_temp_cache_config(settings["dataset_config"])
-
-            text_cmd = [python_executable, "src/musubi_tuner/wan_cache_text_encoder_outputs.py", "--dataset_config", dataset_config_path, "--t5", settings["t5_model"]]
-            self.command_sequence.append(text_cmd)
+        if is_wan:
+            cache_cmds = wan_backend.build_cache_commands(
+                settings, python_executable, temp_config_fn=self._create_temp_cache_config
+            )
+        else:
+            cache_cmds = flux2_backend.build_cache_commands(settings, python_executable)
+        self.command_sequence.extend(cache_cmds)
         
         training_commands = self.build_training_commands()
         if training_commands: self.command_sequence.extend(training_commands)
@@ -753,103 +1202,12 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             self.stop_all_activity()
 
     def build_training_commands(self):
-        settings = self.get_settings(); commands = []
-        train_low = settings.get("train_low_noise"); train_high = settings.get("train_high_noise")
-        
-        def build_single_command(is_high_noise_run, is_combined_run):
-            def normalize_path(p): return p.replace(os.sep, '/') if isinstance(p, str) and p else p
-            def add_arg(cmd_list, key, value, is_path=False):
-                clean_value = str(value).strip()
-                if clean_value not in (None, "", "False"):
-                    cmd_list.extend([key, str(normalize_path(clean_value) if is_path else clean_value)] if clean_value not in (True, "True") else [key])
-
-            command = ["accelerate", "launch", "--num_cpu_threads_per_process", "1", "src/musubi_tuner/wan_train_network.py"]
-            task_type = "i2v-A14B" if settings.get("is_i2v") else "t2v-A14B"
-            add_arg(command, "--task", task_type)
-            add_arg(command, "--mixed_precision", settings.get("mixed_precision"))
-
-            add_arg(command, "--vae", settings.get("vae_model"), is_path=True); add_arg(command, "--t5", settings.get("t5_model"), is_path=True)
-            add_arg(command, "--clip", settings.get("clip_model"), is_path=True); add_arg(command, "--dataset_config", settings.get("dataset_config"), is_path=True)
-            
-            if is_combined_run:
-                add_arg(command, "--dit", settings.get("dit_low_noise"), is_path=True)
-                add_arg(command, "--dit_high_noise", settings.get("dit_high_noise"), is_path=True)
-                add_arg(command, "--timestep_boundary", settings.get("timestep_boundary"))
-            else:
-                add_arg(command, "--dit", settings.get("dit_high_noise") if is_high_noise_run else settings.get("dit_low_noise"), is_path=True)
-                add_arg(command, "--min_timestep", settings.get("min_timestep_high") if is_high_noise_run else settings.get("min_timestep_low"))
-                add_arg(command, "--max_timestep", settings.get("max_timestep_high") if is_high_noise_run else settings.get("max_timestep_low"))
-
-            dim = settings.get("network_dim_high") if is_high_noise_run and settings.get("network_dim_high") else settings.get("network_dim_low")
-            alpha = settings.get("network_alpha_high") if is_high_noise_run and settings.get("network_alpha_high") else settings.get("network_alpha_low")
-            _net_type_map = {"LoHa": "networks.loha", "LoKr": "networks.lokr"}
-            _network_type = settings.get("network_type", "LoRA")
-            _network_module = _net_type_map.get(_network_type, "networks.lora_wan")
-            add_arg(command, "--network_module", _network_module); add_arg(command, "--network_dim", dim); add_arg(command, "--network_alpha", alpha)
-            if _network_type == "LoKr":
-                _factor = (settings.get("lokr_factor") or "").strip()
-                if _factor and _factor != "-1": add_arg(command, "--network_args", f"factor={_factor}")
-            
-            attention = settings.get("attention_mechanism");
-            if attention and attention != "none": command.append(f"--{attention}")
-            add_arg(command, "--fp8_base", settings.get("fp8_base")); add_arg(command, "--fp8_scaled", settings.get("fp8_scaled")); add_arg(command, "--fp8_t5", settings.get("fp8_t5")); add_arg(command, "--fp8_llm", settings.get("fp8_llm"))
-            add_arg(command, "--force_v2_1_time_embedding", settings.get("force_v2_1_time_embedding"))
-            add_arg(command, "--optimizer_type", settings.get("optimizer_type")); add_arg(command, "--learning_rate", settings.get("learning_rate"))
-            add_arg(command, "--max_grad_norm", settings.get("max_grad_norm")); add_arg(command, "--gradient_checkpointing", settings.get("gradient_checkpointing"))
-            add_arg(command, "--gradient_accumulation_steps", settings.get("gradient_accumulation_steps"))
-            add_arg(command, "--max_data_loader_n_workers", settings.get("max_data_loader_n_workers")); add_arg(command, "--persistent_data_loader_workers", settings.get("persistent_data_loader_workers"))
-
-            if is_combined_run and settings.get("offload_inactive_dit"): add_arg(command, "--offload_inactive_dit", True)
-            else: add_arg(command, "--blocks_to_swap", settings.get("blocks_to_swap"))
-            
-            add_arg(command, "--timestep_sampling", settings.get("timestep_sampling")); add_arg(command, "--num_timestep_buckets", settings.get("num_timestep_buckets"))
-            add_arg(command, "--discrete_flow_shift", settings.get("discrete_flow_shift")); add_arg(command, "--preserve_distribution_shape", settings.get("preserve_distribution_shape"))
-            add_arg(command, "--optimizer_args", settings.get("optimizer_args"))
-            
-            lr_scheduler = settings.get("lr_scheduler")
-            if lr_scheduler and lr_scheduler != "constant":
-                add_arg(command, "--lr_scheduler", lr_scheduler)
-                if lr_scheduler == "constant_with_warmup": add_arg(command, "--lr_warmup_steps", settings.get("lr_warmup_steps"))
-                if lr_scheduler == "cosine_with_restarts": add_arg(command, "--lr_scheduler_num_cycles", settings.get("lr_scheduler_num_cycles"))
-                add_arg(command, "--lr_scheduler_power", settings.get("lr_scheduler_power")); add_arg(command, "--lr_scheduler_min_lr_ratio", settings.get("lr_scheduler_min_lr_ratio"))
-
-            add_arg(command, "--max_train_epochs", settings.get("max_train_epochs")); add_arg(command, "--save_every_n_epochs", settings.get("save_every_n_epochs"))
-            add_arg(command, "--save_every_n_steps", settings.get("save_every_n_steps")); add_arg(command, "--seed", settings.get("seed"))
-            
-            suffix = ""
-            if train_low and train_high and not is_combined_run: suffix = "_HighNoise" if is_high_noise_run else "_LowNoise"
-            elif train_high: suffix = "_HighNoise"
-            elif train_low: suffix = "_LowNoise"
-            
-            output_dir = Path(settings.get("output_dir")) / (settings.get("output_name") + suffix)
-            output_name = settings.get("output_name") + suffix
-            os.makedirs(output_dir, exist_ok=True)
-            add_arg(command, "--output_dir", str(output_dir), is_path=True)
-            add_arg(command, "--output_name", output_name)
-            
-            add_arg(command, "--save_state", settings.get("save_state")); add_arg(command, "--resume", settings.get("resume_path"), is_path=True)
-            add_arg(command, "--network_weights", settings.get("network_weights"), is_path=True)
-            
-            log_with = settings.get("log_with")
-            if log_with and log_with != "none":
-                add_arg(command, "--log_with", log_with); add_arg(command, "--logging_dir", settings.get("logging_dir"), is_path=True); add_arg(command, "--log_prefix", settings.get("log_prefix"))
-            return command
-        
-        dim_high = (settings.get("network_dim_high") or "").strip()
-        alpha_high = (settings.get("network_alpha_high") or "").strip()
-        is_separate_run = train_low and train_high and (dim_high or alpha_high)
-        is_combined_run = train_low and train_high and not is_separate_run
-
-        if is_separate_run:
-            commands.append(build_single_command(is_high_noise_run=False, is_combined_run=False))
-            commands.append(build_single_command(is_high_noise_run=True, is_combined_run=False))
-        elif is_combined_run:
-             commands.append(build_single_command(is_high_noise_run=True, is_combined_run=True))
-        elif train_low:
-             commands.append(build_single_command(is_high_noise_run=False, is_combined_run=False))
-        elif train_high:
-             commands.append(build_single_command(is_high_noise_run=True, is_combined_run=False))
-        return commands
+        settings = self.get_settings()
+        mode = settings.get("training_mode", "Wan 2.2")
+        if mode == "Wan 2.2":
+            return wan_backend.build_commands(settings)
+        else:
+            return flux2_backend.build_commands(settings)
 
     def show_command(self):
         commands = self.build_training_commands()
