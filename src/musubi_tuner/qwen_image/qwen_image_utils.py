@@ -1,3 +1,4 @@
+import argparse
 import json
 import logging
 import math
@@ -382,7 +383,7 @@ def get_qwen_prompt_embeds_with_image(
     vlm: Qwen2_5_VLForConditionalGeneration,
     prompt: Union[str, List[str]],
     image: Union[List[ImageInput], ImageInput] = None,
-    mode: str = "edit",
+    model_version: str = "edit",
 ):
     r"""
     Args:
@@ -390,12 +391,12 @@ def get_qwen_prompt_embeds_with_image(
             prompt to be encoded
         image (`PIL.Image.Image`, `np.ndarray`, `torch.Tensor`):
             image to be encoded
-        mode (`str`, *optional*, defaults to "edit"):
-            mode of the prompt, can be "edit" or "edit-plus"
+        model_version (`str`, *optional*, defaults to "edit"):
+            version of the prompt, can be "edit", "edit-2509" or "edit-2511"
     """
-    if mode == "edit":
+    if model_version == "edit":
         prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n"
-    elif mode == "edit-plus":
+    elif model_version == "edit-2509" or model_version == "edit-2511":
         prompt_template_encode = "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
     prompt_template_encode_start_idx = 64
     # default_sample_size = 128
@@ -418,6 +419,20 @@ def get_qwen_prompt_embeds_with_image(
     elif image is not None:
         image = [[image]]  # wrap to list of list, not necessary, but for consistency
 
+    # RGB conversion
+    if image is not None:
+        for i in range(len(image)):
+            for j in range(len(image[i])):
+                img = image[i][j]
+                if isinstance(img, np.ndarray):
+                    if img.shape[2] == 4:
+                        img = img[:, :, :3]
+                    image[i][j] = img
+                elif isinstance(img, Image.Image):
+                    if img.mode == "RGBA":
+                        img = img.convert("RGB")
+                    image[i][j] = img
+
     assert image is None or len(image) == len(prompt), (
         f"Number of images {len(image) if image is not None else 0} must match number of prompts {len(prompt)} for batch processing"
     )
@@ -425,14 +440,14 @@ def get_qwen_prompt_embeds_with_image(
     base_img_prompts = [""] * len(prompt)
     if image is not None:
         vl_image_inputs = []  # flat list of images
-        if mode == "edit":
+        if model_version == "edit":
             for i, img in enumerate(image):
                 if img is None or len(img) == 0:
-                    logger.warning(f"No image provided for prompt {i}, but mode is {mode}, this may cause issues.")
+                    logger.warning(f"No image provided for prompt {i}, but version is {model_version}, this may cause issues.")
                     continue
                 if len(img) > 1:
                     logger.warning(
-                        f"Multiple images {len(img)} provided for prompt {i}, but mode is {mode}, 2nd and later images will be ignored."
+                        f"Multiple images {len(img)} provided for prompt {i}, but version is {model_version}, 2nd and later images will be ignored."
                     )
                 vl_image_inputs.append(img[0])
         else:
@@ -487,6 +502,52 @@ def get_qwen_prompt_embeds_with_image(
     return prompt_embeds, encoder_attention_mask
 
 
+def get_image_caption(
+    vl_processor: Qwen2VLProcessor,
+    vlm: Qwen2_5_VLForConditionalGeneration,
+    prompt_image: Union[List[ImageInput], ImageInput] = None,
+    use_en_prompt: bool = True,
+) -> str:
+    image_caption_prompt_cn = """<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n# 图像标注器\n你是一个专业的图像标注器。请基于输入图像，撰写图注:\n1.
+使用自然、描述性的语言撰写图注，不要使用结构化形式或富文本形式。\n2. 通过加入以下内容，丰富图注细节：\n - 对象的属性：如数量、颜色、形状、大小、位置、材质、状态、动作等\n -
+对象间的视觉关系：如空间关系、功能关系、动作关系、从属关系、比较关系、因果关系等\n - 环境细节：例如天气、光照、颜色、纹理、气氛等\n - 文字内容：识别图像中清晰可见的文字，不做翻译和解释，用引号在图注中强调\n3.
+保持真实性与准确性：\n - 不要使用笼统的描述\n -
+描述图像中所有可见的信息，但不要加入没有在图像中出现的内容\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n"""
+    image_caption_prompt_en = """<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n# Image Annotator\nYou are a professional
+image annotator. Please write an image caption based on the input image:\n1. Write the caption using natural,
+descriptive language without structured formats or rich text.\n2. Enrich caption details by including: \n - Object
+attributes, such as quantity, color, shape, size, material, state, position, actions, and so on\n - Vision Relations
+between objects, such as spatial relations, functional relations, possessive relations, attachment relations, action
+relations, comparative relations, causal relations, and so on\n - Environmental details, such as weather, lighting,
+colors, textures, atmosphere, and so on\n - Identify the text clearly visible in the image, without translation or
+explanation, and highlight it in the caption with quotation marks\n3. Maintain authenticity and accuracy:\n - Avoid
+generalizations\n - Describe all visible information in the image, while do not add information not explicitly shown in
+the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n"""
+
+    if use_en_prompt:
+        prompt = image_caption_prompt_en
+    else:
+        prompt = image_caption_prompt_cn
+
+    # Remove alpha channel if present
+    if isinstance(prompt_image, list) and isinstance(prompt_image[0], np.ndarray):
+        prompt_image = [img[:, :, :3] if img.shape[2] == 4 else img for img in prompt_image]
+    elif isinstance(prompt_image, np.ndarray):
+        if prompt_image.shape[2] == 4:
+            prompt_image = prompt_image[:, :, :3]
+
+    model_inputs = vl_processor(
+        text=prompt,
+        images=prompt_image,
+        padding=True,
+        return_tensors="pt",
+    ).to(vlm.device)
+    generated_ids = vlm.generate(**model_inputs, max_new_tokens=512)
+    generated_ids_trimmed = [out_ids[len(in_ids) :] for in_ids, out_ids in zip(model_inputs.input_ids, generated_ids)]
+    output_text = vl_processor.batch_decode(generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+    return output_text.strip()
+
+
 """
 def encode_prompt(
     vlm: Qwen2_5_VLForConditionalGeneration,
@@ -522,7 +583,153 @@ def encode_prompt(
 # region vae and latents
 
 
-def load_vae(vae_path: str, device: Union[str, torch.device] = "cpu", disable_mmap: bool = False) -> AutoencoderKLQwenImage:
+# Convert ComfyUI keys to standard keys if necessary
+def convert_comfyui_state_dict(sd):
+    if "conv1.bias" not in sd:
+        return sd
+
+    # Key mapping from ComfyUI VAE to official VAE, auto-generated by a script
+    key_map = {
+        "conv1": "quant_conv",
+        "conv2": "post_quant_conv",
+        "decoder.conv1": "decoder.conv_in",
+        "decoder.head.0": "decoder.norm_out",
+        "decoder.head.2": "decoder.conv_out",
+        "decoder.middle.0.residual.0": "decoder.mid_block.resnets.0.norm1",
+        "decoder.middle.0.residual.2": "decoder.mid_block.resnets.0.conv1",
+        "decoder.middle.0.residual.3": "decoder.mid_block.resnets.0.norm2",
+        "decoder.middle.0.residual.6": "decoder.mid_block.resnets.0.conv2",
+        "decoder.middle.1.norm": "decoder.mid_block.attentions.0.norm",
+        "decoder.middle.1.proj": "decoder.mid_block.attentions.0.proj",
+        "decoder.middle.1.to_qkv": "decoder.mid_block.attentions.0.to_qkv",
+        "decoder.middle.2.residual.0": "decoder.mid_block.resnets.1.norm1",
+        "decoder.middle.2.residual.2": "decoder.mid_block.resnets.1.conv1",
+        "decoder.middle.2.residual.3": "decoder.mid_block.resnets.1.norm2",
+        "decoder.middle.2.residual.6": "decoder.mid_block.resnets.1.conv2",
+        "decoder.upsamples.0.residual.0": "decoder.up_blocks.0.resnets.0.norm1",
+        "decoder.upsamples.0.residual.2": "decoder.up_blocks.0.resnets.0.conv1",
+        "decoder.upsamples.0.residual.3": "decoder.up_blocks.0.resnets.0.norm2",
+        "decoder.upsamples.0.residual.6": "decoder.up_blocks.0.resnets.0.conv2",
+        "decoder.upsamples.1.residual.0": "decoder.up_blocks.0.resnets.1.norm1",
+        "decoder.upsamples.1.residual.2": "decoder.up_blocks.0.resnets.1.conv1",
+        "decoder.upsamples.1.residual.3": "decoder.up_blocks.0.resnets.1.norm2",
+        "decoder.upsamples.1.residual.6": "decoder.up_blocks.0.resnets.1.conv2",
+        "decoder.upsamples.10.residual.0": "decoder.up_blocks.2.resnets.2.norm1",
+        "decoder.upsamples.10.residual.2": "decoder.up_blocks.2.resnets.2.conv1",
+        "decoder.upsamples.10.residual.3": "decoder.up_blocks.2.resnets.2.norm2",
+        "decoder.upsamples.10.residual.6": "decoder.up_blocks.2.resnets.2.conv2",
+        "decoder.upsamples.11.resample.1": "decoder.up_blocks.2.upsamplers.0.resample.1",
+        "decoder.upsamples.12.residual.0": "decoder.up_blocks.3.resnets.0.norm1",
+        "decoder.upsamples.12.residual.2": "decoder.up_blocks.3.resnets.0.conv1",
+        "decoder.upsamples.12.residual.3": "decoder.up_blocks.3.resnets.0.norm2",
+        "decoder.upsamples.12.residual.6": "decoder.up_blocks.3.resnets.0.conv2",
+        "decoder.upsamples.13.residual.0": "decoder.up_blocks.3.resnets.1.norm1",
+        "decoder.upsamples.13.residual.2": "decoder.up_blocks.3.resnets.1.conv1",
+        "decoder.upsamples.13.residual.3": "decoder.up_blocks.3.resnets.1.norm2",
+        "decoder.upsamples.13.residual.6": "decoder.up_blocks.3.resnets.1.conv2",
+        "decoder.upsamples.14.residual.0": "decoder.up_blocks.3.resnets.2.norm1",
+        "decoder.upsamples.14.residual.2": "decoder.up_blocks.3.resnets.2.conv1",
+        "decoder.upsamples.14.residual.3": "decoder.up_blocks.3.resnets.2.norm2",
+        "decoder.upsamples.14.residual.6": "decoder.up_blocks.3.resnets.2.conv2",
+        "decoder.upsamples.2.residual.0": "decoder.up_blocks.0.resnets.2.norm1",
+        "decoder.upsamples.2.residual.2": "decoder.up_blocks.0.resnets.2.conv1",
+        "decoder.upsamples.2.residual.3": "decoder.up_blocks.0.resnets.2.norm2",
+        "decoder.upsamples.2.residual.6": "decoder.up_blocks.0.resnets.2.conv2",
+        "decoder.upsamples.3.resample.1": "decoder.up_blocks.0.upsamplers.0.resample.1",
+        "decoder.upsamples.3.time_conv": "decoder.up_blocks.0.upsamplers.0.time_conv",
+        "decoder.upsamples.4.residual.0": "decoder.up_blocks.1.resnets.0.norm1",
+        "decoder.upsamples.4.residual.2": "decoder.up_blocks.1.resnets.0.conv1",
+        "decoder.upsamples.4.residual.3": "decoder.up_blocks.1.resnets.0.norm2",
+        "decoder.upsamples.4.residual.6": "decoder.up_blocks.1.resnets.0.conv2",
+        "decoder.upsamples.4.shortcut": "decoder.up_blocks.1.resnets.0.conv_shortcut",
+        "decoder.upsamples.5.residual.0": "decoder.up_blocks.1.resnets.1.norm1",
+        "decoder.upsamples.5.residual.2": "decoder.up_blocks.1.resnets.1.conv1",
+        "decoder.upsamples.5.residual.3": "decoder.up_blocks.1.resnets.1.norm2",
+        "decoder.upsamples.5.residual.6": "decoder.up_blocks.1.resnets.1.conv2",
+        "decoder.upsamples.6.residual.0": "decoder.up_blocks.1.resnets.2.norm1",
+        "decoder.upsamples.6.residual.2": "decoder.up_blocks.1.resnets.2.conv1",
+        "decoder.upsamples.6.residual.3": "decoder.up_blocks.1.resnets.2.norm2",
+        "decoder.upsamples.6.residual.6": "decoder.up_blocks.1.resnets.2.conv2",
+        "decoder.upsamples.7.resample.1": "decoder.up_blocks.1.upsamplers.0.resample.1",
+        "decoder.upsamples.7.time_conv": "decoder.up_blocks.1.upsamplers.0.time_conv",
+        "decoder.upsamples.8.residual.0": "decoder.up_blocks.2.resnets.0.norm1",
+        "decoder.upsamples.8.residual.2": "decoder.up_blocks.2.resnets.0.conv1",
+        "decoder.upsamples.8.residual.3": "decoder.up_blocks.2.resnets.0.norm2",
+        "decoder.upsamples.8.residual.6": "decoder.up_blocks.2.resnets.0.conv2",
+        "decoder.upsamples.9.residual.0": "decoder.up_blocks.2.resnets.1.norm1",
+        "decoder.upsamples.9.residual.2": "decoder.up_blocks.2.resnets.1.conv1",
+        "decoder.upsamples.9.residual.3": "decoder.up_blocks.2.resnets.1.norm2",
+        "decoder.upsamples.9.residual.6": "decoder.up_blocks.2.resnets.1.conv2",
+        "encoder.conv1": "encoder.conv_in",
+        "encoder.downsamples.0.residual.0": "encoder.down_blocks.0.norm1",
+        "encoder.downsamples.0.residual.2": "encoder.down_blocks.0.conv1",
+        "encoder.downsamples.0.residual.3": "encoder.down_blocks.0.norm2",
+        "encoder.downsamples.0.residual.6": "encoder.down_blocks.0.conv2",
+        "encoder.downsamples.1.residual.0": "encoder.down_blocks.1.norm1",
+        "encoder.downsamples.1.residual.2": "encoder.down_blocks.1.conv1",
+        "encoder.downsamples.1.residual.3": "encoder.down_blocks.1.norm2",
+        "encoder.downsamples.1.residual.6": "encoder.down_blocks.1.conv2",
+        "encoder.downsamples.10.residual.0": "encoder.down_blocks.10.norm1",
+        "encoder.downsamples.10.residual.2": "encoder.down_blocks.10.conv1",
+        "encoder.downsamples.10.residual.3": "encoder.down_blocks.10.norm2",
+        "encoder.downsamples.10.residual.6": "encoder.down_blocks.10.conv2",
+        "encoder.downsamples.2.resample.1": "encoder.down_blocks.2.resample.1",
+        "encoder.downsamples.3.residual.0": "encoder.down_blocks.3.norm1",
+        "encoder.downsamples.3.residual.2": "encoder.down_blocks.3.conv1",
+        "encoder.downsamples.3.residual.3": "encoder.down_blocks.3.norm2",
+        "encoder.downsamples.3.residual.6": "encoder.down_blocks.3.conv2",
+        "encoder.downsamples.3.shortcut": "encoder.down_blocks.3.conv_shortcut",
+        "encoder.downsamples.4.residual.0": "encoder.down_blocks.4.norm1",
+        "encoder.downsamples.4.residual.2": "encoder.down_blocks.4.conv1",
+        "encoder.downsamples.4.residual.3": "encoder.down_blocks.4.norm2",
+        "encoder.downsamples.4.residual.6": "encoder.down_blocks.4.conv2",
+        "encoder.downsamples.5.resample.1": "encoder.down_blocks.5.resample.1",
+        "encoder.downsamples.5.time_conv": "encoder.down_blocks.5.time_conv",
+        "encoder.downsamples.6.residual.0": "encoder.down_blocks.6.norm1",
+        "encoder.downsamples.6.residual.2": "encoder.down_blocks.6.conv1",
+        "encoder.downsamples.6.residual.3": "encoder.down_blocks.6.norm2",
+        "encoder.downsamples.6.residual.6": "encoder.down_blocks.6.conv2",
+        "encoder.downsamples.6.shortcut": "encoder.down_blocks.6.conv_shortcut",
+        "encoder.downsamples.7.residual.0": "encoder.down_blocks.7.norm1",
+        "encoder.downsamples.7.residual.2": "encoder.down_blocks.7.conv1",
+        "encoder.downsamples.7.residual.3": "encoder.down_blocks.7.norm2",
+        "encoder.downsamples.7.residual.6": "encoder.down_blocks.7.conv2",
+        "encoder.downsamples.8.resample.1": "encoder.down_blocks.8.resample.1",
+        "encoder.downsamples.8.time_conv": "encoder.down_blocks.8.time_conv",
+        "encoder.downsamples.9.residual.0": "encoder.down_blocks.9.norm1",
+        "encoder.downsamples.9.residual.2": "encoder.down_blocks.9.conv1",
+        "encoder.downsamples.9.residual.3": "encoder.down_blocks.9.norm2",
+        "encoder.downsamples.9.residual.6": "encoder.down_blocks.9.conv2",
+        "encoder.head.0": "encoder.norm_out",
+        "encoder.head.2": "encoder.conv_out",
+        "encoder.middle.0.residual.0": "encoder.mid_block.resnets.0.norm1",
+        "encoder.middle.0.residual.2": "encoder.mid_block.resnets.0.conv1",
+        "encoder.middle.0.residual.3": "encoder.mid_block.resnets.0.norm2",
+        "encoder.middle.0.residual.6": "encoder.mid_block.resnets.0.conv2",
+        "encoder.middle.1.norm": "encoder.mid_block.attentions.0.norm",
+        "encoder.middle.1.proj": "encoder.mid_block.attentions.0.proj",
+        "encoder.middle.1.to_qkv": "encoder.mid_block.attentions.0.to_qkv",
+        "encoder.middle.2.residual.0": "encoder.mid_block.resnets.1.norm1",
+        "encoder.middle.2.residual.2": "encoder.mid_block.resnets.1.conv1",
+        "encoder.middle.2.residual.3": "encoder.mid_block.resnets.1.norm2",
+        "encoder.middle.2.residual.6": "encoder.mid_block.resnets.1.conv2",
+    }
+
+    new_state_dict = {}
+    for key in sd.keys():
+        new_key = key
+        key_without_suffix = key.rsplit(".", 1)[0]
+        if key_without_suffix in key_map:
+            new_key = key.replace(key_without_suffix, key_map[key_without_suffix])
+        new_state_dict[new_key] = sd[key]
+
+    logger.info("Converted ComfyUI AutoencoderKL state dict keys to official format")
+    return new_state_dict
+
+
+def load_vae(
+    vae_path: str, input_channels: int = 3, device: Union[str, torch.device] = "cpu", disable_mmap: bool = False
+) -> AutoencoderKLQwenImage:
     """Load VAE from a given path."""
     VAE_CONFIG_JSON = """
 {
@@ -594,10 +801,15 @@ def load_vae(vae_path: str, device: Union[str, torch.device] = "cpu", disable_mm
         dropout=config["dropout"],
         latents_mean=config["latents_mean"],
         latents_std=config["latents_std"],
+        input_channels=input_channels,
     )
 
     logger.info(f"Loading VAE from {vae_path}")
     state_dict = load_safetensors(vae_path, device=device, disable_mmap=disable_mmap)
+
+    # Convert ComfyUI VAE keys to official VAE keys
+    state_dict = convert_comfyui_state_dict(state_dict)
+
     info = vae.load_state_dict(state_dict, strict=True, assign=True)
     logger.info(f"Loaded VAE: {info}")
 
@@ -605,9 +817,11 @@ def load_vae(vae_path: str, device: Union[str, torch.device] = "cpu", disable_mm
     return vae
 
 
-def unpack_latents(latents, height, width, vae_scale_factor=VAE_SCALE_FACTOR) -> torch.Tensor:
+def unpack_latents(latents, height, width, vae_scale_factor=VAE_SCALE_FACTOR, is_layered: Optional[bool] = None) -> torch.Tensor:
     """
-    Returns (B, C, 1, H, W)
+    Returns layered (B, L, C, H, W) or single frame (B, C, 1, H, W) latents from (B, N, C) packed latents,
+    where L is number of layers, N = (H/2)*(W/2)*L.
+    If is_layered is None, it will automatically determine whether to return layered or single frame latents based on N and H, W.
     """
     batch_size, num_patches, channels = latents.shape
 
@@ -615,12 +829,13 @@ def unpack_latents(latents, height, width, vae_scale_factor=VAE_SCALE_FACTOR) ->
     # latent height and width to be divisible by 2.
     height = 2 * (int(height) // (vae_scale_factor * 2))
     width = 2 * (int(width) // (vae_scale_factor * 2))
+    num_layers = num_patches // ((height // 2) * (width // 2))
 
-    latents = latents.view(batch_size, height // 2, width // 2, channels // 4, 2, 2)
-    latents = latents.permute(0, 3, 1, 4, 2, 5)
-
-    latents = latents.reshape(batch_size, channels // (2 * 2), 1, height, width)
-
+    latents = latents.view(batch_size, num_layers, height // 2, width // 2, channels // 4, 2, 2)
+    latents = latents.permute(0, 1, 4, 2, 5, 3, 6)
+    latents = latents.reshape(batch_size, num_layers, channels // (2 * 2), height, width)
+    if num_layers == 1 and is_layered is not True:
+        latents = latents.permute(0, 2, 1, 3, 4)  # (B, C, 1, H, W)
     return latents
 
 
@@ -636,31 +851,44 @@ def unpack_latents(latents, height, width, vae_scale_factor=VAE_SCALE_FACTOR) ->
 
 def pack_latents(latents: torch.Tensor) -> torch.Tensor:
     """
-    This function handles (B, C, 1, H, W) and (B, C, H, W) latents. So the logic is a bit weird.
+    This function handles layered (B, L, C, H, W), single frame (B, C, 1, H, W) and normal (B, C, H, W) latents. So the logic is a bit weird.
+    If latents have 4 dimensions or the 3rd dimension is 1, it assumes it's single frame or normal latents.
     It packs the latents into a shape of (B, H/2, W/2, C, 2, 2) and then reshapes it to (B, H/2 * W/2, C*4) = (B, Seq, In-Channels)
+    If latents have 5 dimensions and the 3rd dimension is not 1, it assumes it's layered latents.
+    It packs the latents into a shape of (B, L, H/2, W/2, C, 2, 2) and then reshapes it to (B, L * H/2 * W/2, C*4) = (B, Seq, In-Channels)
     """
     batch_size = latents.shape[0]
-    num_channels_latents = latents.shape[1]
-    height = latents.shape[-2]
-    width = latents.shape[-1]
+    if latents.ndim == 4 or latents.shape[2] == 1:
+        # single frame or normal latents
+        num_channels_latents = latents.shape[1]
+        height = latents.shape[-2]
+        width = latents.shape[-1]
 
-    latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
-    latents = latents.permute(0, 2, 4, 1, 3, 5)
-    latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
+        latents = latents.view(batch_size, num_channels_latents, height // 2, 2, width // 2, 2)
+        latents = latents.permute(0, 2, 4, 1, 3, 5)
+        latents = latents.reshape(batch_size, (height // 2) * (width // 2), num_channels_latents * 4)
+    else:
+        # layered latents: if num_layers == 1, it's equivalent to single frame latents
+        num_layers = latents.shape[1]
+        num_channels_latents = latents.shape[2]
+        height = latents.shape[-2]
+        width = latents.shape[-1]
+
+        latents = latents.view(batch_size, num_layers, num_channels_latents, height // 2, 2, width // 2, 2)
+        latents = latents.permute(0, 1, 3, 5, 2, 4, 6)
+        latents = latents.reshape(batch_size, num_layers * (height // 2) * (width // 2), num_channels_latents * 4)
 
     return latents
 
 
-def prepare_latents(batch_size, num_channels_latents, height, width, dtype, device, generator):
+def prepare_latents(batch_size, num_layers, num_channels_latents, height, width, dtype, device, generator):
     # VAE applies 8x compression on images but we must also account for packing which requires
     # latent height and width to be divisible by 2.
     vae_scale_factor = VAE_SCALE_FACTOR
     height = 2 * (int(height) // (vae_scale_factor * 2))
     width = 2 * (int(width) // (vae_scale_factor * 2))
 
-    # kohya-ss: This is original implementations, but it will be better (B, C, 1, H, W). The latents is packed to (B,S,D) though.
-    # shape = (batch_size, 1, num_channels_latents, height, width)
-    shape = (batch_size, num_channels_latents, 1, height, width)
+    shape = (batch_size, num_layers, num_channels_latents, height, width)
 
     if isinstance(generator, list) and len(generator) != batch_size:
         raise ValueError(
@@ -689,7 +917,10 @@ def preprocess_control_image(
         resize_size (Optional[Tuple[int, int]]): Override target size for resizing if resize_to_prefered is False, with (width, height).
 
     Returns:
-        Tuple[torch.Tensor, np.ndarray, Optional[np.ndarray]]: same as `preprocess_image`, but alpha is always None
+        Tuple[torch.Tensor, np.ndarray, Optional[np.ndarray]]: A tuple containing:
+            - control_image_tensor (torch.Tensor): The preprocessed control image tensor for the model. NCHW format.
+            - control_image_np (np.ndarray): The preprocessed control image as a NumPy array for conditioning. HWC format.
+            - None: Placeholder for compatibility (no additional data returned).
     """
     # See:
     # https://github.com/huggingface/diffusers/pull/12188
@@ -710,8 +941,8 @@ def preprocess_control_image(
     else:
         cond_resize_size = resize_size
 
-    control_image_tensor, _, _ = image_utils.preprocess_image(control_image, *resize_size)
-    _, control_image_np, _ = image_utils.preprocess_image(control_image, *cond_resize_size)
+    control_image_tensor, _, _ = image_utils.preprocess_image(control_image, *resize_size, handle_alpha=True)
+    _, control_image_np, _ = image_utils.preprocess_image(control_image, *cond_resize_size, handle_alpha=True)
     return control_image_tensor, control_image_np, None
 
 
@@ -1312,3 +1543,43 @@ def get_scheduler(shift: Optional[float] = None) -> FlowMatchEulerDiscreteSchedu
 
 
 # endregion scheduler
+
+# region model utils
+
+
+def add_model_version_args(parser: argparse.ArgumentParser):
+    parser.add_argument(
+        "--edit", action="store_true", help="Enable Qwen-Image-Edit original, recommend `--model_version edit` instead"
+    )
+    parser.add_argument(
+        "--edit_plus", action="store_true", help="Enable Qwen-Image-Edit-2509 (plus), recommend `--model_version edit-2509` instead"
+    )
+    parser.add_argument(
+        "--model_version",
+        type=str,
+        default=None,
+        help="training for Qwen-Image model version, e.g., 'original', 'layered', 'edit', 'edit-2509', 'edit-2511' etc.",
+    )
+
+
+def resolve_model_version_args(args: argparse.Namespace) -> str:
+    if args.model_version is not None:
+        args.model_version = args.model_version.lower()
+    elif getattr(args, "edit_plus", False):
+        args.model_version = "edit-2509"
+    elif getattr(args, "edit", False):
+        args.model_version = "edit"
+    else:
+        args.model_version = "original"  # Not specified, use original (non-edit) model
+
+    valid_model_versions = {"original", "layered", "edit", "edit-2509", "edit-2511"}
+    if args.model_version not in valid_model_versions:
+        valid_str = "', '".join(sorted(valid_model_versions))
+        raise ValueError(f"Invalid model_version '{args.model_version}'. Valid options are: '{valid_str}'.")
+
+    args.is_edit = args.model_version in {"edit", "edit-2509", "edit-2511"}
+    args.is_layered = args.model_version == "layered"
+    return args.model_version
+
+
+# endregion model utils

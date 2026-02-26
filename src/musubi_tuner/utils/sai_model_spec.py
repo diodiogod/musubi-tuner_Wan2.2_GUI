@@ -9,11 +9,18 @@ import logging
 
 from musubi_tuner.dataset.image_video_dataset import (
     ARCHITECTURE_HUNYUAN_VIDEO,
+    ARCHITECTURE_HUNYUAN_VIDEO_1_5,
+    ARCHITECTURE_QWEN_IMAGE,
     ARCHITECTURE_QWEN_IMAGE_EDIT,
+    ARCHITECTURE_QWEN_IMAGE_LAYERED,
     ARCHITECTURE_WAN,
     ARCHITECTURE_FRAMEPACK,
     ARCHITECTURE_FLUX_KONTEXT,
-    ARCHITECTURE_QWEN_IMAGE,
+    ARCHITECTURE_FLUX_2_DEV,
+    ARCHITECTURE_FLUX_2_KLEIN_4B,
+    ARCHITECTURE_FLUX_2_KLEIN_9B,
+    ARCHITECTURE_KANDINSKY5,
+    ARCHITECTURE_Z_IMAGE,
 )
 
 logger = logging.getLogger(__name__)
@@ -68,10 +75,19 @@ ARCH_WAN = "wan2.1"
 
 ARCH_FRAMEPACK = "framepack"
 ARCH_FLUX_KONTEXT = "Flux.1-dev"
+ARCH_FLUX_2_DEV = "Flux.2-dev"
+ARCH_FLUX_2_KLEIN_4B = "Flux.2-klein-4b"
+ARCH_FLUX_2_KLEIN_9B = "Flux.2-klein-9b"
 ARCH_QWEN_IMAGE = "Qwen-Image"
 ARCH_QWEN_IMAGE_EDIT = "Qwen-Image-Edit"
 ARCH_QWEN_IMAGE_EDIT_PLUS = "Qwen-Image-Edit-Plus"
+ARCH_QWEN_IMAGE_EDIT_2511 = "Qwen-Image-Edit-2511"
 CUSTOM_ARCH_QWEN_IMAGE_EDIT_PLUS = "@@Qwen-Image-Edit-Plus@@"  # special custom architecture name for Qwen-Image-Edit-Plus
+CUSTOM_ARCH_QWEN_IMAGE_EDIT_2511 = "@@Qwen-Image-Edit-2511@@"  # special custom architecture name for Qwen-Image-Edit-2511
+ARCH_QWEN_IMAGE_LAYERED = "Qwen-Image-Layered"
+ARCH_KANDINSKY5 = "Kandinsky-5"
+ARCH_HUNYUAN_VIDEO_1_5 = "hunyuan-video-1.5"
+ARCH_Z_IMAGE = "Z-Image"
 
 ADAPTER_LORA = "lora"
 
@@ -79,8 +95,13 @@ IMPL_HUNYUAN_VIDEO = "https://github.com/Tencent/HunyuanVideo"
 IMPL_WAN = "https://github.com/Wan-Video/Wan2.1"
 IMPL_FRAMEPACK = "https://github.com/lllyasviel/FramePack"
 IMPL_FLUX_KONTEXT = "https://github.com/black-forest-labs/flux"
+IMPL_FLUX_2 = "https://github.com/black-forest-labs/flux2"
 IMPL_QWEN_IMAGE = "https://github.com/QwenLM/Qwen-Image"
 IMPL_QWEN_IMAGE_EDIT = IMPL_QWEN_IMAGE
+IMPL_QWEN_IMAGE_LAYERED = "https://github.com/QwenLM/Qwen-Image-Layered"
+IMPL_KANDINSKY5 = "https://github.com/kandinskylab/kandinsky-5"
+IMPL_HUNYUAN_VIDEO_1_5 = "https://github.com/Tencent-Hunyuan/HunyuanVideo-1.5"
+IMPL_Z_IMAGE = "https://github.com/Tongyi-MAI/Z-Image"
 
 PRED_TYPE_EPSILON = "epsilon"
 # PRED_TYPE_V = "v"
@@ -151,6 +172,18 @@ def build_metadata(
     elif architecture == ARCHITECTURE_FLUX_KONTEXT:
         arch = ARCH_FLUX_KONTEXT
         impl = IMPL_FLUX_KONTEXT
+    elif (
+        architecture == ARCHITECTURE_FLUX_2_DEV
+        or architecture == ARCHITECTURE_FLUX_2_KLEIN_4B
+        or architecture == ARCHITECTURE_FLUX_2_KLEIN_9B
+    ):
+        if architecture == ARCHITECTURE_FLUX_2_DEV:
+            arch = ARCH_FLUX_2_DEV
+        elif architecture == ARCHITECTURE_FLUX_2_KLEIN_4B:
+            arch = ARCH_FLUX_2_KLEIN_4B
+        elif architecture == ARCHITECTURE_FLUX_2_KLEIN_9B:
+            arch = ARCH_FLUX_2_KLEIN_9B
+        impl = IMPL_FLUX_2
     elif architecture == ARCHITECTURE_QWEN_IMAGE:
         arch = ARCH_QWEN_IMAGE
         impl = IMPL_QWEN_IMAGE
@@ -163,8 +196,23 @@ def build_metadata(
         elif custom_arch == CUSTOM_ARCH_QWEN_IMAGE_EDIT_PLUS:
             arch = ARCH_QWEN_IMAGE_EDIT_PLUS
             custom_arch = None  # clear custom_arch to avoid override later
+        elif custom_arch == CUSTOM_ARCH_QWEN_IMAGE_EDIT_2511:
+            arch = ARCH_QWEN_IMAGE_EDIT_2511
+            custom_arch = None  # clear custom_arch to avoid override later
         else:
             arch = ARCH_QWEN_IMAGE_EDIT  # override with custom_arch later
+    elif architecture == ARCHITECTURE_QWEN_IMAGE_LAYERED:
+        arch = ARCH_QWEN_IMAGE_LAYERED
+        impl = IMPL_QWEN_IMAGE_LAYERED
+    elif architecture == ARCHITECTURE_KANDINSKY5:
+        arch = ARCH_KANDINSKY5
+        impl = IMPL_KANDINSKY5
+    elif architecture == ARCHITECTURE_HUNYUAN_VIDEO_1_5:
+        arch = ARCH_HUNYUAN_VIDEO_1_5
+        impl = IMPL_HUNYUAN_VIDEO_1_5
+    elif architecture == ARCHITECTURE_Z_IMAGE:
+        arch = ARCH_Z_IMAGE
+        impl = IMPL_Z_IMAGE
     else:
         raise ValueError(f"Unknown architecture: {architecture}")
 
@@ -223,10 +271,12 @@ def build_metadata(
             reso = (reso[0], reso[0])
     else:
         # resolution is defined in dataset, so use default here
-        # Use 1328x1328 for Qwen-Image models, 1024x1024 for Qwen-Image-Edit models, and 1280x720 for others (this is just a placeholder, actual resolution may vary)
+        # Use 1328x1328 for Qwen-Image, 1024x1024 for Qwen-Image-Edit and Z-Image, or 1280x720 for others (this is just a placeholder, actual resolution may vary)
         if architecture == ARCHITECTURE_QWEN_IMAGE:
             reso = (1328, 1328)
         elif architecture == ARCHITECTURE_QWEN_IMAGE_EDIT:
+            reso = (1024, 1024)
+        elif architecture == ARCHITECTURE_Z_IMAGE:
             reso = (1024, 1024)
         else:
             reso = (1280, 720)

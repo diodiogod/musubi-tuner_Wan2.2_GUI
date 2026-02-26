@@ -17,7 +17,7 @@ from musubi_tuner import qwen_image_train_network
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.modules.scheduling_flow_match_discrete import FlowMatchDiscreteScheduler
-from musubi_tuner.qwen_image import qwen_image_model
+from musubi_tuner.qwen_image import qwen_image_model, qwen_image_utils
 from musubi_tuner.hv_train_network import (
     SS_METADATA_KEY_BASE_MODEL_VERSION,
     SS_METADATA_MINIMUM_KEYS,
@@ -67,6 +67,7 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
                 dit_path,
                 attn_mode,
                 split_attn,
+                args.model_version == "edit-2511",
                 loading_device,
                 dit_weight_dtype,
                 args.fp8_scaled,
@@ -90,7 +91,15 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
             logger.info(f"Block index map: {block_index_map}")
 
         # create model
-        model = qwen_image_model.create_model(attn_mode, split_attn, dit_weight_dtype, num_layers=total_num_blocks)
+        model = qwen_image_model.create_model(
+            attn_mode,
+            split_attn,
+            args.model_version == "edit-2511",
+            args.is_layered,
+            args.is_layered,
+            dit_weight_dtype,
+            num_layers=total_num_blocks,
+        )
 
         # load weights from disk
         logger.info(f"Loading weights from {dit_path}")
@@ -116,6 +125,13 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
 
                     state_dict[state_dict_key] = f.get_tensor(key, device=loading_device, dtype=dit_weight_dtype)
             synchronize_device(loading_device)
+
+        # Add after line 121 (after synchronize_device)
+        if "__index_timestep_zero__" in state_dict:  # ComfyUI flag for edit-2511
+            assert args.model_version == "edit-2511", (
+                "Found __index_timestep_zero__ in state_dict, the model must be '2511' variant. Use --model_version edit-2511"
+            )
+            state_dict.pop("__index_timestep_zero__")
 
         info = model.load_state_dict(state_dict, strict=True, assign=True)
         logger.info(f"Loaded DiT model from {dit_path}, info={info}")
@@ -519,7 +535,21 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
 
             metadata_to_save.update(sai_metadata)
 
-            state_dict = unwrapped_model.state_dict()
+            # temporarily remove self-referencing _orig_mod to avoid infinite recursion in state_dict()
+            has_self_ref_orig_mod_module = (
+                hasattr(unwrapped_model, "_modules")
+                and "_orig_mod" in unwrapped_model._modules
+                and unwrapped_model._modules["_orig_mod"] is unwrapped_model
+            )
+            if has_self_ref_orig_mod_module:
+                del unwrapped_model._modules["_orig_mod"]
+
+            try:
+                state_dict = unwrapped_model.state_dict()
+            finally:
+                # restore _orig_mod after state_dict() if it was removed
+                if has_self_ref_orig_mod_module:
+                    unwrapped_model._modules["_orig_mod"] = unwrapped_model
 
             # if model is compiled, get original model state dict
             if "transformer_blocks.0._orig_mod.attn.add_k_proj.bias" in state_dict:
@@ -552,7 +582,11 @@ class QwenImageTrainer(QwenImageNetworkTrainer):
         # training loop
 
         # log device and dtype for each model
-        logger.info(f"DiT dtype: {transformer.dtype}, device: {transformer.device}")
+        unwrapped_transformer = accelerator.unwrap_model(transformer)
+        first_param = next(iter(unwrapped_transformer.parameters()), None)
+        logger.info(
+            f"DiT dtype: {first_param.dtype if first_param is not None else None}, device: {first_param.device if first_param is not None else accelerator.device}"
+        )
 
         clean_memory_on_device(accelerator.device)
 
@@ -752,6 +786,8 @@ def main():
         logger.warning("FP8 training is not supported for fine-tuning. Set --fp8-base or --fp8-scaled to False.")
         args.fp8_base = False
         args.fp8_scaled = False
+
+    qwen_image_utils.resolve_model_version_args(args)
 
     trainer = QwenImageTrainer()
     trainer.train(args)

@@ -18,6 +18,7 @@ import inspect
 import numbers
 from typing import Any, Dict, List, Optional, Tuple, Union
 import math
+from math import prod
 
 # import numpy as np
 import torch
@@ -33,7 +34,7 @@ from musubi_tuner.hunyuan_model.attention import attention as hunyuan_attention
 import logging
 
 from musubi_tuner.utils.lora_utils import load_safetensors_with_lora_and_fp8
-from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper, to_cpu, to_device
+from musubi_tuner.utils.model_utils import create_cpu_offloading_wrapper
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -249,17 +250,26 @@ class Timesteps(nn.Module):
 
 
 class QwenTimestepProjEmbeddings(nn.Module):
-    def __init__(self, embedding_dim):
+    def __init__(self, embedding_dim, use_additional_t_cond=False):
         super().__init__()
 
         self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0, scale=1000)
         self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
+        self.use_additional_t_cond = use_additional_t_cond
+        if use_additional_t_cond:
+            self.addition_t_embedding = nn.Embedding(2, embedding_dim)
 
-    def forward(self, timestep, hidden_states):
+    def forward(self, timestep, hidden_states, addition_t_cond=None):
         timesteps_proj = self.time_proj(timestep)
         timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=hidden_states.dtype))  # (N, D)
-
         conditioning = timesteps_emb
+
+        if self.use_additional_t_cond:
+            if addition_t_cond is None:
+                raise ValueError("When additional_t_cond is True, addition_t_cond must be provided.")
+            addition_t_emb = self.addition_t_embedding(addition_t_cond)
+            addition_t_emb = addition_t_emb.to(dtype=hidden_states.dtype)
+            conditioning = conditioning + addition_t_emb
 
         return conditioning
 
@@ -346,6 +356,74 @@ class QwenEmbedRope(nn.Module):
         freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
 
         freqs_frame = freqs_pos[0][idx : idx + frame].view(frame, 1, 1, -1).expand(frame, height, width, -1)
+        if self.scale_rope:
+            freqs_height = torch.cat([freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]], dim=0)
+            freqs_height = freqs_height.view(1, height, 1, -1).expand(frame, height, width, -1)
+            freqs_width = torch.cat([freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]], dim=0)
+            freqs_width = freqs_width.view(1, 1, width, -1).expand(frame, height, width, -1)
+        else:
+            freqs_height = freqs_pos[1][:height].view(1, height, 1, -1).expand(frame, height, width, -1)
+            freqs_width = freqs_pos[2][:width].view(1, 1, width, -1).expand(frame, height, width, -1)
+
+        freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
+        return freqs.clone().contiguous()
+
+
+class QwenEmbedLayer3DRope(QwenEmbedRope):
+    def __init__(self, theta: int, axes_dim: List[int], scale_rope=False):
+        super().__init__(theta, axes_dim, scale_rope)
+
+    def forward(self, video_fhw, txt_seq_lens, device):
+        """
+        Args: video_fhw: [frame, height, width] a list of 3 integers representing the shape of the video Args:
+        txt_length: [bs] a list of 1 integers representing the length of the text
+        """
+        if self.pos_freqs.device != device:
+            self.pos_freqs = self.pos_freqs.to(device)
+            self.neg_freqs = self.neg_freqs.to(device)
+
+        if isinstance(video_fhw, list):
+            video_fhw = video_fhw[0]
+        if not isinstance(video_fhw, list):
+            video_fhw = [video_fhw]
+
+        vid_freqs = []
+        max_vid_index = 0
+        layer_num = len(video_fhw) - 1
+        for idx, fhw in enumerate(video_fhw):
+            frame, height, width = fhw
+            is_cond = idx == layer_num
+            rope_key = f"{is_cond}_{idx}_{height}_{width}"
+            if rope_key not in self.rope_cache:
+                if not is_cond:
+                    video_freq = self._compute_video_freqs(frame, height, width, idx)
+                else:
+                    ### For the condition image, we set the layer index to -1
+                    video_freq = self._compute_condition_freqs(frame, height, width)
+                self.rope_cache[rope_key] = video_freq
+            video_freq = self.rope_cache[rope_key]
+            video_freq = video_freq.to(device)
+            vid_freqs.append(video_freq)
+
+            if self.scale_rope:
+                max_vid_index = max(height // 2, width // 2, max_vid_index)
+            else:
+                max_vid_index = max(height, width, max_vid_index)
+
+        max_vid_index = max(max_vid_index, layer_num)
+        max_len = max(txt_seq_lens)
+        txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
+        vid_freqs = torch.cat(vid_freqs, dim=0)
+
+        return vid_freqs, txt_freqs
+
+    # @functools.lru_cache(maxsize=None)
+    def _compute_condition_freqs(self, frame, height, width):
+        seq_lens = frame * height * width
+        freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+        freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+
+        freqs_frame = freqs_neg[0][-1:].view(frame, 1, 1, -1).expand(frame, height, width, -1)
         if self.scale_rope:
             freqs_height = torch.cat([freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]], dim=0)
             freqs_height = freqs_height.view(1, height, 1, -1).expand(frame, height, width, -1)
@@ -550,6 +628,7 @@ class FeedForward(nn.Module):
             hidden_states = module(hidden_states)
         return hidden_states
 
+
 # torch.inductor does not support code generation for complex
 # This breaks fullgraph=True
 @torch.compiler.disable
@@ -736,11 +815,13 @@ class Attention(nn.Module):
                 attention_mask = torch.cat(
                     [
                         torch.ones(
-                            (encoder_hidden_states_mask.shape[0], seq_img), device=encoder_hidden_states_mask.device, dtype=torch.bool
+                            (encoder_hidden_states_mask.shape[0], seq_img),
+                            device=encoder_hidden_states_mask.device,
+                            dtype=torch.bool,
                         ),
-                        encoder_hidden_states_mask.to(torch.bool)
-                    ]
-                    , dim=1
+                        encoder_hidden_states_mask.to(torch.bool),
+                    ],
+                    dim=1,
                 )  # [B, S_img + S_txt]
                 attention_mask = attention_mask[:, None, None, :]  # [B, 1, 1, S] for scaled_dot_product_attention
             else:
@@ -812,6 +893,7 @@ class QwenImageTransformerBlock(nn.Module):
         eps: float = 1e-6,
         attn_mode: str = "torch",
         split_attn: bool = False,
+        zero_cond_t: bool = False,
     ):
         super().__init__()
 
@@ -855,10 +937,40 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.txt_mlp = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
-    def _modulate(self, x, mod_params):
+        self.zero_cond_t = zero_cond_t
+
+    def _modulate(self, x, mod_params, timestep_zero_index: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply modulation to input tensor"""
+        # x: [b, l, d], shift/scale/gate: [b, d] (or [2*b, d] when `zero_cond_t=True`)
         shift, scale, gate = mod_params.chunk(3, dim=-1)
-        return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1), gate.unsqueeze(1)
+
+        if timestep_zero_index is not None:
+            actual_batch = shift.size(0) // 2
+            shift_base, shift_ext = shift[:actual_batch], shift[actual_batch:]
+            scale_base, scale_ext = scale[:actual_batch], scale[actual_batch:]
+            gate_base, gate_ext = gate[:actual_batch], gate[actual_batch:]
+
+            shift_base = shift_base.unsqueeze(1)
+            shift_ext = shift_ext.unsqueeze(1)
+            scale_base = scale_base.unsqueeze(1)
+            scale_ext = scale_ext.unsqueeze(1)
+            gate_base = gate_base.unsqueeze(1)
+            gate_ext = gate_ext.unsqueeze(1)
+
+            return torch.cat(
+                [
+                    x[:, :timestep_zero_index] * (1 + scale_base) + shift_base,
+                    x[:, timestep_zero_index:] * (1 + scale_ext) + shift_ext,
+                ],
+                dim=1,
+            ), torch.cat(
+                [gate_base.expand(-1, timestep_zero_index, -1), gate_ext.expand(-1, x.size(1) - timestep_zero_index, -1)], dim=1
+            )
+        else:
+            shift_result = shift.unsqueeze(1)
+            scale_result = scale.unsqueeze(1)
+            gate_result = gate.unsqueeze(1)
+            return x * (1 + scale_result) + shift_result, gate_result
 
     def forward(
         self,
@@ -869,9 +981,12 @@ class QwenImageTransformerBlock(nn.Module):
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         txt_seq_lens: Optional[torch.Tensor] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        timestep_zero_index: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
         img_mod_params = self.img_mod(temb)  # [B, 6*dim]
+        if self.zero_cond_t:
+            temb = torch.chunk(temb, 2, dim=0)[0]
         txt_mod_params = self.txt_mod(temb)  # [B, 6*dim]
 
         # Split modulation parameters for norm1 and norm2
@@ -882,7 +997,7 @@ class QwenImageTransformerBlock(nn.Module):
 
         # Process image stream - norm1 + modulation
         img_normed = self.img_norm1(hidden_states)
-        img_modulated, img_gate1 = self._modulate(img_normed, img_mod1)
+        img_modulated, img_gate1 = self._modulate(img_normed, img_mod1, timestep_zero_index)
         del img_normed, img_mod1
 
         # Process text stream - norm1 + modulation
@@ -919,7 +1034,7 @@ class QwenImageTransformerBlock(nn.Module):
 
         # Process image stream - norm2 + MLP
         img_normed2 = self.img_norm2(hidden_states)
-        img_modulated2, img_gate2 = self._modulate(img_normed2, img_mod2)
+        img_modulated2, img_gate2 = self._modulate(img_normed2, img_mod2, timestep_zero_index)
         del img_normed2, img_mod2
         img_mlp_output = self.img_mlp(img_modulated2)
         del img_modulated2
@@ -968,6 +1083,12 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
             Whether to use guidance embeddings for guidance-distilled variant of the model.
         axes_dims_rope (`Tuple[int]`, defaults to `(16, 56, 56)`):
             The dimensions to use for the rotary positional embeddings.
+        attn_mode (`str`, defaults to `"torch"`):
+            The attention implementation to use.
+        split_attn (`bool`, defaults to `False`):
+            Whether to split the attention computation to save memory.
+        zero_cond_t (`bool`, defaults to `False`):
+            Whether to use zero conditioning for time embeddings.
     """
 
     # _supports_gradient_checkpointing = True
@@ -988,6 +1109,9 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
         axes_dims_rope: Tuple[int, int, int] = (16, 56, 56),
         attn_mode: str = "torch",
         split_attn: bool = False,
+        zero_cond_t: bool = False,
+        use_additional_t_cond: bool = False,
+        use_layer3d_rope: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -996,9 +1120,12 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
         self.attn_mode = attn_mode
         self.split_attn = split_attn
 
-        self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
+        if not use_layer3d_rope:
+            self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
+        else:
+            self.pos_embed = QwenEmbedLayer3DRope(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
 
-        self.time_text_embed = QwenTimestepProjEmbeddings(embedding_dim=self.inner_dim)
+        self.time_text_embed = QwenTimestepProjEmbeddings(embedding_dim=self.inner_dim, use_additional_t_cond=use_additional_t_cond)
 
         self.txt_norm = RMSNorm(joint_attention_dim, eps=1e-6)
 
@@ -1013,6 +1140,7 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
                     attention_head_dim=attention_head_dim,
                     attn_mode=attn_mode,
                     split_attn=split_attn,
+                    zero_cond_t=zero_cond_t,
                 )
                 for _ in range(num_layers)
             ]
@@ -1022,6 +1150,7 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
 
         self.gradient_checkpointing = False
+        self.zero_cond_t = zero_cond_t
         self.activation_cpu_offloading = False
 
         # offloading
@@ -1046,16 +1175,24 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
         self.activation_cpu_offloading = False
         print("QwenModel: Gradient checkpointing disabled.")
 
-    def enable_block_swap(self, blocks_to_swap: int, device: torch.device, supports_backward: bool, use_pinned_memory: bool = False):
+    def enable_block_swap(
+        self, blocks_to_swap: int, device: torch.device, supports_backward: bool, use_pinned_memory: bool = False
+    ):
         self.blocks_to_swap = blocks_to_swap
         self.num_blocks = len(self.transformer_blocks)
 
-        assert (
-            self.blocks_to_swap <= self.num_blocks - 1
-        ), f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
+        assert self.blocks_to_swap <= self.num_blocks - 1, (
+            f"Cannot swap more than {self.num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
+        )
 
         self.offloader = ModelOffloader(
-            "qwen-image-block", self.transformer_blocks, self.num_blocks, self.blocks_to_swap, supports_backward, device, use_pinned_memory
+            "qwen-image-block",
+            self.transformer_blocks,
+            self.num_blocks,
+            self.blocks_to_swap,
+            supports_backward,
+            device,
+            use_pinned_memory,
         )
         # , debug=True
         print(
@@ -1066,13 +1203,13 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
         if self.blocks_to_swap:
             self.offloader.set_forward_only(True)
             self.prepare_block_swap_before_forward()
-            print(f"QwenModel: Block swap set to forward only.")
+            print("QwenModel: Block swap set to forward only.")
 
     def switch_block_swap_for_training(self):
         if self.blocks_to_swap:
             self.offloader.set_forward_only(False)
             self.prepare_block_swap_before_forward()
-            print(f"QwenModel: Block swap set to forward and backward.")
+            print("QwenModel: Block swap set to forward and backward.")
 
     def move_to_device_except_swap_blocks(self, device: torch.device):
         # assume model is on cpu. do not move blocks to device to reduce temporary memory usage
@@ -1105,6 +1242,7 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
         txt_seq_lens: Optional[List[int]] = None,
         guidance: torch.Tensor = None,  # TODO: this should probably be removed
         attention_kwargs: Optional[Dict[str, Any]] = None,
+        additional_t_cond=None,
     ) -> torch.Tensor:
         """
         The [`QwenTransformer2DModel`] forward method.
@@ -1150,17 +1288,34 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
         hidden_states = self.img_in(hidden_states)
 
         timestep = timestep.to(hidden_states.dtype)
+
+        if self.zero_cond_t:
+            if img_shapes is None:
+                raise ValueError("`img_shapes` must be provided when `zero_cond_t=True`.")
+
+            timestep = torch.cat([timestep, timestep * 0], dim=0)
+
+            sample = img_shapes[0]  # img_shapes always has single entry for musubi tuner
+            if isinstance(sample, (tuple, list)) and len(sample) == 3 and all(isinstance(x, numbers.Integral) for x in sample):
+                base_len = int(prod(sample))
+            else:
+                if not (isinstance(sample, (tuple, list)) and len(sample) >= 1):
+                    raise ValueError("Invalid `img_shapes` entry for `zero_cond_t=True`.")
+                base = sample[0]
+                if not (isinstance(base, (tuple, list)) and len(base) == 3):
+                    raise ValueError("Invalid `img_shapes` entry for `zero_cond_t=True`.")
+                base_len = int(prod(base))
+            timestep_zero_index = base_len
+        else:
+            timestep_zero_index = None
+
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
         if guidance is not None:
             guidance = guidance.to(hidden_states.dtype) * 1000
 
-        temb = (
-            self.time_text_embed(timestep, hidden_states)
-            if guidance is None
-            else self.time_text_embed(timestep, guidance, hidden_states)
-        )
+        temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
         image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
 
@@ -1181,6 +1336,8 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
                     temb,
                     image_rotary_emb,
                     txt_seq_lens,
+                    attention_kwargs,
+                    timestep_zero_index,
                 )
 
             else:
@@ -1192,6 +1349,7 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
                     image_rotary_emb=image_rotary_emb,
                     txt_seq_lens=txt_seq_lens,
                     joint_attention_kwargs=attention_kwargs,
+                    timestep_zero_index=timestep_zero_index,
                 )
 
             if self.blocks_to_swap:
@@ -1199,6 +1357,9 @@ class QwenImageTransformer2DModel(nn.Module):  # ModelMixin, ConfigMixin, PeftAd
 
         if input_device != hidden_states.device:
             hidden_states = hidden_states.to(input_device)
+
+        if self.zero_cond_t:
+            temb = temb.chunk(2, dim=0)[0]
 
         # Use only the image part (hidden_states) from the dual-stream blocks
         hidden_states = self.norm_out(hidden_states, temb)
@@ -1222,10 +1383,18 @@ FP8_OPTIMIZATION_EXCLUDE_KEYS = [
 
 
 def create_model(
-    attn_mode: str, split_attn: bool, dtype: Optional[torch.dtype], num_layers: Optional[int] = 60
+    attn_mode: str,
+    split_attn: bool,
+    zero_cond_t: bool,
+    use_additional_t_cond: bool,
+    use_layer3d_rope: bool,
+    dtype: Optional[torch.dtype],
+    num_layers: Optional[int] = 60,
 ) -> QwenImageTransformer2DModel:
     with init_empty_weights():
-        logger.info(f"Creating QwenImageTransformer2DModel")
+        logger.info(
+            f"Creating QwenImageTransformer2DModel. Attn mode: {attn_mode}, split_attn: {split_attn}, zero_cond_t: {zero_cond_t}, num_layers: {num_layers} "
+        )
         """
         {
             "_class_name": "QwenImageTransformer2DModel",
@@ -1260,6 +1429,9 @@ def create_model(
             axes_dims_rope=(16, 56, 56),
             attn_mode=attn_mode,
             split_attn=split_attn,
+            zero_cond_t=zero_cond_t,
+            use_additional_t_cond=use_additional_t_cond,
+            use_layer3d_rope=use_layer3d_rope,
         )
         if dtype is not None:
             model.to(dtype)
@@ -1271,6 +1443,9 @@ def load_qwen_image_model(
     dit_path: str,
     attn_mode: str,
     split_attn: bool,
+    zero_cond_t: bool,
+    use_additional_t_cond: bool,
+    use_layer3d_rope: bool,
     loading_device: Union[str, torch.device],
     dit_weight_dtype: Optional[torch.dtype],
     fp8_scaled: bool = False,
@@ -1280,13 +1455,16 @@ def load_qwen_image_model(
     disable_numpy_memmap: bool = False,
 ) -> QwenImageTransformer2DModel:
     """
-    Load a WAN model from the specified checkpoint.
+    Load a Qwen-Image model from the specified checkpoint.
 
     Args:
         device (Union[str, torch.device]): Device for optimization or merging
         dit_path (str): Path to the DiT model checkpoint.
         attn_mode (str): Attention mode to use, e.g., "torch", "flash", etc.
         split_attn (bool): Whether to use split attention.
+        zero_cond_t (bool): Whether the model uses zero conditioning for time embeddings.
+        use_additional_t_cond (bool): Whether to use additional time conditioning (for layered model).
+        use_layer3d_rope (bool): Whether to use 3D RoPE (for layered model).
         loading_device (Union[str, torch.device]): Device to load the model weights on.
         dit_weight_dtype (Optional[torch.dtype]): Data type of the DiT weights.
             If None, it will be loaded as is (same as the state_dict) or scaled for fp8. if not None, model weights will be casted to this dtype.
@@ -1302,7 +1480,9 @@ def load_qwen_image_model(
     device = torch.device(device)
     loading_device = torch.device(loading_device)
 
-    model = create_model(attn_mode, split_attn, dit_weight_dtype, num_layers=num_layers)
+    model = create_model(
+        attn_mode, split_attn, zero_cond_t, use_additional_t_cond, use_layer3d_rope, dit_weight_dtype, num_layers=num_layers
+    )
 
     # load model weights with dynamic fp8 optimization and LoRA merging if needed
     logger.info(f"Loading DiT model from {dit_path}, device={loading_device}")
@@ -1319,10 +1499,14 @@ def load_qwen_image_model(
         disable_numpy_memmap=disable_numpy_memmap,
     )
 
-    # remove "model.diffusion_model." prefix: 1.3B model has this prefix
+    # remove "model.diffusion_model."
     for key in list(sd.keys()):
         if key.startswith("model.diffusion_model."):
             sd[key[22:]] = sd.pop(key)
+
+    if "__index_timestep_zero__" in sd:  # ComfyUI flag for edit-2511
+        assert zero_cond_t, "Found __index_timestep_zero__ in state_dict, the model must be '2511' variant."
+        sd.pop("__index_timestep_zero__")
 
     if fp8_scaled:
         apply_fp8_monkey_patch(model, sd, use_scaled_mm=False)

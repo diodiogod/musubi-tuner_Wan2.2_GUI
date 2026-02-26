@@ -34,6 +34,7 @@ from diffusers.optimization import (
 )
 from transformers.optimization import SchedulerType, TYPE_TO_SCHEDULER_FUNCTION
 
+from musubi_tuner import convert_lora
 from musubi_tuner.dataset import config_utils
 from musubi_tuner.hunyuan_model.models import load_transformer, get_rotary_pos_embed_by_shape, HYVideoDiffusionTransformer
 import musubi_tuner.hunyuan_model.text_encoder as text_encoder_module
@@ -376,6 +377,8 @@ class NetworkTrainer:
         self.blocks_to_swap = None
         self.timestep_range_pool = []
         self.num_timestep_buckets: Optional[int] = None  # for get_bucketed_timestep()
+        self.vae_frame_stride = 4  # all architectures require frames to be divisible by 4, except Qwen-Image-Layered
+        self.default_discrete_flow_shift = 14.5  # default value for discrete flow shift for all models TODO may be None is better
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
@@ -403,12 +406,12 @@ class NetworkTrainer:
             if lr_descriptions is not None:
                 lr_desc = lr_descriptions[i]
             else:
-                idx = i - (0 if network_train_unet_only else -1)
+                idx = i - (0 if network_train_unet_only else 1)
                 if idx == -1:
                     lr_desc = "textencoder"
                 else:
                     if len(lrs) > 2:
-                        lr_desc = f"group{idx}"
+                        lr_desc = f"group{i}"
                     else:
                         lr_desc = "unet"
 
@@ -419,26 +422,12 @@ class NetworkTrainer:
                 logs[f"lr/d*lr/{lr_desc}"] = (
                     lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
                 )
-            if (
-                args.optimizer_type.lower().endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None
-            ):  # tracking d*lr value of unet.
-                logs["lr/d*lr"] = optimizer.param_groups[0]["d"] * optimizer.param_groups[0]["lr"]
-        else:
-            idx = 0
-            if not network_train_unet_only:
-                logs["lr/textencoder"] = float(lrs[0])
-                idx = 1
 
-            for i in range(idx, len(lrs)):
-                logs[f"lr/group{i}"] = float(lrs[i])
-                if args.optimizer_type.lower().startswith("DAdapt".lower()) or args.optimizer_type.lower().endswith(
-                    "Prodigy".lower()
-                ):
-                    logs[f"lr/d*lr/group{i}"] = (
-                        lr_scheduler.optimizers[-1].param_groups[i]["d"] * lr_scheduler.optimizers[-1].param_groups[i]["lr"]
-                    )
-                if args.optimizer_type.lower().endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None:
-                    logs[f"lr/d*lr/group{i}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["lr"]
+            if args.optimizer_type.lower().endswith("ProdigyPlusScheduleFree".lower()) and optimizer is not None:
+                # tracking d*lr value of unet.
+                logs[f"lr/d*lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["lr"]
+                if "effective_lr" in optimizer.param_groups[i]:
+                    logs[f"lr/d*eff_lr/{lr_desc}"] = optimizer.param_groups[i]["d"] * optimizer.param_groups[i]["effective_lr"]
 
         return logs
 
@@ -834,6 +823,7 @@ class NetworkTrainer:
             or args.timestep_sampling == "logsnr"
             or args.timestep_sampling == "qinglong_flux"
             or args.timestep_sampling == "qinglong_qwen"
+            or args.timestep_sampling == "flux2_shift"
         ):
 
             def compute_sampling_timesteps(org_timesteps: Optional[torch.Tensor]) -> torch.Tensor:
@@ -869,6 +859,8 @@ class NetworkTrainer:
                         # we are pre-packed so must adjust for packed size
                         if args.timestep_sampling == "flux_shift":
                             mu = train_utils.get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
+                        elif args.timestep_sampling == "flux2_shift":
+                            mu = train_utils.get_lin_function(y1=0.5, y2=1.15)(h * w)
                         elif args.timestep_sampling == "qwen_shift":
                             mu = train_utils.get_lin_function(x1=256, y1=0.5, x2=8192, y2=0.9)((h // 2) * (w // 2))
                         # def time_shift(mu: float, sigma: float, t: torch.Tensor):
@@ -1148,7 +1140,7 @@ class NetworkTrainer:
         height = sample_parameter.get("height", 256)
         frame_count = sample_parameter.get("frame_count", 1)
         guidance_scale = sample_parameter.get("guidance_scale", self.default_guidance_scale)
-        discrete_flow_shift = sample_parameter.get("discrete_flow_shift", 14.5)
+        discrete_flow_shift = sample_parameter.get("discrete_flow_shift", self.default_discrete_flow_shift)
         seed = sample_parameter.get("seed")
         prompt: str = sample_parameter.get("prompt", "")
         cfg_scale = sample_parameter.get("cfg_scale", None)  # None for architecture default
@@ -1158,7 +1150,8 @@ class NetworkTrainer:
         width = (width // 8) * 8
         height = (height // 8) * 8
 
-        frame_count = (frame_count - 1) // 4 * 4 + 1  # 1, 5, 9, 13, ... For HunyuanVideo and Wan2.1
+        # 1, 5, 9, 13, ... For HunyuanVideo and Wan2.1
+        frame_count = (frame_count - 1) // self.vae_frame_stride * self.vae_frame_stride + 1
 
         if self.i2v_training:
             image_path = sample_parameter.get("image_path", None)
@@ -1211,6 +1204,13 @@ class NetworkTrainer:
             logger.info(f"control video path: {control_video_path}")
 
         # inference: architecture dependent
+        # Check if transformer has self-referencing _orig_mod (compiled model hack)
+        # If so, skip eval/train to avoid infinite recursion
+        has_self_ref_orig_mod = getattr(transformer, "_orig_mod", None) is transformer
+        was_train = transformer.training if not has_self_ref_orig_mod else True
+        if not has_self_ref_orig_mod:
+            transformer.eval()
+
         video = self.do_inference(
             accelerator,
             args,
@@ -1230,6 +1230,9 @@ class NetworkTrainer:
             image_path=image_path,
             control_video_path=control_video_path,
         )
+
+        if not has_self_ref_orig_mod:
+            transformer.train(was_train)
 
         # Save video
         if video is None:
@@ -1255,7 +1258,8 @@ class NetworkTrainer:
             wandb = None
 
         if video.shape[2] == 1:
-            image_paths = save_images_grid(video, save_dir, save_path, create_subdir=False)
+            # In Qwen-Image-Layered, video is (N, C, 1, H, W) where N=Layers, otherwise (1, C, 1, H, W)
+            image_paths = save_images_grid(video, save_dir, save_path, n_rows=video.shape[0], create_subdir=False)
             if wandb_tracker is not None and wandb is not None:
                 for image_path in image_paths:
                     wandb_tracker.log({f"sample_{prompt_idx}": wandb.Image(image_path)}, step=steps)
@@ -1297,6 +1301,16 @@ class NetworkTrainer:
     @property
     def control_training(self) -> bool:
         return self._control_training
+
+    def convert_weight_keys(self, weights_sd: dict[str, torch.Tensor], network_module: lora_module):
+        keys = list(weights_sd.keys())
+        if keys[0].startswith("lora_"):
+            return weights_sd  # default format
+        if keys[0].startswith("diffusion_model.") or keys[0].startswith("transformer."):
+            # Diffusers? format
+            logger.info("converting LoRA weights from diffusers format to default format")
+            return convert_lora.convert_from_diffusers("lora_unet_", weights_sd)
+        return weights_sd  # unknown format, return as is
 
     def process_sample_prompts(
         self,
@@ -1778,6 +1792,7 @@ class NetworkTrainer:
                 accelerator.print(f"merging module: {weight_path} with multiplier {multiplier}")
 
                 weights_sd = load_file(weight_path)
+                weights_sd = self.convert_weight_keys(weights_sd, args.network_module)
                 module = network_module.create_arch_network_from_weights(
                     multiplier, weights_sd, unet=transformer, for_inference=True
                 )
@@ -2146,7 +2161,11 @@ class NetworkTrainer:
         # training loop
 
         # log device and dtype for each model
-        logger.info(f"DiT dtype: {transformer.dtype}, device: {transformer.device}")
+        unwrapped_transformer = accelerator.unwrap_model(transformer)
+        first_param = next(iter(unwrapped_transformer.parameters()), None)
+        logger.info(
+            f"DiT dtype: {first_param.dtype if first_param is not None else None}, device: {first_param.device if first_param is not None else accelerator.device}"
+        )
 
         clean_memory_on_device(accelerator.device)
 
@@ -2680,8 +2699,8 @@ def setup_parser_common() -> argparse.ArgumentParser:
     parser.add_argument(
         "--disable_numpy_memmap",
         action="store_true",
-        help="Disable numpy memory mapping for model loading. Only for Wan, FramePack and Qwen-Image. Increases RAM usage but speeds up model loading in some cases."
-        " / モデル読み込み時のnumpyメモリマッピングを無効にします。Wan、FramePack、Qwen-Imageで有効です。RAM使用量が増えますが、場合によってはモデルの読み込みが高速化されます。",
+        help="Disable numpy memory mapping for model loading. Only for Wan, FramePack, Qwen-Image and FLUX.2. Increases RAM usage but speeds up model loading in some cases."
+        " / モデル読み込み時のnumpyメモリマッピングを無効にします。Wan、FramePack、Qwen-Image、FLUX.2で有効です。RAM使用量が増えますが、場合によってはモデルの読み込みが高速化されます。",
     )
 
     # parser.add_argument("--flow_shift", type=float, default=7.0, help="Shift factor for flow matching schedulers")
@@ -2690,7 +2709,18 @@ def setup_parser_common() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--timestep_sampling",
-        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "qwen_shift", "logsnr", "qinglong_flux", "qinglong_qwen"],
+        choices=[
+            "sigma",
+            "uniform",
+            "sigmoid",
+            "shift",
+            "flux_shift",
+            "flux2_shift",
+            "qwen_shift",
+            "logsnr",
+            "qinglong_flux",
+            "qinglong_qwen",
+        ],
         default="sigma",
         help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid and flux shift."
         " / タイムステップをサンプリングする方法：sigma、random uniform、random normalのsigmoid、sigmoidのシフト、flux shift。",
@@ -2988,7 +3018,7 @@ def setup_parser_common() -> argparse.ArgumentParser:
 
     parser.add_argument("--dit", type=str, help="DiT checkpoint path / DiTのチェックポイントのパス")
     parser.add_argument("--vae", type=str, help="VAE checkpoint path / VAEのチェックポイントのパス")
-    parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default is float16")
+    parser.add_argument("--vae_dtype", type=str, default=None, help="data type for VAE, default depends on model")
 
     return parser
 

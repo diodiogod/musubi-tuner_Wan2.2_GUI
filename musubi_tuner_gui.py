@@ -215,11 +215,17 @@ class MusubiTunerGUI:
         self._add_widget(basic_frame, "seed", "Seed:", "A number to ensure reproducible training results. Any integer will do.", validate_num=True)
         
         network_container = ttk.Frame(frame); network_container.pack(fill="x", padx=10, pady=10)
-        self.hidden_frames['low_noise_lora_params'] = ttk.LabelFrame(network_container, text="Low Noise LoRA Parameters")
-        self._add_widget(self.hidden_frames['low_noise_lora_params'], "network_dim_low", "Network Dimension (Rank):", "The 'size' or capacity of the LoRA. Higher values can capture more detail but may overfit. Common values: 32, 64, 128.", is_required=True, validate_num=True)
-        self._add_widget(self.hidden_frames['low_noise_lora_params'], "network_alpha_low", "Network Alpha:", "Acts as a learning rate scaler for the LoRA weights. Often set to half of the Network Dimension.", is_required=True, validate_num=True)
+        network_type_frame = ttk.LabelFrame(network_container, text="Network Type"); network_type_frame.pack(fill="x", pady=(0, 5))
+        self._add_widget(network_type_frame, "network_type", "Network Type:", "LoRA: standard, efficient. LoHa: uses Hadamard product, often better quality — use lower ranks (4-32). LoKr: uses Kronecker product, more expressive.", kind='combobox', options=["LoRA", "LoHa", "LoKr"], command=self.update_button_states)
 
-        self.hidden_frames['high_noise_lora_params'] = ttk.LabelFrame(network_container, text="High Noise LoRA Parameters")
+        self.hidden_frames['lokr_factor'] = ttk.Frame(network_container)
+        self._add_widget(self.hidden_frames['lokr_factor'], "lokr_factor", "LoKr Factor:", "Controls how LoKr splits weight dimensions via Kronecker factorization. -1 = auto (recommended). Positive values force a specific factor (e.g., 4, 8).", validate_num=False)
+
+        self.hidden_frames['low_noise_lora_params'] = ttk.LabelFrame(network_container, text="Low Noise Network Parameters")
+        self._add_widget(self.hidden_frames['low_noise_lora_params'], "network_dim_low", "Network Dimension (Rank):", "Controls network capacity. LoRA: 32-128 typical. LoHa: use lower values (4-32) — the Hadamard product squares expressiveness so smaller ranks go further. LoKr: similar range to LoRA.", is_required=True, validate_num=True)
+        self._add_widget(self.hidden_frames['low_noise_lora_params'], "network_alpha_low", "Network Alpha:", "Scaling factor for network weights. Often set to half of Network Dimension, or equal to it for LoHa/LoKr.", is_required=True, validate_num=True)
+
+        self.hidden_frames['high_noise_lora_params'] = ttk.LabelFrame(network_container, text="High Noise Network Parameters")
         self._add_widget(self.hidden_frames['high_noise_lora_params'], "network_dim_high", "Network Dimension (Rank):", "Leave blank to use the same as the Low Noise model. If different, a separate training run will be executed.", is_required=False, validate_num=True)
         self._add_widget(self.hidden_frames['high_noise_lora_params'], "network_alpha_high", "Network Alpha:", "Leave blank to use the same as the Low Noise model.", is_required=False, validate_num=True)
 
@@ -446,6 +452,11 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
         show_low = self.entries["train_low_noise"].var.get(); show_high = self.entries["train_high_noise"].var.get()
         is_i2v = self.entries["is_i2v"].var.get()
 
+        net_type = self.entries.get("network_type", None)
+        is_lokr = net_type and net_type.get() == "LoKr"
+        if is_lokr: self.hidden_frames['lokr_factor'].pack(fill='x', pady=(0, 3))
+        else: self.hidden_frames['lokr_factor'].pack_forget()
+
         if show_low: self.hidden_frames['low_noise_lora_params'].pack(fill='x', expand=True, pady=(0, 5))
         else: self.hidden_frames['low_noise_lora_params'].pack_forget()
         if show_high: self.hidden_frames['high_noise_lora_params'].pack(fill='x', expand=True, pady=(0, 5))
@@ -511,7 +522,7 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             "vae_model": "", "clip_model": "", "t5_model": "",
             "output_dir": "", "output_name": "my-lora",
             "learning_rate": "2e-4", "max_train_epochs": "10", "save_every_n_epochs": "1", "save_every_n_steps": "", "seed": "42",
-            "network_dim_low": "32", "network_alpha_low": "16", "network_dim_high": "", "network_alpha_high": "",
+            "network_type": "LoRA", "lokr_factor": "", "network_dim_low": "32", "network_alpha_low": "16", "network_dim_high": "", "network_alpha_high": "",
             "optimizer_type": "adamw8bit", "max_grad_norm": "1.0", "optimizer_args": "", "lr_scheduler": "cosine",
             "lr_warmup_steps": "0", "lr_scheduler_num_cycles": "1",
             "mixed_precision": "fp16", "gradient_accumulation_steps": "1",
@@ -771,7 +782,13 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
 
             dim = settings.get("network_dim_high") if is_high_noise_run and settings.get("network_dim_high") else settings.get("network_dim_low")
             alpha = settings.get("network_alpha_high") if is_high_noise_run and settings.get("network_alpha_high") else settings.get("network_alpha_low")
-            add_arg(command, "--network_module", "networks.lora_wan"); add_arg(command, "--network_dim", dim); add_arg(command, "--network_alpha", alpha)
+            _net_type_map = {"LoHa": "networks.loha", "LoKr": "networks.lokr"}
+            _network_type = settings.get("network_type", "LoRA")
+            _network_module = _net_type_map.get(_network_type, "networks.lora_wan")
+            add_arg(command, "--network_module", _network_module); add_arg(command, "--network_dim", dim); add_arg(command, "--network_alpha", alpha)
+            if _network_type == "LoKr":
+                _factor = (settings.get("lokr_factor") or "").strip()
+                if _factor and _factor != "-1": add_arg(command, "--network_args", f"factor={_factor}")
             
             attention = settings.get("attention_mechanism");
             if attention and attention != "none": command.append(f"--{attention}")
