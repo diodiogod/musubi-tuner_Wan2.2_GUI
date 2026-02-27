@@ -1249,7 +1249,6 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
 
     def start_training(self):
         self.update_button_states(); settings = self.get_settings()
-        settings["sample_prompts"] = self._build_sample_prompts_txt()
         if not self._check_logging_dependencies(settings.get("log_with")): return
         if self.start_btn['state'] == 'disabled':
             messagebox.showerror("Validation Error", "Please fill all required fields before training."); return
@@ -1290,6 +1289,7 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
 
     def build_training_commands(self):
         settings = self.get_settings()
+        settings["sample_prompts"] = self._build_sample_prompts_txt()
         mode = settings.get("training_mode", "Wan 2.2")
         if mode == "Wan 2.2":
             return wan_backend.build_commands(settings)
