@@ -599,10 +599,9 @@ class MusubiTunerGUI:
         e_prompt.focus_set()
 
     def _build_sample_prompts_txt(self):
-        """Serialise self._sample_prompts_data to a temp .txt file, return path or ''."""
+        """Serialise self._sample_prompts_data to a .txt file next to the output dir, return path or ''."""
         if not self._sample_prompts_data:
             return ""
-        import tempfile
         lines = []
         for p in self._sample_prompts_data:
             line = p.get("prompt", "")
@@ -617,11 +616,22 @@ class MusubiTunerGUI:
             if p.get("neg"):        line += f" --n {p['neg']}"
             if p.get("image_path"): line += f" --i {p['image_path']}"
             lines.append(line)
-        tf = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
-        tf.write("\n".join(lines))
-        tf.close()
-        self._temp_prompts_file = tf.name
-        return tf.name
+        # Save next to output_dir so it's inspectable and avoids temp dir issues
+        output_dir = self.entries["output_dir"].get().strip()
+        output_name = self.entries["output_name"].get().strip() or "training"
+        if output_dir and os.path.isdir(output_dir):
+            save_path = os.path.join(output_dir, f"{output_name}_sample_prompts.txt")
+        else:
+            import tempfile
+            save_path = os.path.join(tempfile.gettempdir(), f"{output_name}_sample_prompts.txt")
+        try:
+            with open(save_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            self._temp_prompts_file = save_path
+            return save_path
+        except Exception as e:
+            print(f"[ERROR] Could not write sample prompts file: {e}")
+            return ""
 
     def _open_output_folder(self):
         output_dir = self.entries["output_dir"].get()
@@ -1231,6 +1241,10 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
         if not self._check_logging_dependencies(settings.get("log_with")): return
         if self.start_btn['state'] == 'disabled':
             messagebox.showerror("Validation Error", "Please fill all required fields before training."); return
+        # Warn if sample frequency is set but no prompts were added
+        wants_samples = (settings.get("sample_every_n_epochs") or settings.get("sample_every_n_steps") or settings.get("sample_at_first"))
+        if wants_samples and not self._sample_prompts_data:
+            messagebox.showwarning("No Sample Prompts", "You set a sample frequency but have no prompts in the Samples tab.\nNo samples will be generated.\n\nGo to the Samples tab and click '+ Add Prompt' to add at least one prompt.")
         
         self.loss_data.clear(); self.current_step = 0
         self.update_loss_graph(); self.start_vram_monitor(); self._start_sample_watcher()
