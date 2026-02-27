@@ -334,7 +334,7 @@ class MusubiTunerGUI:
             "  use_schedulefree=True\n"
             "  use_speed=True      (optional, may improve convergence)\n"
             "  betas=(0.9,0.99)    (or (0.95,0.99) for more stability)\n\n"
-            "Example: weight_decay=0.01, d_coef=1.0, use_stableadamw=True, use_speed=True\n\n"
+            "Example: weight_decay=0.01, d_coef=1.0, use_stableadamw=True, use_speed=True, betas=(0.9,0.99)\n\n"
             "Note: do NOT put spaces around '=' signs."
         ), kind='entry')
         

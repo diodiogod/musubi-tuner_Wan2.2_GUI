@@ -67,9 +67,9 @@ def build_common_train_args(cmd, settings):
     add_arg(cmd, "--preserve_distribution_shape", settings.get("preserve_distribution_shape"))
     opt_args = (settings.get("optimizer_args") or "").strip()
     if opt_args:
-        # Normalize separators: comma, semicolon, or whitespace → split into tokens
+        # Split on comma/semicolon/whitespace but NOT inside parentheses (e.g. betas=(0.9,0.99))
         import re as _re
-        tokens = [t.strip() for t in _re.split(r'[,;\s]+', opt_args) if t.strip()]
+        tokens = [t.strip() for t in _re.split(r'[,;\s]+(?![^(]*\))', opt_args) if t.strip()]
         for token in tokens:
             cmd.extend(["--optimizer_args", token])
 
