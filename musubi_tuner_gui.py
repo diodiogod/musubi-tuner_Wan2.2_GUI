@@ -626,21 +626,18 @@ class MusubiTunerGUI:
             if p.get("neg"):        line += f" --n {p['neg']}"
             if p.get("image_path"): line += f" --i {p['image_path']}"
             lines.append(line)
-        # Save next to output_dir so it's inspectable and avoids temp dir issues
-        output_dir = self.entries["output_dir"].get().strip()
+        # Save to a fixed path in the project root (always writable, no spaces issue)
         output_name = self.entries["output_name"].get().strip() or "training"
-        if output_dir and os.path.isdir(output_dir):
-            save_path = os.path.join(output_dir, f"{output_name}_sample_prompts.txt")
-        else:
-            import tempfile
-            save_path = os.path.join(tempfile.gettempdir(), f"{output_name}_sample_prompts.txt")
+        project_root = os.getcwd()
+        save_path = os.path.join(project_root, f"{output_name}_sample_prompts.txt")
         try:
             with open(save_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
             self._temp_prompts_file = save_path
+            print(f"[Samples] Wrote prompts file: {save_path}")
             return save_path
         except Exception as e:
-            print(f"[ERROR] Could not write sample prompts file: {e}")
+            messagebox.showerror("Sample Prompts Error", f"Could not write sample prompts file:\n{save_path}\n\n{e}")
             return ""
 
     def _open_output_folder(self):
