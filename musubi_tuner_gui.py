@@ -331,10 +331,9 @@ class MusubiTunerGUI:
             "  weight_decay=0.01\n"
             "  d_coef=1.0          (tuning knob 0.1-2.0; lower=slower, higher=aggressive)\n"
             "  use_stableadamw=True\n"
-            "  use_schedulefree=True\n"
-            "  use_speed=True      (optional, may improve convergence)\n"
-            "  betas=(0.9,0.99)    (or (0.95,0.99) for more stability)\n\n"
-            "Example: weight_decay=0.01, d_coef=1.0, use_stableadamw=True, use_speed=True, betas=(0.9,0.99)\n\n"
+            "  use_speed=True\n"
+            "  betas=(0.95,0.99)   (optional, default is (0.9,0.99); more stable)\n\n"
+            "Example: weight_decay=0.01, d_coef=1.0, use_stableadamw=True, use_speed=True\n\n"
             "Note: do NOT put spaces around '=' signs."
         ), kind='entry')
         
