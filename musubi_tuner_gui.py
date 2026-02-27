@@ -626,10 +626,15 @@ class MusubiTunerGUI:
             if p.get("neg"):        line += f" --n {p['neg']}"
             if p.get("image_path"): line += f" --i {p['image_path']}"
             lines.append(line)
-        # Save to a fixed path in the project root (always writable, no spaces issue)
+        # Save next to the dataset config (always outside the repo, always exists)
         output_name = self.entries["output_name"].get().strip() or "training"
-        project_root = os.getcwd()
-        save_path = os.path.join(project_root, f"{output_name}_sample_prompts.txt")
+        dataset_config = self.entries["dataset_config"].get().strip()
+        if dataset_config and os.path.isfile(dataset_config):
+            base_dir = os.path.dirname(dataset_config)
+        else:
+            import tempfile
+            base_dir = tempfile.gettempdir()
+        save_path = os.path.join(base_dir, f"{output_name}_sample_prompts.txt")
         try:
             with open(save_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines))
