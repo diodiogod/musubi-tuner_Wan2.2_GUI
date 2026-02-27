@@ -47,8 +47,13 @@ def build_sample_args(cmd, settings):
     if not sample_prompts:
         return
     add_arg(cmd, "--sample_prompts", sample_prompts, is_path=True)
-    add_arg(cmd, "--sample_every_n_epochs", settings.get("sample_every_n_epochs"))
-    add_arg(cmd, "--sample_every_n_steps", settings.get("sample_every_n_steps"))
+    # Only pass if > 0 — passing 0 causes ZeroDivisionError in the trainer (epoch % 0)
+    n_epochs = str(settings.get("sample_every_n_epochs") or "").strip()
+    if n_epochs and n_epochs != "0":
+        add_arg(cmd, "--sample_every_n_epochs", n_epochs)
+    n_steps = str(settings.get("sample_every_n_steps") or "").strip()
+    if n_steps and n_steps != "0":
+        add_arg(cmd, "--sample_every_n_steps", n_steps)
     if settings.get("sample_at_first"):
         cmd.append("--sample_at_first")
 
