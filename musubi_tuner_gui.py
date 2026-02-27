@@ -325,7 +325,18 @@ class MusubiTunerGUI:
         _opt_var.trace_add("write", _opt_var_trace)
         # --- ADDED --- max_grad_norm widget
         self._add_widget(optimizer_frame, "max_grad_norm", "Max Grad Norm:", "Clips the gradient norm to prevent gradients from exploding, which can stabilize training. '1.0' is a good default. '0' disables it.", validate_num=True)
-        self._add_widget(optimizer_frame, "optimizer_args", "Optimizer Args:", "Additional arguments for the optimizer, e.g., 'weight_decay=0.1'. Can be left blank.", kind='entry')
+        self._add_widget(optimizer_frame, "optimizer_args", "Optimizer Args:", (
+            "Additional arguments for the optimizer. Separate multiple args with space, comma, or semicolon.\n\n"
+            "ProdigyPlusScheduleFree recommended args:\n"
+            "  weight_decay=0.01\n"
+            "  d_coef=1.0          (tuning knob 0.1-2.0; lower=slower, higher=aggressive)\n"
+            "  use_stableadamw=True\n"
+            "  use_schedulefree=True\n"
+            "  use_speed=True      (optional, may improve convergence)\n"
+            "  betas=(0.9,0.99)    (or (0.95,0.99) for more stability)\n\n"
+            "Example: weight_decay=0.01, d_coef=1.0, use_stableadamw=True, use_speed=True\n\n"
+            "Note: do NOT put spaces around '=' signs."
+        ), kind='entry')
         
         lr_frame = ttk.LabelFrame(frame, text="Learning Rate Scheduler"); lr_frame.pack(fill="x", padx=10, pady=10)
         self._add_widget(lr_frame, "lr_scheduler", "LR Scheduler:", "Algorithm to adjust learning rate during training. 'cosine' is a reliable choice.", kind='combobox', options=["constant", "linear", "cosine", "cosine_with_restarts", "polynomial", "constant_with_warmup"], command=self.update_button_states)
