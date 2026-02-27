@@ -65,7 +65,13 @@ def build_common_train_args(cmd, settings):
     add_arg(cmd, "--num_timestep_buckets", settings.get("num_timestep_buckets"))
     add_arg(cmd, "--discrete_flow_shift", settings.get("discrete_flow_shift"))
     add_arg(cmd, "--preserve_distribution_shape", settings.get("preserve_distribution_shape"))
-    add_arg(cmd, "--optimizer_args", settings.get("optimizer_args"))
+    opt_args = (settings.get("optimizer_args") or "").strip()
+    if opt_args:
+        # Normalize separators: comma, semicolon, or whitespace → split into tokens
+        import re as _re
+        tokens = [t.strip() for t in _re.split(r'[,;\s]+', opt_args) if t.strip()]
+        for token in tokens:
+            cmd.extend(["--optimizer_args", token])
 
     lr = settings.get("lr_scheduler")
     if lr and lr != "constant":
