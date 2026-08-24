@@ -1283,24 +1283,36 @@ const DATASET_HELP = {
 const datasetValueText=value=>Array.isArray(value)?value.join(", "):(value??"");
 const datasetBasename=value=>String(value||"").replaceAll("\\","/").split("/").filter(Boolean).pop()||"Untitled source";
 const formatBytes=value=>{const n=Number(value||0);if(n<1024)return `${n} B`;if(n<1024**2)return `${(n/1024).toFixed(1)} KB`;if(n<1024**3)return `${(n/1024**2).toFixed(1)} MB`;return `${(n/1024**3).toFixed(1)} GB`};
-const DATASET_AUDIT_CACHE_KEY="musubi-dataset-audit-v1",DATASET_AUDIT_CACHE_TTL=7*24*60*60*1000;
-function datasetAuditCacheId(path,text){
-  const normalized=String(path||"").replaceAll("\\","/").trim().toLowerCase();let hash=2166136261;
-  for(const character of String(text||"")){hash^=character.charCodeAt(0);hash=Math.imul(hash,16777619)}
-  return `${normalized}|${hash>>>0}`;
+const DATASET_AUDIT_CACHE_KEY="musubi-dataset-audit-v2",DATASET_AUDIT_CACHE_TTL=30*24*60*60*1000;
+function datasetAuditCacheId(path,fingerprint){
+  return `${String(path||"").replaceAll("\\","/").trim().toLowerCase()}|${String(fingerprint||"")}`;
 }
-function readDatasetAuditCache(path,text){
+function readDatasetAuditCache(path,fingerprint){
   try{
-    const entries=JSON.parse(localStorage.getItem(DATASET_AUDIT_CACHE_KEY)||"{}"),entry=entries[datasetAuditCacheId(path,text)];
+    const entries=JSON.parse(localStorage.getItem(DATASET_AUDIT_CACHE_KEY)||"{}"),entry=entries[datasetAuditCacheId(path,fingerprint)];
     return entry&&Date.now()-Number(entry.saved_at||0)<=DATASET_AUDIT_CACHE_TTL&&entry.payload?.datasets?entry.payload:null;
   }catch(_){return null}
 }
-function writeDatasetAuditCache(path,text,payload){
+function writeDatasetAuditCache(path,fingerprint,payload){
   try{
-    const entries=JSON.parse(localStorage.getItem(DATASET_AUDIT_CACHE_KEY)||"{}"),id=datasetAuditCacheId(path,text);entries[id]={saved_at:Date.now(),payload};
-    const kept=Object.entries(entries).sort((a,b)=>Number(b[1]?.saved_at||0)-Number(a[1]?.saved_at||0)).slice(0,8);
+    const entries=JSON.parse(localStorage.getItem(DATASET_AUDIT_CACHE_KEY)||"{}"),id=datasetAuditCacheId(path,fingerprint);entries[id]={saved_at:Date.now(),payload};
+    const kept=Object.entries(entries).sort((a,b)=>Number(b[1]?.saved_at||0)-Number(a[1]?.saved_at||0)).slice(0,16);
     localStorage.setItem(DATASET_AUDIT_CACHE_KEY,JSON.stringify(Object.fromEntries(kept)));
   }catch(_){}
+}
+async function primeDatasetAudit(path,text,{force=false,focus=false}={}){
+  const signature=await api("/api/dataset/fingerprint",{method:"POST",body:JSON.stringify({text,path})});
+  if(!state.dataset||!sameLocalPath(state.dataset.path||path,path)||state.dataset.text!==text)return false;
+  const fingerprint=signature.fingerprint||"";
+  if(!force){
+    const cached=readDatasetAuditCache(path,fingerprint);
+    if(cached){applyDatasetAudit(cached,{focus,announce:focus?"Dataset counts restored from cache.":""});return true}
+  }
+  const payload=await api("/api/dataset/inspect",{method:"POST",body:JSON.stringify({text,path})});
+  if(!state.dataset||!sameLocalPath(state.dataset.path||path,path)||state.dataset.text!==text)return false;
+  writeDatasetAuditCache(path,fingerprint,payload);
+  applyDatasetAudit(payload,{focus,announce:focus?"Full dataset audit complete.":""});
+  return true;
 }
 
 async function loadDatasetDocument({quiet = false} = {}) {
@@ -1329,8 +1341,7 @@ async function loadDatasetDocument({quiet = false} = {}) {
       state.selectedDataset=payload.datasets.length?0:-1;state.datasetTab=payload.datasets.length?"media":"settings";
       const linkedPath=payload.path||path,recipeChanged=!sameLocalPath(state.settings.dataset_config,linkedPath);
       renderDataset(payload,state.selectedDataset);
-      const cachedAudit=readDatasetAuditCache(linkedPath,payload.text||"");
-      if(cachedAudit)applyDatasetAudit(cachedAudit,{focus:false});
+      primeDatasetAudit(linkedPath,payload.text||"",{focus:false}).catch(error=>console.warn("Dataset audit cache could not be prepared:",error));
       state.settings.dataset_config=linkedPath;
       setDatasetDirty(false);
       sync(recipeChanged);
@@ -1794,11 +1805,50 @@ async function loadH3Ref(){const result=await api("/api/h3/ref2va/load",{method:
 async function saveH3Ref(){const button=$("#h3-save-ref"),path=$("#h3-ref-path").value.trim();await withBusy(button,"Validating…",async()=>{const result=await api("/api/h3/ref2va/save",{method:"POST",body:JSON.stringify({path,records:state.h3RefRecords})});state.settings.minimax_h3_multimodal_task="ref2va";sync();const dataset=state.dataset?.datasets?.[state.selectedDataset];if(dataset?.kind==="video"){state.datasetTab="settings";renderDataset(state.dataset,state.selectedDataset);const mode=$("#dataset-editor [data-key=\"_source_mode\"]"),source=$("#dataset-editor [data-key=\"_source_path\"]");if(mode&&source){mode.value="jsonl";source.value=result.path;markDatasetFormChanged()}}toast(`Saved and validated ${result.count} Ref2VA record(s).`)})}
 async function inspectDataset(){
   await flushDatasetDraft();
-  const path=$("#dataset-path").value,text=$("#dataset-source").value,cached=readDatasetAuditCache(path,text);
-  if(cached){applyDatasetAudit(cached,{focus:true,announce:"Loaded the cached dataset audit. Run full audit to refresh it."});return}
-  const payload=await api("/api/dataset/inspect",{method:"POST",body:JSON.stringify({text,path})});
-  writeDatasetAuditCache(path,text,payload);
-  applyDatasetAudit(payload,{focus:true,announce:"Full dataset audit complete."});
+  const path=$("#dataset-path").value,text=$("#dataset-source").value;
+  await primeDatasetAudit(path,text,{force:true,focus:true});
+}
+const datasetInspectorView={zoom:1,fitScale:1,x:0,y:0,observer:null};
+function bindDatasetInspectorViewport(){
+  const host=$("#dataset-inspector-media"),media=host?.querySelector("img,video");if(!host||!media)return;
+  datasetInspectorView.observer?.disconnect();
+  const dimensions=()=>media instanceof HTMLVideoElement?[media.videoWidth,media.videoHeight]:[media.naturalWidth,media.naturalHeight];
+  const apply=()=>{
+    const [width,height]=dimensions();if(!width||!height)return;
+    media.style.width=`${width}px`;media.style.height=`${height}px`;
+    media.style.transform=`translate(${datasetInspectorView.x}px, ${datasetInspectorView.y}px) scale(${datasetInspectorView.fitScale*datasetInspectorView.zoom})`;
+    host.classList.toggle("zoomed",datasetInspectorView.zoom>1);
+  };
+  const reset=()=>{
+    const [width,height]=dimensions(),rect=host.getBoundingClientRect();if(!width||!height||!rect.width||!rect.height)return;
+    datasetInspectorView.zoom=1;datasetInspectorView.fitScale=Math.min(rect.width/width,rect.height/height);
+    datasetInspectorView.x=(rect.width-width*datasetInspectorView.fitScale)/2;
+    datasetInspectorView.y=(rect.height-height*datasetInspectorView.fitScale)/2;apply();
+  };
+  const ready=media instanceof HTMLVideoElement?"loadedmetadata":"load";
+  if(dimensions().every(Boolean))reset();else media.addEventListener(ready,reset,{once:true});
+  datasetInspectorView.observer=new ResizeObserver(()=>{if(datasetInspectorView.zoom===1)reset()});
+  datasetInspectorView.observer.observe(host);
+  host.addEventListener("wheel",event=>{
+    event.preventDefault();
+    const rect=host.getBoundingClientRect(),px=event.clientX-rect.left,py=event.clientY-rect.top;
+    const previous=datasetInspectorView.zoom,next=Math.max(1,Math.min(8,previous*(event.deltaY<0?1.16:1/1.16)));
+    if(next===previous)return;
+    const ratio=next/previous;
+    if(next===1){reset();return}
+    datasetInspectorView.x=px-(px-datasetInspectorView.x)*ratio;
+    datasetInspectorView.y=py-(py-datasetInspectorView.y)*ratio;
+    datasetInspectorView.zoom=next;apply();
+  },{passive:false});
+  host.addEventListener("dblclick",event=>{event.preventDefault();reset()});
+  host.addEventListener("pointerdown",event=>{
+    if(event.button!==0||datasetInspectorView.zoom<=1)return;
+    event.preventDefault();host.setPointerCapture(event.pointerId);host.classList.add("dragging");
+    const startX=event.clientX,startY=event.clientY,originX=datasetInspectorView.x,originY=datasetInspectorView.y;
+    const move=moveEvent=>{datasetInspectorView.x=originX+moveEvent.clientX-startX;datasetInspectorView.y=originY+moveEvent.clientY-startY;apply()};
+    const finish=()=>{host.classList.remove("dragging");host.removeEventListener("pointermove",move);host.removeEventListener("pointerup",finish);host.removeEventListener("pointercancel",finish)};
+    host.addEventListener("pointermove",move);host.addEventListener("pointerup",finish);host.addEventListener("pointercancel",finish);
+  });
 }
 function openDatasetMedia(index){
   if(state.datasetCaptionDirty&&!confirm("Discard the unsaved caption changes?"))return;
@@ -1810,6 +1860,7 @@ function renderDatasetMediaInspector(){
   const url=`/api/dataset/media-file?token=${encodeURIComponent(item.token)}`;
   $("#dataset-inspector-media").innerHTML=!item.token?`<div class="media-placeholder large"><span>!</span><p>This file is missing or cannot be previewed.</p></div>`:item.preview_kind==="video"?`<video src="${url}" controls preload="metadata" tabindex="0"></video>`:`<img src="${url}" alt="${esc(item.name)}">`;
   bindHoverVideoControls($("#dataset-inspector-media video"));
+  bindDatasetInspectorViewport();
   $("#dataset-inspector-kicker").textContent=`${item.kind.toUpperCase()} · ${item.role==="target"?"LAYER TARGET":"TRAINING ITEM"}`;
   $("#dataset-inspector-name").textContent=item.name;
   $("#dataset-inspector-meta").textContent=[item.width&&item.height?`${item.width}×${item.height}`:"",item.duration_seconds?`${Number(item.duration_seconds).toFixed(2)} seconds`:"",item.audio_state&&item.audio_state!=="not_applicable"?`audio: ${item.audio_state}`:"",formatBytes(item.bytes),item.relative_path].filter(Boolean).join(" · ");

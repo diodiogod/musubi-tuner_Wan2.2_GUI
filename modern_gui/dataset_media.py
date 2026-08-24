@@ -768,6 +768,58 @@ def dataset_source_location(text: str, index: int) -> Path:
     return target
 
 
+def dataset_source_fingerprint(text: str) -> str:
+    """Return a cheap signature for the active dataset sources.
+
+    This intentionally reads directory metadata rather than decoding media.
+    It catches added, removed, renamed, or edited media/caption/control files,
+    allowing the browser to reuse a previous expensive audit safely.
+    """
+
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace"))
+    plain = plain_document(parse_document(text))
+    datasets = plain.get("datasets", [])
+
+    def add_path(path: Path, root: Path) -> None:
+        try:
+            stat = path.stat()
+            relative = path.relative_to(root).as_posix()
+            digest.update(f"{relative}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode("utf-8", errors="replace"))
+        except (OSError, ValueError):
+            digest.update(f"missing:{path}\n".encode("utf-8", errors="replace"))
+
+    for index, _dataset in enumerate(datasets if isinstance(datasets, list) else []):
+        try:
+            spec = _source_spec(text, index)
+        except Exception as exc:
+            digest.update(f"source-error:{index}:{exc}\n".encode("utf-8", errors="replace"))
+            continue
+        source: Path = spec["path"]
+        digest.update(f"source:{index}:{spec['mode']}:{source}\n".encode("utf-8", errors="replace"))
+        if spec["mode"] == "jsonl":
+            add_path(source, source.parent)
+            continue
+        if not source.is_dir():
+            digest.update(f"missing-directory:{source}\n".encode("utf-8", errors="replace"))
+            continue
+        try:
+            for path in sorted((item for item in source.rglob("*") if item.is_file()), key=lambda item: item.as_posix().casefold()):
+                add_path(path, source)
+        except OSError as exc:
+            digest.update(f"scan-error:{source}:{exc}\n".encode("utf-8", errors="replace"))
+        control_value = str(spec["dataset"].get("control_directory") or "").strip()
+        if control_value:
+            control_root = resolve_configured_path(control_value)
+            digest.update(f"controls:{control_root}\n".encode("utf-8", errors="replace"))
+            if control_root.is_dir():
+                try:
+                    for path in sorted((item for item in control_root.rglob("*") if item.is_file()), key=lambda item: item.as_posix().casefold()):
+                        add_path(path, control_root)
+                except OSError as exc:
+                    digest.update(f"control-scan-error:{control_root}:{exc}\n".encode("utf-8", errors="replace"))
+    return digest.hexdigest()
+
+
 def audit_dataset_sources(text: str, source_path: str = "") -> dict[str, Any]:
     del source_path
     plain = plain_document(parse_document(text))

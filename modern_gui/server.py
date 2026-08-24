@@ -37,6 +37,7 @@ from modern_gui.dataset_documents import (
 from modern_gui.dataset_media import (
     CaptionConflictError,
     MediaTokenError,
+    dataset_source_fingerprint,
     dataset_source_location,
     list_dataset_media,
     resolve_media_token,
@@ -447,6 +448,8 @@ class MusubiWebHandler(BaseHTTPRequestHandler):
                 )
             if self.path == "/api/dataset/inspect":
                 return self._json(inspect_dataset_sources(body.get("text", ""), body.get("path", "")))
+            if self.path == "/api/dataset/fingerprint":
+                return self._json({"fingerprint": dataset_source_fingerprint(body.get("text", ""))})
             if self.path == "/api/h3/pairing/inspect":
                 inspection = inspect_pairing_sources(body.get("image_directory", ""), body.get("audio_directory", ""))
                 inspection["plan"] = pairing_plan(

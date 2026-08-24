@@ -16,6 +16,7 @@ from modern_gui.dataset_documents import (
 from modern_gui.dataset_media import (
     CaptionConflictError,
     MediaTokenError,
+    dataset_source_fingerprint,
     dataset_source_location,
     list_dataset_media,
     resolve_media_token,
@@ -38,6 +39,23 @@ resolution = 512
 num_repeats = {repeats}
 future_key = "preserve"
 """
+
+
+def test_dataset_source_fingerprint_is_stable_until_source_files_change(tmp_path):
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    _image(image_dir / "one.png")
+    source = _directory_toml(image_dir)
+
+    initial = dataset_source_fingerprint(source)
+    assert dataset_source_fingerprint(source) == initial
+
+    (image_dir / "one.txt").write_text("caption", encoding="utf-8")
+    with_caption = dataset_source_fingerprint(source)
+    assert with_caption != initial
+
+    _image(image_dir / "two.png", color="blue")
+    assert dataset_source_fingerprint(source) != with_caption
 
 
 def test_summary_separates_raw_values_from_effective_inheritance():
