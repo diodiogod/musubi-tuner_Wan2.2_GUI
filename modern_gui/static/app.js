@@ -104,7 +104,7 @@ const HELP = {
   minimax_h3_teacher_conditions: "Choose what information the unchanged teacher model receives. Use Ref for normal still-image training; it uses the current training sample, so no separate reference image is required. First,last is intended for video datasets and uses the real first and last frames. Ref is the recommended starting option.",
   minimax_h3_teacher_condition_sigma_max: "At or below this base sigma, the teacher uses the target condition. Above it, the extra pass becomes a pure frozen-base preservation anchor. Upstream currently recommends 0.75.",
   minimax_h3_teacher_loss_dc_weight: "Reduces how strongly conditioned teacher steps copy global color and tone. Upstream's identity starting recipe uses 0.3. Preservation steps still keep full color correction.",
-  minimax_h3_teacher_loss_mag_weight: "Weights prediction magnitude relative to direction in the teacher loss. Keep 1.0 unless diagnostics show a specific norm problem.",
+  minimax_h3_teacher_loss_mag_weight: "On conditioned teaching steps, weights prediction magnitude relative to direction. Keep 1.0 unless diagnostics show a specific norm problem. High-noise preservation-anchor steps always retain the full magnitude correction so lowering this cannot weaken their protection.",
   minimax_h3_teacher_preservation_weight: "Strength of high-noise frozen-base anchor steps. Raise it only if samples show growing composition or palette drift.",
   minimax_h3_timestep_focus_min: "Lower edge of the teacher's extra sampling focus band. This uses base sigma before H3's video/audio shifts.",
   minimax_h3_timestep_focus_max: "Upper edge of the teacher's extra sampling focus band. Upstream observed content decisions mainly in the 0.4–0.8 region.",

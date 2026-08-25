@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from musubi_tuner.minimax_h3_native.packing import H3VideoGeometry, build_h3_layout
 from musubi_tuner.minimax_h3_native.sampling import (
+    H3_VIDEO_CRF,
     augment_condition_latents,
     build_shifted_schedule,
     create_sampling_generator,
@@ -44,6 +45,7 @@ def test_shifted_schedules_share_one_descending_base_grid_but_keep_modality_shif
     torch.testing.assert_close(schedule.video, torch.tensor([1.0, 12.0 / 13.0, 0.0], dtype=torch.float64))
     torch.testing.assert_close(schedule.audio, torch.tensor([1.0, 0.75, 0.0], dtype=torch.float64))
     assert not torch.equal(schedule.video, schedule.audio)
+    assert H3_VIDEO_CRF == 16
 
 
 @pytest.mark.parametrize("shift", (0.0, 101.0))
@@ -573,4 +575,3 @@ def test_generation_trajectory_dump_writes_sigma_schedule_and_per_step_videos(tm
     assert step_files == ["step000_base1.0000_sigv1.0000.mp4", "step001_base0.5000_sigv0.9231.mp4"]
     # the final output decode plus one decode per dumped step
     assert len(decode_calls) == 1 + args.steps
-

@@ -1359,6 +1359,18 @@ class MusubiTunerGUI:
             wraplength=850,
             style="PageHelp.TLabel",
         ).pack(anchor="w", padx=10, pady=(8, 4))
+        self.hidden_frames['minimax_h3_guidance_protection'] = ttk.LabelFrame(
+            self.regularization_frame, text="MiniMax H3 · Training Quality Protection"
+        )
+        ttk.Label(
+            self.hidden_frames['minimax_h3_guidance_protection'],
+            text=(
+                "Important H3 controls. Ostris's frozen assistant, proven Dynamic Sigma target, and optional drift check "
+                "can be enabled together and scheduled independently. Presets provide editable starting points."
+            ),
+            wraplength=850,
+            style="PageHelp.TLabel",
+        ).pack(anchor="w", padx=10, pady=(8, 4))
         teacher_title = ttk.Label(
             self.hidden_frames['minimax_h3_guidance_protection'],
             text="Native video workflow · upstream teacher matching",
@@ -1385,7 +1397,7 @@ class MusubiTunerGUI:
         for key, label, tip in (
             ("minimax_h3_teacher_condition_sigma_max", "Teacher Cutoff Sigma:", "Recommended 0.75. Above this base sigma the extra pass becomes pure frozen-base preservation."),
             ("minimax_h3_teacher_loss_dc_weight", "Teacher Color/Style Weight:", "Upstream identity starting value: 0.3. Reduces copying of global color and tone on teaching steps."),
-            ("minimax_h3_teacher_loss_mag_weight", "Teacher Magnitude Weight:", "Keep 1.0 normally. Controls magnitude relative to direction in the decomposed teacher loss."),
+            ("minimax_h3_teacher_loss_mag_weight", "Teacher Magnitude Weight:", "Keep 1.0 normally. This changes conditioned teaching steps only; preservation-anchor steps always retain full magnitude correction."),
             ("minimax_h3_teacher_preservation_weight", "Teacher Base-Preservation Weight:", "Keep 1.0 initially. Raise only when high-noise composition or palette drift keeps growing."),
             ("minimax_h3_timestep_focus_min", "Teacher Focus Band Start:", "Lower base-sigma edge of the teacher focus band; upstream starts at 0.4."),
             ("minimax_h3_timestep_focus_max", "Teacher Focus Band End:", "Upper base-sigma edge of the teacher focus band; upstream starts at 0.8."),
@@ -1451,18 +1463,6 @@ class MusubiTunerGUI:
             "Differential Output Preservation was studied from github.com/ostris/ai-toolkit. This implementation shares the training idea but was adapted independently to Musubi's cached-text Krea 2 and FLUX.2 Klein pipelines.",
         )
 
-        self.hidden_frames['minimax_h3_guidance_protection'] = ttk.LabelFrame(
-            self.regularization_frame, text="MiniMax H3 · Training Quality Protection"
-        )
-        ttk.Label(
-            self.hidden_frames['minimax_h3_guidance_protection'],
-            text=(
-                "Important H3 controls. Ostris's frozen assistant, proven Dynamic Sigma target, and optional drift check "
-                "can be enabled together and scheduled independently. Presets provide editable starting points."
-            ),
-            wraplength=850,
-            style="PageHelp.TLabel",
-        ).pack(anchor="w", padx=10, pady=(8, 4))
         self._add_widget(
             self.hidden_frames['minimax_h3_guidance_protection'],
             "minimax_h3_quality_protection_preset",
@@ -6806,76 +6806,7 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
                 self.entries["network_alpha_low"].delete(0, tk.END)
                 self.entries["network_alpha_low"].insert(0, "32")
         elif mode == "MiniMax H3 (Experimental)":
-            multimodal = str(settings.get("minimax_h3_training_workflow") or "").startswith("Video")
-            if multimodal:
-                missing_multimodal = [
-                    label for label, key in (
-                        ("official Video VAE", "minimax_h3_video_vae"),
-                        ("official Audio VAE", "minimax_h3_audio_vae"),
-                    ) if not settings.get(key) or not os.path.exists(settings[key])
-                ]
-                if missing_multimodal:
-                    messagebox.showerror("Validation Error", "Video + audio training is missing: " + ", ".join(missing_multimodal))
-                    return
-                if "int8" in os.path.basename(settings["minimax_h3_video_vae"]).lower():
-                    messagebox.showerror(
-                        "Validation Error",
-                        "Video + audio training needs minimax_h3_video_vae_fp16.safetensors. The INT8 ConvRot VAE is a ComfyUI inference format.",
-                    )
-                    return
-                dit_name = os.path.basename(settings.get("minimax_h3_dit_model", "")).lower()
-                task = settings.get("minimax_h3_multimodal_task", "t2va")
-                if settings.get("minimax_h3_teacher_matching"):
-                    if task != "t2va":
-                        messagebox.showerror("MiniMax Teacher Matching", "Teacher matching trains a T2VA student. Select t2va.")
-                        return
-                    try:
-                        sigma_max = float(settings.get("minimax_h3_teacher_condition_sigma_max", 0.75))
-                        focus_min = float(settings.get("minimax_h3_timestep_focus_min", 0.4))
-                        focus_max = float(settings.get("minimax_h3_timestep_focus_max", 0.8))
-                        focus_prob = float(settings.get("minimax_h3_timestep_focus_prob", 0.5))
-                        if not (0 <= sigma_max <= 1 and 0 <= focus_min < focus_max <= 1 and 0 <= focus_prob <= 1):
-                            raise ValueError
-                    except (TypeError, ValueError):
-                        messagebox.showerror("MiniMax Teacher Matching", "Teacher sigma and focus values must stay between 0 and 1, with Focus Start below Focus End.")
-                        return
-                    if not settings.get("recache_text"):
-                        if not messagebox.askyesno(
-                            "Rebuild Teacher Cache?",
-                            "Teacher matching requires new teacher presentation rows in the caption cache. Enable text re-caching now?",
-                        ):
-                            return
-                        self.entries["recache_text"].var.set(True)
-                        settings["recache_text"] = True
-                    if settings.get("minimax_h3_teacher_conditions") == "first,last" and not settings.get("recache_latents"):
-                        if not messagebox.askyesno(
-                            "Rebuild Endpoint Latents?",
-                            "First/last teacher matching requires FL2VA endpoint latents. Enable latent re-caching now?",
-                        ):
-                            return
-                        self.entries["recache_latents"].var.set(True)
-                        settings["recache_latents"] = True
-                if (task == "ref2va" and "ref2va" not in dit_name) or (task != "ref2va" and "ref2va" in dit_name):
-                    messagebox.showerror(
-                        "MiniMax Model Mismatch",
-                        "Ref2VA needs a Ref2VA transformer. T2VA and FL2VA need the FL2VA transformer family.",
-                    )
-                    return
-                from modern_gui.h3_datasets import audit_h3_training_dataset
-                h3_audit = audit_h3_training_dataset(
-                    settings.get("dataset_config", ""),
-                    task=settings.get("minimax_h3_multimodal_task", "t2va"),
-                    training_target=settings.get("minimax_h3_training_target", "Video + audio"),
-                    allow_experimental_duration=bool(settings.get("minimax_h3_allow_experimental_duration")),
-                )
-                if h3_audit["errors"]:
-                    messagebox.showerror("MiniMax Dataset Error", "\n\n".join(h3_audit["errors"][:8]))
-                    return
-                if h3_audit["warnings"] and not messagebox.askyesno(
-                    "MiniMax Dataset Warning",
-                    "\n\n".join(h3_audit["warnings"][:8]) + "\n\nContinue anyway?",
-                ):
-                    return
+            multimodal = str(self.entries["minimax_h3_training_workflow"].get() or "").startswith("Video")
             self.mode_note_label.config(text=(
                 "Experimental native video/audio LoRA · synchronized H3 training"
                 if multimodal else
@@ -7281,6 +7212,11 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
         is_wan = (mode == "Wan 2.2")
         is_krea2 = (mode == "Krea 2")
         is_minimax_h3 = (mode == "MiniMax H3 (Experimental)")
+        h3_multimodal = bool(
+            is_minimax_h3
+            and self.entries.get("minimax_h3_training_workflow")
+            and str(self.entries["minimax_h3_training_workflow"].get() or "").startswith("Video")
+        )
 
         show_low = self.entries["train_low_noise"].var.get() if is_wan else False
         show_high = self.entries["train_high_noise"].var.get() if is_wan else False

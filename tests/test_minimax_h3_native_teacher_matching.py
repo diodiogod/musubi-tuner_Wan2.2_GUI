@@ -1653,6 +1653,23 @@ def test_compute_loss_keeps_full_dc_and_applies_the_preservation_weight_on_ancho
     assert loss.item() == pytest.approx(5.0)
 
 
+def test_compute_loss_keeps_full_magnitude_correction_on_anchor_steps():
+    trainer = MiniMaxH3NetworkTrainer()
+    args = _trainer_args(h3_teacher_matching=True, h3_teacher_loss_mag_weight=0.0)
+
+    # With a zero target this fixture has no direction term. The conditioned
+    # step honors mag=0, while the preservation anchor keeps full MSE.
+    _, anchor_logs = trainer.compute_loss(
+        args, _dc_split_output(conditioned=0.0), None, None, torch.bfloat16, torch.float32, 0
+    )
+    _, teaching_logs = trainer.compute_loss(
+        args, _dc_split_output(conditioned=1.0), None, None, torch.bfloat16, torch.float32, 0
+    )
+
+    assert anchor_logs["loss/video"].item() == pytest.approx(2.5)
+    assert teaching_logs["loss/video"].item() == pytest.approx(0.0, abs=1e-6)
+
+
 def test_preservation_density_compensation_restores_the_anchor_share_under_focus():
     from musubi_tuner.minimax_h3_native_train_network import _preservation_density_compensation
 

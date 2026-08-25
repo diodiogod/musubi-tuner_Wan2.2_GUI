@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import torch
 
 from musubi_tuner.minimax_h3.video_sampling import (
+    H3_VIDEO_CRF,
     build_joint_sigma_schedule,
     decode_video_latent,
     initialize_joint_noise,
@@ -64,4 +65,5 @@ def test_decode_and_write_silent_mp4(tmp_path):
     output = write_silent_video(pixels, tmp_path / "preview.mp4", fps=24)
 
     assert pixels.shape == (5, 32, 32, 3)
+    assert H3_VIDEO_CRF == 16
     assert output.stat().st_size > 0

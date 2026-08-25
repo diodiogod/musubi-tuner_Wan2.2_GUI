@@ -185,8 +185,9 @@ if HAS_TRITON:
         block_size: tl.constexpr,
         input_dtype_code: tl.constexpr,
     ):
-        # Row index we are processing
-        row_idx = tl.program_id(0)
+        # Promote before multiplying by the row width. H3 can pack enough
+        # video/audio/text rows for an int32 address offset to wrap silently.
+        row_idx = tl.program_id(0).to(tl.int64)
 
         # Pointers to the start of the row
         x_row_ptr = x_ptr + row_idx * n_elements
@@ -308,7 +309,8 @@ if HAS_TRITON:
         offs_bn = (pid_n * block_n + tl.arange(0, block_n)) % n
         offs_k = tl.arange(0, block_k)
 
-        a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        offs_am_i64 = offs_am.to(tl.int64)
+        a_ptrs = a_ptr + (offs_am_i64[:, None] * stride_am + offs_k[None, :] * stride_ak)
         b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
         # 2. Main Loop (Accumulate in Int32)
@@ -339,7 +341,7 @@ if HAS_TRITON:
             c = c + bias[None, :]
 
         # 4. Store Result
-        c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
+        c_ptrs = c_ptr + stride_cm * offs_am_i64[:, None] + stride_cn * offs_bn[None, :]
         c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
         tl.store(c_ptrs, c, mask=c_mask)
 
@@ -401,7 +403,8 @@ if HAS_TRITON:
         offs_bn = (pid_n * block_n + tl.arange(0, block_n)) % n
         offs_k = tl.arange(0, block_k)
 
-        a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+        offs_am_i64 = offs_am.to(tl.int64)
+        a_ptrs = a_ptr + (offs_am_i64[:, None] * stride_am + offs_k[None, :] * stride_ak)
         b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
 
         # 2. Main Loop (Accumulate in Int32)
@@ -427,7 +430,7 @@ if HAS_TRITON:
             c = c + bias[None, :]
 
         # 4. Store Result
-        c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bn[None, :]
+        c_ptrs = c_ptr + stride_cm * offs_am_i64[:, None] + stride_cn * offs_bn[None, :]
         c_mask = (offs_am[:, None] < m) & (offs_bn[None, :] < n)
         tl.store(c_ptrs, c, mask=c_mask)
 

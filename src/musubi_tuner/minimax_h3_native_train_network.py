@@ -1582,7 +1582,9 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             # steps the DC penalty is exactly what pulls palette drift back to the base
             if attenuate_dc and conditioned and dc_weight != 1.0:
                 pred = _dc_attenuated_prediction(pred, target, dc_weight)
-            return _decomposed_flow_loss(pred, target, mag_weight, 1.0)
+            # Magnitude down-weighting is education-only. On preservation
+            # anchors the full magnitude term restores the base output norm.
+            return _decomposed_flow_loss(pred, target, mag_weight if conditioned else 1.0, 1.0)
 
         # the DC attenuation targets the video palette axis; the audio anchor keeps its full DC
         video_loss = flow_loss(output.pred.to(network_dtype), output.target.to(network_dtype), attenuate_dc=True)
@@ -1772,9 +1774,8 @@ def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         "--h3_teacher_loss_mag_weight",
         type=float,
         default=1.0,
-        help="teacher matching only: weight of the magnitude term of the decomposed loss, relative to the"
-        " direction term fixed at 1.0. At 1.0 the loss value equals the plain MSE (only the gradient geometry"
-        " differs); lower it to prioritize direction matching (0 = pure direction)",
+        help="teacher matching only: on conditioned teaching steps, weight of the magnitude term of the decomposed"
+        " loss relative to the direction term. Preservation-anchor steps always keep the full magnitude term",
     )
     parser.add_argument(
         "--h3_teacher_preservation_weight",

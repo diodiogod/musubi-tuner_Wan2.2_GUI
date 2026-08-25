@@ -210,6 +210,9 @@ def decode_video_latent(video_vae, latent: torch.Tensor, *, frame_count: int) ->
     return ((pixels + 1.0) * 127.5).round().to(torch.uint8).permute(1, 2, 3, 0).contiguous()
 
 
+H3_VIDEO_CRF = 16
+
+
 def write_silent_video(video: torch.Tensor, output: str | Path, *, fps: int = 24) -> Path:
     if video.ndim != 4 or video.shape[-1] != 3 or video.dtype != torch.uint8:
         raise ValueError(f"MiniMax-H3 output video must be uint8 [F,H,W,3], got {tuple(video.shape)} {video.dtype}")
@@ -218,7 +221,7 @@ def write_silent_video(video: torch.Tensor, output: str | Path, *, fps: int = 24
         raise ValueError("Compact MiniMax-H3 video previews must use .mp4 output")
     output.parent.mkdir(parents=True, exist_ok=True)
     with av.open(str(output), mode="w") as container:
-        stream = container.add_stream("libx264", rate=fps)
+        stream = container.add_stream("libx264", rate=fps, options={"crf": str(H3_VIDEO_CRF)})
         stream.width = video.shape[2]
         stream.height = video.shape[1]
         stream.pix_fmt = "yuv420p"
