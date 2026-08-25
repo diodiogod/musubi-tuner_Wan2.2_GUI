@@ -100,6 +100,12 @@ def training_settings_summary(settings: dict[str, Any]) -> str:
     if optimizer:
         parts.append(f"opt={optimizer}")
 
+    if settings.get("minimax_h3_foundation_lora_enabled"):
+        foundation = str(settings.get("minimax_h3_foundation_lora") or "").strip()
+        strength = str(settings.get("minimax_h3_foundation_lora_multiplier") or "1.0").strip()
+        if foundation:
+            parts.append(f"foundation={Path(foundation).name}@{strength}")
+
     if settings.get("dop_enabled"):
         strength = _enabled_number(settings, "dop_loss_weight")
         class_word = str(settings.get("dop_class_word") or "").strip()

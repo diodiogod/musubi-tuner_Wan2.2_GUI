@@ -320,6 +320,36 @@ def test_build_minimax_h3_preview_uses_selected_lora_and_strength(tmp_path: Path
     assert command[command.index("--lora_multiplier") + 1] == "0.75"
 
 
+def test_build_minimax_h3_preview_stacks_foundation_before_refinement(tmp_path: Path):
+    paths = {}
+    for name in ("dit.safetensors", "vae.safetensors", "te.safetensors", "foundation.safetensors", "nails.safetensors"):
+        path = tmp_path / name
+        path.write_bytes(b"x")
+        paths[name] = str(path)
+
+    command, _ = build_minimax_h3_preview(
+        {
+            "training_mode": "MiniMax H3 (Experimental)",
+            "minimax_h3_dit_model": paths["dit.safetensors"],
+            "vae_model": paths["vae.safetensors"],
+            "minimax_h3_text_encoder": paths["te.safetensors"],
+            "output_dir": str(tmp_path),
+            "preview_use_lora": True,
+            "preview_lora_path": paths["nails.safetensors"],
+            "preview_lora_multiplier": "0.7",
+            "minimax_h3_foundation_lora_enabled": True,
+            "minimax_h3_foundation_lora": paths["foundation.safetensors"],
+            "minimax_h3_foundation_lora_multiplier": "0.8",
+        },
+        [{"prompt": "detailed hands", "width": 768, "height": 768, "guidance": 1}],
+    )
+
+    weights = [command[index + 1] for index, value in enumerate(command) if value == "--network_weights"]
+    strengths = [command[index + 1] for index, value in enumerate(command) if value == "--lora_multiplier"]
+    assert weights == [paths["foundation.safetensors"], paths["nails.safetensors"]]
+    assert strengths == ["0.8", "0.7"]
+
+
 def test_build_minimax_h3_preview_uses_selected_resume_state_model(tmp_path: Path):
     paths = {}
     for name in ("dit.safetensors", "vae.safetensors", "te.safetensors"):

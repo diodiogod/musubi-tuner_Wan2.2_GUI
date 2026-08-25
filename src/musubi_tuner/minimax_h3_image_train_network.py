@@ -31,6 +31,7 @@ from musubi_tuner.training.h3_training_assistant import (
     DEFAULT_ASSISTANT,
     base_preservation_loss,
     load_live_assistant,
+    load_live_foundation_lora,
     should_preserve_base,
 )
 from musubi_tuner.perceptual.depth_devices import resolve_depth_vae_device
@@ -52,6 +53,7 @@ class MiniMaxH3ImageNetworkTrainer(NetworkTrainer):
         self._depth_anchor = None
         self._depth_vae_device = None
         self._training_assistant = None
+        self._foundation_lora = None
 
     @property
     def architecture(self) -> str:
@@ -141,6 +143,10 @@ class MiniMaxH3ImageNetworkTrainer(NetworkTrainer):
             raise ValueError("H3 Dynamic Sigma cadence must be at least 1")
         if args.h3_training_assistant_enabled and not str(args.h3_training_assistant or "").strip():
             raise ValueError("The selected H3 assistant method requires --h3_training_assistant")
+        if getattr(args, "h3_foundation_lora", None) and not torch.isfinite(
+            torch.tensor(getattr(args, "h3_foundation_lora_multiplier", 1.0))
+        ):
+            raise ValueError("H3 foundation LoRA strength must be a finite number")
         if args.h3_base_preservation_loss_weight < 0:
             raise ValueError("H3 base-preservation strength must be non-negative")
         if args.h3_base_preservation_every_n_steps < 1:
@@ -155,16 +161,29 @@ class MiniMaxH3ImageNetworkTrainer(NetworkTrainer):
             raise ValueError("Base + assistant reference requires the Ostris training assistant to be enabled")
 
     def on_transformer_loaded(self, args, accelerator, transformer) -> None:
-        if not args.h3_training_assistant_enabled:
-            return
-        logger.info("Loading frozen MiniMax-H3 training assistant: %s", args.h3_training_assistant)
-        self._training_assistant = load_live_assistant(
-            transformer,
-            args.h3_training_assistant,
-            accelerator.device,
-            torch.bfloat16,
-        )
-        logger.info("MiniMax-H3 training assistant active from %s", self._training_assistant.assistant_source)
+        if getattr(args, "h3_foundation_lora", None):
+            logger.info(
+                "Loading frozen MiniMax-H3 foundation LoRA: %s at %g",
+                args.h3_foundation_lora,
+                getattr(args, "h3_foundation_lora_multiplier", 1.0),
+            )
+            self._foundation_lora = load_live_foundation_lora(
+                transformer,
+                args.h3_foundation_lora,
+                getattr(args, "h3_foundation_lora_multiplier", 1.0),
+                accelerator.device,
+                torch.bfloat16,
+            )
+            logger.info("MiniMax-H3 foundation LoRA active from %s", self._foundation_lora.foundation_source)
+        if args.h3_training_assistant_enabled:
+            logger.info("Loading frozen MiniMax-H3 training assistant: %s", args.h3_training_assistant)
+            self._training_assistant = load_live_assistant(
+                transformer,
+                args.h3_training_assistant,
+                accelerator.device,
+                torch.bfloat16,
+            )
+            logger.info("MiniMax-H3 training assistant active from %s", self._training_assistant.assistant_source)
 
     def on_before_sample_images(self, *args, **kwargs) -> None:
         if self._training_assistant is not None:
@@ -699,10 +718,20 @@ class MiniMaxH3ImageNetworkTrainer(NetworkTrainer):
             "ss_minimax_h3_dynamic_sigma_every_n_steps": getattr(args, "h3_dynamic_sigma_every_n_steps", 1),
             "ss_minimax_h3_base_preservation_enabled": getattr(args, "h3_base_preservation_enabled", False),
             "ss_minimax_h3_base_preservation_reference": getattr(args, "h3_base_preservation_reference", "assistant"),
+            "ss_minimax_h3_foundation_lora": str(getattr(args, "h3_foundation_lora", "") or ""),
+            "ss_minimax_h3_foundation_lora_multiplier": getattr(args, "h3_foundation_lora_multiplier", 1.0),
         }
 
 
 def minimax_h3_image_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    foundation = parser.add_argument_group("MiniMax-H3 frozen foundation LoRA")
+    foundation.add_argument(
+        "--h3_foundation_lora",
+        type=str,
+        default=None,
+        help="ordinary MiniMax-H3 LoRA kept frozen and active while a separate new LoRA trains on top",
+    )
+    foundation.add_argument("--h3_foundation_lora_multiplier", type=float, default=1.0)
     parser.add_argument(
         "--convrot_bwd_mode",
         choices=("bf16", "int8"),

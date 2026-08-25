@@ -12,6 +12,10 @@ from modern_gui.sample_prompts import serialize_sample_prompt
 from backends._common import setting_or_default
 
 
+def _same_path(left: str, right: str) -> bool:
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+
 def serialize_prompt(prompt: dict[str, Any]) -> str:
     return serialize_sample_prompt(prompt, "Krea 2")
 
@@ -229,8 +233,20 @@ def build_minimax_h3_preview(settings: dict[str, Any], prompts: list[dict[str, A
         command.append("--use_pinned_memory_for_block_swap")
     if str(settings.get("block_swap_ring_size") or "").strip():
         command.extend(["--block_swap_ring_size", str(settings["block_swap_ring_size"])])
+    foundation = (
+        str(settings.get("minimax_h3_foundation_lora") or "").strip()
+        if settings.get("minimax_h3_foundation_lora_enabled") and settings.get("preview_use_lora") is not False
+        else ""
+    )
+    if foundation:
+        command.extend(
+            [
+                "--network_weights", foundation,
+                "--lora_multiplier", str(settings.get("minimax_h3_foundation_lora_multiplier") or "1.0"),
+            ]
+        )
     lora = resolve_preview_lora(settings)
-    if lora:
+    if lora and not (foundation and _same_path(lora, foundation)):
         command.extend(["--network_weights", lora, "--lora_multiplier", str(preview_lora_multiplier(settings))])
     return command, save_path
 

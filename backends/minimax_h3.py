@@ -95,6 +95,13 @@ def build_commands(settings):
     add_arg(cmd, "--network_module", "networks.lora_minimax_h3")
     add_arg(cmd, "--network_dim", settings.get("network_dim_low"))
     add_arg(cmd, "--network_alpha", settings.get("network_alpha_low"))
+    if settings.get("minimax_h3_foundation_lora_enabled"):
+        add_arg(cmd, "--h3_foundation_lora", settings.get("minimax_h3_foundation_lora"), is_path=True)
+        add_arg(
+            cmd,
+            "--h3_foundation_lora_multiplier",
+            settings.get("minimax_h3_foundation_lora_multiplier") or "1.0",
+        )
     add_arg(cmd, "--blocks_to_swap", settings.get("blocks_to_swap"))
     add_arg(cmd, "--block_swap_h2d_only", True)
     add_arg(cmd, "--block_swap_ring_size", settings.get("block_swap_ring_size"))
@@ -181,6 +188,13 @@ def _build_multimodal_commands(settings):
     add_arg(cmd, "--network_module", "networks.lora_minimax_h3")
     add_arg(cmd, "--network_dim", settings.get("network_dim_low"))
     add_arg(cmd, "--network_alpha", settings.get("network_alpha_low"))
+    if settings.get("minimax_h3_foundation_lora_enabled"):
+        add_arg(cmd, "--h3_foundation_lora", settings.get("minimax_h3_foundation_lora"), is_path=True)
+        add_arg(
+            cmd,
+            "--h3_foundation_lora_multiplier",
+            settings.get("minimax_h3_foundation_lora_multiplier") or "1.0",
+        )
     add_arg(cmd, "--blocks_to_swap", settings.get("blocks_to_swap"))
     add_arg(cmd, "--convrot_int8_bwd", settings.get("minimax_h3_convrot_bwd_mode") or "bf16")
     teacher_matching = bool(settings.get("minimax_h3_teacher_matching"))

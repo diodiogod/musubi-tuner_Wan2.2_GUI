@@ -77,6 +77,21 @@ def validate_training_settings(settings: dict[str, Any]) -> dict[str, list[dict[
             error("blocks_to_swap", "Krea Turbo sampling cannot be combined with Blocks to Swap.")
     elif mode == "MiniMax H3 (Experimental)":
         require("minimax_h3_dit_model", "MiniMax H3 pruned ConvRot INT8 DiT")
+        if settings.get("minimax_h3_foundation_lora_enabled"):
+            foundation = Path(str(settings.get("minimax_h3_foundation_lora") or "")).expanduser()
+            if not foundation.is_file():
+                error("minimax_h3_foundation_lora", f"Foundation LoRA does not exist: {foundation}")
+            try:
+                strength = float(settings.get("minimax_h3_foundation_lora_multiplier"))
+                if strength != strength or strength in {float("inf"), float("-inf")}:
+                    raise ValueError
+            except (TypeError, ValueError):
+                error("minimax_h3_foundation_lora_multiplier", "Foundation Strength must be a finite number.")
+            if settings.get("starting_point_mode") != "new":
+                warning(
+                    "starting_point_mode",
+                    "Foundation LoRA is separate from continuation. This run will keep the foundation frozen while also loading the selected trainable continuation/state.",
+                )
         multimodal = str(settings.get("minimax_h3_training_workflow") or "").startswith("Video")
         if multimodal:
             require("minimax_h3_video_vae", "official MiniMax H3 video VAE")

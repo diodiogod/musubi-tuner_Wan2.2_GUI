@@ -48,6 +48,34 @@ def test_compact_workflow_exposes_shifted_uniform_without_changing_default(tmp_p
     assert experimental_command[experimental_command.index("--timestep_sampling") + 1] == "h3_shifted_uniform"
 
 
+def test_foundation_lora_is_forwarded_to_compact_and_native_trainers(tmp_path):
+    foundation = tmp_path / "foundation.safetensors"
+    shared = _settings(tmp_path) | {
+        "minimax_h3_foundation_lora_enabled": True,
+        "minimax_h3_foundation_lora": str(foundation),
+        "minimax_h3_foundation_lora_multiplier": "0.8",
+    }
+    compact, = minimax_h3.build_commands(shared)
+    native, = minimax_h3.build_commands(
+        shared | {"minimax_h3_training_workflow": "Video + audio · official multimodal"}
+    )
+
+    for command in (compact, native):
+        assert command[command.index("--h3_foundation_lora") + 1] == foundation.as_posix()
+        assert command[command.index("--h3_foundation_lora_multiplier") + 1] == "0.8"
+
+
+def test_disabled_foundation_lora_is_not_forwarded(tmp_path):
+    command, = minimax_h3.build_commands(
+        _settings(tmp_path) | {
+            "minimax_h3_foundation_lora_enabled": False,
+            "minimax_h3_foundation_lora": str(tmp_path / "stale.safetensors"),
+        }
+    )
+
+    assert "--h3_foundation_lora" not in command
+
+
 def test_hybrid_assistant_command_forwards_helper_and_sparse_preservation(tmp_path):
     settings = _settings(tmp_path) | {
         "minimax_h3_training_assistant_enabled": True,

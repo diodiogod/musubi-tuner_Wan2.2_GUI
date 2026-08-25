@@ -206,6 +206,8 @@ Zero audio loss does not preserve the base model's audio behavior. H3 is single-
 
 Block swap supports up to 48 of the 50 main blocks. `--block_swap_h2d_only` is also supported for frozen-base LoRA training and requires `--gradient_checkpointing`.
 
+An existing ordinary H3 LoRA can be kept frozen as the behavioral foundation for a separate new adapter with `--h3_foundation_lora PATH --h3_foundation_lora_multiplier 1.0`. Unlike `--network_weights`, this does not continue or modify the selected LoRA. The foundation stays active during optimization and training previews, is excluded from the optimizer and saved output, and therefore normally remains required beside the new refinement LoRA at inference. This runtime route also supports pre-quantized ConvRot INT8 bases, where upstream's destructive `--base_weights` merge is not available. It does not change either dataset cache.
+
 MiniMax-H3 requires `batch_size = 1` in every H3 dataset. Use Accelerate gradient accumulation for a larger effective batch. The latent caching script warns when a dataset config sets any other value, and the trainer rejects the first batch whose size is not 1. Real packed batching needs text padding, an attention mask, and per-sample structural tensors, so it is deferred to a separate PR.
 
 Saved `ss_minimax_h3_base_family` names the released transformer family, not the task. T2VA therefore records `ss_minimax_h3_task=t2va` and `ss_minimax_h3_base_family=fl2va`, because T2VA uses the released FL2VA base.

@@ -6,6 +6,7 @@ from musubi_tuner.training.h3_training_assistant import (
     base_preservation_loss,
     convert_ai_toolkit_weights,
     load_live_assistant,
+    load_live_foundation_lora,
     should_preserve_base,
 )
 
@@ -98,3 +99,27 @@ def test_live_assistant_is_frozen_toggleable_and_unmerged(tmp_path):
     assert not torch.equal(active, base)
     torch.testing.assert_close(disabled, base)
     assert all(not parameter.requires_grad for parameter in assistant.parameters())
+
+
+def test_native_h3_lora_can_stay_live_and_frozen_as_foundation(tmp_path):
+    path = tmp_path / "foundation.safetensors"
+    name = "lora_unet_blocks_0_attn_qkv"
+    save_file(
+        {
+            f"{name}.lora_down.weight": torch.ones(2, 4),
+            f"{name}.lora_up.weight": torch.ones(4, 2),
+            f"{name}.alpha": torch.tensor(2.0),
+        },
+        str(path),
+    )
+    transformer = _TinyTransformer()
+    value = torch.ones(1, 4)
+    base = transformer(value).detach().clone()
+
+    foundation = load_live_foundation_lora(
+        transformer, str(path), 0.5, torch.device("cpu"), torch.float32
+    )
+
+    assert not torch.equal(transformer(value), base)
+    assert foundation.foundation_multiplier == 0.5
+    assert all(not parameter.requires_grad for parameter in foundation.parameters())

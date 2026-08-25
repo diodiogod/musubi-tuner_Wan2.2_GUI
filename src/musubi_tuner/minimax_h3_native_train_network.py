@@ -56,7 +56,11 @@ from musubi_tuner.minimax_h3_native.text_encoder import (
     load_h3_uncond_cache,
     normalize_teacher_conditions,
 )
-from musubi_tuner.training.h3_training_assistant import DEFAULT_ASSISTANT, load_live_assistant
+from musubi_tuner.training.h3_training_assistant import (
+    DEFAULT_ASSISTANT,
+    load_live_assistant,
+    load_live_foundation_lora,
+)
 from musubi_tuner.minimax_h3_native.video_vae import VIDEO_VAE_DECODE_DTYPE, VIDEO_VAE_ENCODE_DTYPE, load_video_vae
 from musubi_tuner.minimax_h3_native_cache_latents import PyAVH3MediaDecoder
 from musubi_tuner.training.audio_loss import add_audio_train_args, effective_audio_loss_weights
@@ -558,6 +562,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         # --h3_guidance_loss_scale is active
         self._guidance_uncond: tuple[torch.Tensor, torch.Tensor] | None = None
         self._training_assistant = None
+        self._foundation_lora = None
 
     @property
     def architecture(self) -> str:
@@ -704,6 +709,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             raise ValueError(f"--h3_guidance_loss_sigma_min must be in [0.0,1.0], got {args.h3_guidance_loss_sigma_min}")
         if getattr(args, "h3_training_assistant_enabled", False) and not str(args.h3_training_assistant or "").strip():
             raise ValueError("--h3_training_assistant_enabled requires --h3_training_assistant")
+        if getattr(args, "h3_foundation_lora", None) and not torch.isfinite(
+            torch.tensor(getattr(args, "h3_foundation_lora_multiplier", 1.0))
+        ):
+            raise ValueError("H3 foundation LoRA strength must be a finite number")
         self._guidance_uncond = None
         if guidance_scale > 0.0:
             if not args.h3_guidance_loss_uncond_cache:
@@ -743,6 +752,20 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 raise ValueError("--convrot_int8_bwd int8 requires a CUDA training device")
         if is_convrot_int8 and getattr(args, "base_weights", None):
             raise ValueError("MiniMax-H3 --base_weights cannot be merged into a ConvRot INT8 transformer base")
+        if getattr(args, "h3_foundation_lora", None):
+            logger.info(
+                "Loading frozen MiniMax-H3 foundation LoRA: %s at %g",
+                args.h3_foundation_lora,
+                getattr(args, "h3_foundation_lora_multiplier", 1.0),
+            )
+            self._foundation_lora = load_live_foundation_lora(
+                transformer,
+                args.h3_foundation_lora,
+                getattr(args, "h3_foundation_lora_multiplier", 1.0),
+                accelerator.device,
+                torch.bfloat16,
+            )
+            logger.info("MiniMax-H3 foundation LoRA active from %s", self._foundation_lora.foundation_source)
         if getattr(args, "h3_training_assistant_enabled", False):
             logger.info("Loading frozen Ostris MiniMax-H3 training assistant: %s", args.h3_training_assistant)
             self._training_assistant = load_live_assistant(
@@ -1118,6 +1141,11 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         if getattr(args, "h3_training_assistant_enabled", False):
             metadata["ss_minimax_h3_training_assistant_enabled"] = True
             metadata["ss_minimax_h3_training_assistant"] = str(args.h3_training_assistant)
+        if getattr(args, "h3_foundation_lora", None):
+            metadata["ss_minimax_h3_foundation_lora"] = str(args.h3_foundation_lora)
+            metadata["ss_minimax_h3_foundation_lora_multiplier"] = getattr(
+                args, "h3_foundation_lora_multiplier", 1.0
+            )
         if float(args.h3_timestep_focus_prob) > 0.0:
             metadata["ss_minimax_h3_timestep_focus_min"] = args.h3_timestep_focus_min
             metadata["ss_minimax_h3_timestep_focus_max"] = args.h3_timestep_focus_max
@@ -1707,6 +1735,13 @@ def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         help="keep Ostris's frozen MiniMax-H3 v1 assistant LoRA active during native training; it is disabled for previews and excluded from the saved LoRA",
     )
     parser.add_argument("--h3_training_assistant", type=str, default=DEFAULT_ASSISTANT)
+    parser.add_argument(
+        "--h3_foundation_lora",
+        type=str,
+        default=None,
+        help="ordinary MiniMax-H3 LoRA kept frozen and active while a separate new LoRA trains on top",
+    )
+    parser.add_argument("--h3_foundation_lora_multiplier", type=float, default=1.0)
     parser.add_argument(
         "--h3_guidance_loss_scale_audio",
         type=float,

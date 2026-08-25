@@ -84,6 +84,16 @@ def test_minimax_h3_preflight_enforces_experimental_24gb_contract(tmp_path: Path
     assert result["errors"] == []
     assert any("two-epoch run" in item["message"] for item in result["warnings"])
 
+    foundation = tmp_path / "foundation.safetensors"
+    foundation.write_bytes(b"test")
+    settings.update(
+        minimax_h3_foundation_lora_enabled=True,
+        minimax_h3_foundation_lora=str(foundation),
+        minimax_h3_foundation_lora_multiplier="0.8",
+        starting_point_mode="new",
+    )
+    assert validate_training_settings(settings)["errors"] == []
+
     settings.update({"compile": True, "fp8_base": True, "blocks_to_swap": "0", "sample_at_first": True})
     messages = [item["message"] for item in validate_training_settings(settings)["errors"]]
     assert any("Torch Compile" in message for message in messages)

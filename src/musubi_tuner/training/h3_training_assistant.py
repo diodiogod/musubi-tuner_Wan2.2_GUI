@@ -1,8 +1,13 @@
-"""Frozen MiniMax-H3 training-assistant and sparse base-preservation helpers.
+"""Frozen MiniMax-H3 adapter and sparse base-preservation helpers.
 
 The assistant mechanism follows Ostris AI Toolkit's live, unmerged training
 adapter design. The published v1 adapter remains active while the user's
 LoRA trains, is disabled for samples, and is never written into user outputs.
+
+Foundation LoRAs use the same live-hook mechanism but have different semantics:
+they are ordinary Musubi H3 LoRAs supplied by the user, stay active for both
+training and previews, and provide the frozen starting behavior on top of which
+the new output LoRA learns.
 """
 
 from __future__ import annotations
@@ -89,6 +94,49 @@ def load_live_assistant(transformer, source: str, device: torch.device, dtype: t
     network.to(device=device, dtype=dtype).requires_grad_(False).eval()
     network.set_enabled(True)
     network.assistant_source = os.fspath(path)
+    return network
+
+
+def load_live_foundation_lora(
+    transformer,
+    source: str,
+    multiplier: float,
+    device: torch.device,
+    dtype: torch.dtype,
+):
+    """Attach a normal Musubi MiniMax-H3 LoRA as a frozen runtime foundation.
+
+    Runtime attachment is intentionally used instead of ``--base_weights`` so
+    the feature also works with pre-quantized ConvRot INT8 bases, whose packed
+    tensors cannot safely accept a destructive LoRA merge.
+    """
+
+    from musubi_tuner.networks import lora_minimax_h3
+
+    path = resolve_assistant_path(source)
+    weights = load_file(str(path), device="cpu")
+    if any(key.startswith("diffusion_model.") for key in weights):
+        weights = convert_ai_toolkit_weights(weights)
+    if not any(key.endswith(".lora_down.weight") for key in weights):
+        raise ValueError("The selected foundation file contains no compatible MiniMax-H3 LoRA weights.")
+
+    network = lora_minimax_h3.create_arch_network_from_weights(
+        float(multiplier),
+        weights,
+        unet=transformer,
+        for_inference=True,
+    )
+    network.apply_to(None, transformer, apply_text_encoder=False, apply_unet=True)
+    info = network.load_state_dict(weights, strict=False)
+    if info.missing_keys or info.unexpected_keys:
+        raise ValueError(
+            "MiniMax-H3 foundation LoRA does not exactly match this model: "
+            f"missing={info.missing_keys[:8]}, unexpected={info.unexpected_keys[:8]}"
+        )
+    network.to(device=device, dtype=dtype).requires_grad_(False).eval()
+    network.set_enabled(True)
+    network.foundation_source = os.fspath(path)
+    network.foundation_multiplier = float(multiplier)
     return network
 
 

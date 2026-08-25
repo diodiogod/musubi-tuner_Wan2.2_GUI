@@ -737,8 +737,19 @@ class MusubiTunerGUI:
         self._add_widget(self.hidden_frames['krea2_model_paths'], "krea2_text_encoder", "Text Encoder (Qwen3-VL-4B):", "Path to the Qwen3-VL-4B-Instruct safetensors file. Required for text re-caching and sample generation during training.", kind='path_entry', options=[("Model files", "*.safetensors *.pt")], is_path=True)
         self._add_widget(self.hidden_frames['krea2_model_paths'], "krea2_turbo_dit", "Turbo DiT (Optional):", "Optional distilled Turbo DiT safetensors path. Used only for sample generation during training to preview Turbo inference behavior.", kind='path_entry', options=[("Model files", "*.safetensors *.pt")], is_path=True)
         self._add_widget(self.hidden_frames['krea2_model_paths'], "krea2_turbo_dit_cache", "Cache Turbo DiT in RAM", "Keeps only the optional Turbo weights in CPU RAM so entering each preview is faster. The RAW training model is safely restored from disk afterward. Uses roughly one extra model's worth of system RAM and is only relevant when Turbo DiT is set.", kind='checkbox')
-        self._add_widget(self.hidden_frames['krea2_model_paths'], "krea2_projector_diff", "Projector Patch (Optional):", "Optional tiny Krea 2 projector diff safetensors patch. Applied to the RAW training base model and also to optional Turbo sample generation so previews stay consistent.", kind='path_entry', options=[("Safetensors", "*.safetensors")], is_path=True)
-        self._add_widget(self.hidden_frames['krea2_model_paths'], "krea2_projector_diff_strength", "Patch Strength:", "Multiplier for the optional projector patch. Example: 2.5", validate_num=True)
+        self._add_widget(
+            self.hidden_frames['krea2_model_paths'], "krea2_projector_diff", "Projector Patch (Optional):",
+            "A small Krea-specific correction patch such as krea2filterbypass3.safetensors. It directly adjusts only "
+            "the model's projector weights before training; it is not a normal LoRA and it does not continue or merge "
+            "your trained LoRA. Leave it blank unless a Krea recipe specifically tells you to use one. The same patch "
+            "is applied to RAW training and optional Turbo previews so they remain consistent.",
+            kind='path_entry', options=[("Safetensors", "*.safetensors")], is_path=True,
+        )
+        self._add_widget(
+            self.hidden_frames['krea2_model_paths'], "krea2_projector_diff_strength", "Patch Strength:",
+            "How strongly to apply the specialized projector correction. Use the value recommended by the patch's "
+            "author; 1.0 is the patch at its original strength. This is not a LoRA strength setting.", validate_num=True,
+        )
 
         # ---- MiniMax H3 experimental image-only paths ----
         self.hidden_frames['minimax_h3_model_paths'] = ttk.LabelFrame(frame, text="MiniMax H3 · Image-only LoRA (Experimental)")
@@ -837,6 +848,29 @@ class MusubiTunerGUI:
             "calculations used while the LoRA learns—the base model remains the ~21 GB ConvRot INT8 checkpoint and the saved "
             "LoRA is unaffected. Choose 'int8' only for advanced experiments; it requires Triton and has not been validated here.",
             kind='combobox', options=["bf16", "int8"],
+        )
+        self._add_widget(
+            self.hidden_frames['minimax_h3_model_paths'], "minimax_h3_foundation_lora_enabled",
+            "Train a New LoRA on Top of an Existing LoRA",
+            "Optional advanced workflow. Your selected existing H3 LoRA stays frozen and active while a separate new "
+            "LoRA learns. Use this to protect a proven broad LoRA while teaching a focused refinement. This is not "
+            "continuation: the existing file is never changed or included in the new output, and the new LoRA may need "
+            "the foundation LoRA during generation.",
+            kind='checkbox', default_val=False, command=self._on_h3_foundation_toggle,
+        )
+        self._h3_foundation_details = ttk.Frame(self.hidden_frames['minimax_h3_model_paths'])
+        self._add_widget(
+            self._h3_foundation_details, "minimax_h3_foundation_lora", "Foundation LoRA:",
+            "Choose the already-trained MiniMax H3 LoRA whose behavior you want to keep. It is attached at runtime, "
+            "kept frozen, remains active in training previews, and is never written into the newly trained LoRA. At "
+            "inference, load both the foundation and the new refinement LoRA at their tested strengths.",
+            kind='path_entry', options=[("Safetensors", "*.safetensors")], is_path=True,
+        )
+        self._add_widget(
+            self._h3_foundation_details, "minimax_h3_foundation_lora_multiplier", "Foundation Strength:",
+            "Fixed strength used for the existing LoRA throughout training and previews. Start with 1.0, or use the "
+            "same strength at which that LoRA already gives reliable results. Generation should reproduce this strength.",
+            validate_num=True,
         )
 
         # VAE shared by both modes — store reference for pack ordering
@@ -2383,8 +2417,18 @@ class MusubiTunerGUI:
         ]
         if settings.get("use_pinned_memory_for_block_swap"):
             command.append("--use_pinned_memory_for_block_swap")
+        foundation = (
+            str(settings.get("minimax_h3_foundation_lora") or "").strip()
+            if settings.get("minimax_h3_foundation_lora_enabled")
+            else ""
+        )
+        if foundation:
+            command.extend([
+                "--network_weights", foundation,
+                "--lora_multiplier", str(settings.get("minimax_h3_foundation_lora_multiplier") or "1.0"),
+            ])
         lora = self._resolve_krea2_preview_lora(settings)
-        if lora:
+        if lora and not (foundation and os.path.normcase(os.path.abspath(lora)) == os.path.normcase(os.path.abspath(foundation))):
             command.extend(["--network_weights", lora, "--lora_multiplier", "1.0"])
         return command
 
@@ -6825,6 +6869,7 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             self.entries["attention_mechanism"].set("sdpa")
             self.entries["mixed_precision"].set("bf16")
             self.entries["minimax_h3_convrot_bwd_mode"].set("bf16")
+            self._on_h3_foundation_toggle()
             self.entries["gradient_checkpointing"].var.set(True)
             self.entries["fp8_base"].var.set(False)
             self.entries["fp8_scaled"].var.set(False)
@@ -7137,6 +7182,12 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
         log_with = self.entries["log_with"].get(); self.entries["logging_dir"].is_required = log_with != "none"
         self.entries["dop_trigger_word"].is_required = dop_active
         self.entries["dop_class_word"].is_required = dop_active
+        foundation_active = bool(
+            is_minimax_h3
+            and self.entries.get("minimax_h3_foundation_lora_enabled")
+            and self.entries["minimax_h3_foundation_lora_enabled"].var.get()
+        )
+        self.entries["minimax_h3_foundation_lora"].is_required = foundation_active
 
         for key, widget in self.entries.items():
             if not isinstance(widget, tk.Widget): continue
@@ -7390,6 +7441,16 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
                 self.entries["recache_text"].var.set(True)
         self._on_h3_quality_controls_changed(mark_custom=False)
 
+    def _on_h3_foundation_toggle(self):
+        try:
+            if self.entries["minimax_h3_foundation_lora_enabled"].var.get():
+                self._h3_foundation_details.pack(fill="x", padx=8, pady=(2, 8))
+            else:
+                self._h3_foundation_details.pack_forget()
+            self.update_button_states()
+        except (AttributeError, KeyError, tk.TclError):
+            pass
+
     def _on_h3_teacher_matching_changed(self):
         try:
             if self.entries["minimax_h3_teacher_matching"].var.get():
@@ -7541,6 +7602,11 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
         optimizer = str(settings.get("optimizer_type") or "").strip()
         if optimizer:
             parts.append(f"opt={optimizer}")
+        if settings.get("minimax_h3_foundation_lora_enabled"):
+            foundation = str(settings.get("minimax_h3_foundation_lora") or "").strip()
+            strength = str(settings.get("minimax_h3_foundation_lora_multiplier") or "1.0").strip()
+            if foundation:
+                parts.append(f"foundation={Path(foundation).name}@{strength}")
 
         if settings.get("dop_enabled"):
             strength = enabled_number("dop_loss_weight")
@@ -7560,7 +7626,7 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             if noise:
                 parts.append(f"weight-noise {noise} {settings.get('krea2_weight_noise_mode') or 'relative'}")
             projector = str(settings.get("krea2_projector_diff") or "").strip()
-            if projector:
+            if projector and str(settings.get("training_mode")) == "Krea 2":
                 strength = str(settings.get("krea2_projector_diff_strength") or "1").strip()
                 parts.append(f"projector={Path(projector).name}@{strength}")
 
@@ -7711,6 +7777,9 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             "minimax_h3_timestep_focus_min": "0.4", "minimax_h3_timestep_focus_max": "0.8",
             "minimax_h3_timestep_focus_prob": "0.5",
             "minimax_h3_training_assistant": "ostris/minimax_h3_training_adapter/minimax_h3_training_adapter_v1.safetensors",
+            "minimax_h3_foundation_lora_enabled": False,
+            "minimax_h3_foundation_lora": "",
+            "minimax_h3_foundation_lora_multiplier": "1.0",
             "minimax_h3_base_preservation_loss_weight": "0.05",
             "minimax_h3_base_preservation_every_n_steps": "10",
             "minimax_h3_base_preservation_enabled": False,
@@ -9035,6 +9104,21 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
                     "MiniMax H3 on a 24 GB card requires block swapping. Choose 1–48 blocks; 30 is the conservative default.",
                 )
                 return
+            if settings.get("minimax_h3_foundation_lora_enabled"):
+                foundation = str(settings.get("minimax_h3_foundation_lora") or "").strip()
+                try:
+                    foundation_strength = float(settings.get("minimax_h3_foundation_lora_multiplier") or "")
+                    if not math.isfinite(foundation_strength):
+                        raise ValueError
+                except (TypeError, ValueError):
+                    messagebox.showerror("Validation Error", "Foundation LoRA Strength must be a finite number.")
+                    return
+                if not foundation or not os.path.isfile(foundation):
+                    messagebox.showerror(
+                        "Validation Error",
+                        "Choose an existing MiniMax H3 .safetensors file for the enabled Foundation LoRA workflow.",
+                    )
+                    return
             h3_protection = minimax_h3_backend.quality_protection_components(settings)
             if multimodal:
                 # Compact-only values remain saved and visible but are deliberately

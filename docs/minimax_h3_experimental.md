@@ -54,6 +54,14 @@ MiniMax H3 VAE posterior sampling is forced to FP32 even though the published ch
 
 The `int8` ConvRot backward option is more experimental and needs working Triton kernels. Keep `bf16` for the validated baseline.
 
+### Frozen foundation LoRA
+
+Both GUIs expose a collapsed **Train a New LoRA on Top of an Existing LoRA** section. When enabled, the selected ordinary MiniMax H3 LoRA is attached to the ConvRot transformer as a frozen runtime adapter before the new trainable LoRA is created. It remains active during training and scheduled previews, but it is absent from the optimizer and is never copied into the new output.
+
+This is useful for modular refinement: keep a proven broad LoRA unchanged, then train a separate focused LoRA against the behavior it already provides. It is not the same as **Continue from LoRA**, which makes the selected adapter itself trainable. The refinement LoRA may depend on the foundation and should normally be generated with both adapters at their training strengths. Keep the original files even if you later make a convenience merge.
+
+Runtime attachment is deliberate. Upstream `--base_weights` provides the same conceptual workflow by destructively merging an adapter into a merge-compatible base, but pre-quantized ConvRot INT8 weights cannot safely accept that merge. The H3-specific `--h3_foundation_lora PATH --h3_foundation_lora_multiplier 1.0` path preserves the upstream semantics without rewriting the packed base. Changing a foundation LoRA does not require rebuilding latent or text caches.
+
 ### Tuning block swap after the first run
 
 Keep `30` swapped blocks for the safest first attempt on a 24 GB card. Once that configuration trains successfully, lowering the value can improve throughput by keeping more transformer blocks on the GPU, at the cost of higher VRAM use and less protection against a large bucket or temporary allocation spike.
