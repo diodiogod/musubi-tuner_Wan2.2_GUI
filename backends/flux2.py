@@ -19,6 +19,15 @@ def _get_version(settings):
     )
 
 
+def reference_condition_value(value):
+    normalized = str(value or "same_item").strip().lower()
+    if normalized.startswith("same training item") or normalized == "same_item":
+        return "same_item"
+    if normalized.startswith("other pictures") or normalized == "subject_ref":
+        return "subject_ref"
+    return normalized
+
+
 def build_commands(settings):
     """Returns a single accelerate launch command for Flux.2 training."""
     cmd = ["accelerate", "launch", "--num_processes", "1", "--num_cpu_threads_per_process", "1",
@@ -40,6 +49,16 @@ def build_commands(settings):
         cmd.append("--fp8_text_encoder")
 
     add_arg(cmd, "--blocks_to_swap", settings.get("blocks_to_swap"))
+
+    if settings.get("flux2_reference_guided"):
+        add_arg(cmd, "--flux2_reference_guided", True)
+        add_arg(cmd, "--flux2_reference_conditions", reference_condition_value(settings.get("flux2_reference_conditions")))
+        add_arg(cmd, "--flux2_reference_sigma_max", settings.get("flux2_reference_sigma_max") or "0.75")
+        add_arg(
+            cmd,
+            "--flux2_reference_direct_loss_weight",
+            settings.get("flux2_reference_direct_loss_weight") or "0.0",
+        )
 
     build_sample_args(cmd, settings)
     if _get_version(settings) != "dev":

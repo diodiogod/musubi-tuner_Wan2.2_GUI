@@ -26,11 +26,12 @@ MINIMAX_H3_DEFAULTS = {
     "minimax_h3_visual_cond_clean": "0.999",
     "minimax_h3_audio_cond_clean": "1.0",
     "minimax_h3_teacher_matching": False,
-    "minimax_h3_teacher_conditions": "ref",
+    "minimax_h3_teacher_conditions": "Same training item (Ostris-style)",
     "minimax_h3_teacher_condition_sigma_max": "0.75",
     "minimax_h3_teacher_loss_dc_weight": "0.3",
     "minimax_h3_teacher_loss_mag_weight": "1.0",
     "minimax_h3_teacher_preservation_weight": "1.0",
+    "minimax_h3_teacher_direct_loss_weight": "0.0",
     "minimax_h3_timestep_focus_min": "0.4",
     "minimax_h3_timestep_focus_max": "0.8",
     "minimax_h3_timestep_focus_prob": "0.5",
@@ -68,6 +69,12 @@ MINIMAX_H3_DEFAULTS = {
 KREA2_DEPTH_DEFAULTS = {
     "krea2_depth_vae_device": "training",
 }
+FLUX2_REFERENCE_DEFAULTS = {
+    "flux2_reference_guided": False,
+    "flux2_reference_conditions": "Same training item (self-reference)",
+    "flux2_reference_sigma_max": "0.75",
+    "flux2_reference_direct_loss_weight": "0.0",
+}
 
 MINIMAX_H3_SHARED_REGULARIZATION_KEYS = {
     "krea2_generalization_preset",
@@ -91,12 +98,13 @@ FIELD_LABELS = {
     "minimax_h3_training_target": "What Should This LoRA Learn?",
     "minimax_h3_allow_experimental_duration": "Allow Clips Outside Official 5–15 Seconds",
     "minimax_h3_audio_loss_weight": "Audio Learning Strength",
-    "minimax_h3_teacher_matching": "Use Upstream Teacher Matching",
+    "minimax_h3_teacher_matching": "Use Reference-Guided Learning",
     "minimax_h3_teacher_conditions": "Teacher Information",
     "minimax_h3_teacher_condition_sigma_max": "Teacher Cutoff Sigma",
     "minimax_h3_teacher_loss_dc_weight": "Teacher Color/Style Weight",
     "minimax_h3_teacher_loss_mag_weight": "Teacher Magnitude Weight",
     "minimax_h3_teacher_preservation_weight": "Teacher Base-Preservation Weight",
+    "minimax_h3_teacher_direct_loss_weight": "Direct Dataset Learning Contribution",
     "minimax_h3_timestep_focus_min": "Teacher Focus Band Start",
     "minimax_h3_timestep_focus_max": "Teacher Focus Band End",
     "minimax_h3_timestep_focus_prob": "Teacher Focus Probability",
@@ -125,6 +133,10 @@ FIELD_LABELS = {
     "minimax_h3_base_preservation_enabled": "Use Drift/Base Preservation",
     "minimax_h3_base_preservation_reference": "Drift Reference",
     "rename_final_artifacts_to_epoch": "Rename Final Save to Epoch Number",
+    "flux2_reference_guided": "Use Reference-Guided Learning",
+    "flux2_reference_conditions": "Teacher Information",
+    "flux2_reference_sigma_max": "Teacher Cutoff Sigma",
+    "flux2_reference_direct_loss_weight": "Direct Dataset Learning Contribution",
 }
 
 SECTION_TITLES = {
@@ -162,7 +174,11 @@ CHOICES = {
     "minimax_h3_training_workflow": ["Still images · compact ConvRot", "Video + audio · official multimodal"],
     "minimax_h3_training_target": ["Video + audio", "Video only", "Audio only (experimental)"],
     "minimax_h3_multimodal_task": ["t2va", "fl2va", "ref2va"],
-    "minimax_h3_teacher_conditions": ["ref", "first,last"],
+    "minimax_h3_teacher_conditions": [
+        "Same training item (Ostris-style)",
+        "Other pictures of subject (Musubi-style)",
+        "First and last video frames (upstream)",
+    ],
     "minimax_h3_text_encoder_attn_mode": ["sdpa", "flash_attention_2", "eager"],
     "minimax_h3_text_cache_dtype": ["bfloat16", "float32"],
     "minimax_h3_depth_vae_device": ["training", "secondary"],
@@ -177,6 +193,10 @@ CHOICES = {
     "minimax_h3_base_preservation_reference": ["Base + assistant", "Base only"],
     "minimax_h3_guidance_distillation_schedule": ["sigma", "constant"],
     "krea2_depth_vae_device": ["training", "secondary"],
+    "flux2_reference_conditions": [
+        "Same training item (self-reference)",
+        "Other pictures of subject (image JSONL)",
+    ],
     "appearance_mode": ["Dark", "Light"],
 }
 
@@ -255,7 +275,7 @@ def load_settings() -> dict[str, Any]:
         payload["minimax_h3_quality_protection_preset"] = (
             "Proven Quality" if legacy.startswith("dynamic") else "Custom"
         )
-    for key, value in (MINIMAX_H3_DEFAULTS | KREA2_DEPTH_DEFAULTS).items():
+    for key, value in (MINIMAX_H3_DEFAULTS | KREA2_DEPTH_DEFAULTS | FLUX2_REFERENCE_DEFAULTS).items():
         payload.setdefault(key, value)
     return payload
 
@@ -297,7 +317,7 @@ def _section_for(key: str) -> str:
         return "optimization"
     if "timestep" in key or key in {"discrete_flow_shift", "preserve_distribution_shape", "train_high_noise", "train_low_noise"}:
         return "timesteps"
-    if key.startswith(("dop_", "krea2_weight_", "krea2_depth_", "krea2_generalization", "krea2_keep_", "minimax_h3_depth_", "minimax_h3_keep_depth_", "minimax_h3_guidance_", "minimax_h3_quality_", "minimax_h3_training_assistant", "minimax_h3_base_preservation_")):
+    if key.startswith(("dop_", "flux2_reference_", "krea2_weight_", "krea2_depth_", "krea2_generalization", "krea2_keep_", "minimax_h3_depth_", "minimax_h3_keep_depth_", "minimax_h3_guidance_", "minimax_h3_quality_", "minimax_h3_training_assistant", "minimax_h3_base_preservation_", "minimax_h3_teacher_")):
         return "regularization"
     if key.startswith(("sample_",)):
         return "sampling"

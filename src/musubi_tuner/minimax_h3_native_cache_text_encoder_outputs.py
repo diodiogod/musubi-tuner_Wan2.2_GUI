@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import logging
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from musubi_tuner.minimax_h3_native.text_encoder import (
     H3Presentation,
     H3TextVisual,
     TEACHER_CONDITIONS_REF,
+    TEACHER_CONDITIONS_SUBJECT_REF,
     TEXT_CACHE_FORMAT,
     build_presentation,
     encode_h3_presentation,
@@ -26,8 +28,11 @@ from musubi_tuner.minimax_h3_native.text_encoder import (
     processor_fingerprint,
     save_h3_uncond_cache,
     wrap_ref_teacher_caption,
+    wrap_subject_reference_caption,
 )
-from musubi_tuner.minimax_h3_native.media import H3AudioSource, H3Record, H3Reference, h3_records_from_datasource
+from musubi_tuner.minimax_h3_native.media import (
+    H3AudioSource, H3Record, H3Reference, h3_records_from_datasource, validate_subject_reference_record,
+)
 from musubi_tuner.minimax_h3_native_cache_latents import (
     PyAVH3MediaDecoder,
     _adapt_canvas,
@@ -47,6 +52,8 @@ logging.basicConfig(level=logging.INFO)
 
 
 def _text_media_paths(record, task: str, teacher_conditions: str | None = None) -> set[Path]:
+    if teacher_conditions == TEACHER_CONDITIONS_SUBJECT_REF:
+        return {reference.path for reference in record.references if reference.type in {"image", "video"}}
     if task == "fl2va" or teacher_conditions:
         # the FL2VA (or teacher) presentation embeds the first/last frames of the target video
         return {record.video_path}
@@ -134,6 +141,18 @@ def _ref_teacher_presentation(record, item: ItemInfo) -> H3Presentation:
     return build_presentation(teacher_record, "ref2va", {reference.path: H3TextVisual(sampled, timestamps)})
 
 
+def _subject_ref_teacher_presentation(
+    record: H3Record,
+    item: ItemInfo,
+    decoder: PyAVH3MediaDecoder,
+    decoded_reference_cache: dict[tuple, torch.Tensor],
+) -> H3Presentation:
+    validate_subject_reference_record(record, f"H3 JSONL line {record.jsonl_line}")
+    caption = record.teacher_caption or wrap_subject_reference_caption(record.caption, len(record.references))
+    visuals = _build_visuals(record, "ref2va", item, decoder, decoded_reference_cache)
+    return build_presentation(replace(record, caption=caption), "ref2va", visuals)
+
+
 def _text_cache_metadata(
     *,
     task: str,
@@ -205,7 +224,8 @@ def setup_parser() -> argparse.ArgumentParser:
         default=None,
         help="also cache a teacher presentation for --h3_teacher_matching training (--task t2va only)."
         " 'first,last' stores the FL2VA presentation with the crop endpoints; 'ref' stores the Ref2VA"
-        " presentation with the training crop itself (video + audio copy declaration) as the reference",
+        " presentation with the training crop itself (video + audio copy declaration) as the reference;"
+        " 'subject_ref' uses the record's explicit JSONL image references (other pictures of the subject)",
     )
     parser.add_argument("--text_cache_dtype", choices=("bf16", "float32"), default="bf16")
     parser.add_argument("--disable_mmap", action="store_true", help="disable memory-mapped safetensors loading")
@@ -248,9 +268,14 @@ def main() -> None:
 
     decoder = PyAVH3MediaDecoder()
     records_by_dir = {}
+    record_task = "ref2va" if teacher_conditions == TEACHER_CONDITIONS_SUBJECT_REF else args.task
     for dataset in datasets:
         validate_h3_dataset(dataset)
-        records_by_dir[dataset_cache_dir_key(dataset.cache_directory)] = h3_records_from_datasource(dataset.datasource, args.task)
+        records_by_dir[dataset_cache_dir_key(dataset.cache_directory)] = h3_records_from_datasource(dataset.datasource, record_task)
+    if teacher_conditions == TEACHER_CONDITIONS_SUBJECT_REF:
+        for records in records_by_dir.values():
+            for record in records:
+                validate_subject_reference_record(record, f"H3 JSONL line {record.jsonl_line}")
 
     all_cache_files, all_cache_paths = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
     text_paths = {
@@ -305,8 +330,9 @@ def main() -> None:
             records = records_by_dir[dataset_cache_dir_key(str(Path(item.text_encoder_output_cache_path).parent))]
             datasource_index, crop_start = item_record_inputs(item)
             record = records[datasource_index]
-            visuals = _build_visuals(record, args.task, item, decoder, decoded_reference_cache)
-            presentation = build_presentation(record, args.task, visuals)
+            student_record = replace(record, references=()) if teacher_conditions == TEACHER_CONDITIONS_SUBJECT_REF else record
+            visuals = _build_visuals(student_record, args.task, item, decoder, decoded_reference_cache)
+            presentation = build_presentation(student_record, args.task, visuals)
             record_media_fingerprints = {path: media_fingerprints[path] for path in _text_media_paths(record, args.task)}
             presentation_identity = presentation_fingerprint(
                 presentation,
@@ -315,7 +341,14 @@ def main() -> None:
             )
             teacher_presentation = None
             teacher_presentation_identity = None
-            if teacher_conditions == TEACHER_CONDITIONS_REF:
+            if teacher_conditions == TEACHER_CONDITIONS_SUBJECT_REF:
+                teacher_presentation = _subject_ref_teacher_presentation(record, item, decoder, decoded_reference_cache)
+                teacher_presentation_identity = presentation_fingerprint(
+                    teacher_presentation,
+                    {path: media_fingerprints[path] for path in _text_media_paths(record, args.task, teacher_conditions)},
+                    frame_count=item.frame_count,
+                )
+            elif teacher_conditions == TEACHER_CONDITIONS_REF:
                 # the student rows stay a plain T2VA presentation; the teacher rows are the
                 # Ref2VA presentation with the training crop itself as the copy-source reference
                 teacher_presentation = _ref_teacher_presentation(record, item)
@@ -324,7 +357,7 @@ def main() -> None:
                 # FL2VA presentation of the same record (first/last frames of the crop window)
                 teacher_visuals = _build_visuals(record, "fl2va", item, decoder, decoded_reference_cache)
                 teacher_presentation = build_presentation(record, "fl2va", teacher_visuals)
-            if teacher_presentation is not None:
+            if teacher_presentation is not None and teacher_presentation_identity is None:
                 teacher_presentation_identity = presentation_fingerprint(
                     teacher_presentation,
                     {record.video_path: media_fingerprints[record.video_path]},
@@ -358,7 +391,10 @@ def main() -> None:
                 teacher_hidden, teacher_tags = encode_h3_presentation(processor, text_encoder, teacher_presentation)
                 teacher_hidden = teacher_hidden.to(_cache_dtype(args.text_cache_dtype))
                 # distinct keys per teacher kind, so the trainer hard-fails on a mode mismatch
-                key_prefix = "varlen_mmh3_teacher_ref" if teacher_conditions == TEACHER_CONDITIONS_REF else "varlen_mmh3_teacher"
+                key_prefix = {
+                    TEACHER_CONDITIONS_REF: "varlen_mmh3_teacher_ref",
+                    TEACHER_CONDITIONS_SUBJECT_REF: "varlen_mmh3_teacher_subject_ref",
+                }.get(teacher_conditions, "varlen_mmh3_teacher")
                 tensors[f"{key_prefix}_hidden_states_{dtype_to_str(teacher_hidden.dtype)}"] = teacher_hidden
                 tensors[f"{key_prefix}_token_tags_int64"] = teacher_tags
                 payload_mib += teacher_hidden.numel() * teacher_hidden.element_size() / (1024**2)

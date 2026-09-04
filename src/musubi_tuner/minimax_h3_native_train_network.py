@@ -49,6 +49,7 @@ from musubi_tuner.minimax_h3_native.sampling import (
 )
 from musubi_tuner.minimax_h3_native.text_encoder import (
     TEACHER_CONDITIONS_REF,
+    TEACHER_CONDITIONS_SUBJECT_REF,
     build_presentation,
     encode_h3_presentation,
     load_h3_processor,
@@ -266,7 +267,10 @@ def _runtime_batch_plan(
     has_fl_condition = "latents_first" in batch or "latents_last" in batch
     has_fl_teacher_text = "mmh3_teacher_hidden_states" in batch or "mmh3_teacher_token_tags" in batch
     has_ref_teacher_text = "mmh3_teacher_ref_hidden_states" in batch or "mmh3_teacher_ref_token_tags" in batch
-    if (has_fl_teacher_text or has_ref_teacher_text) and teacher_conditions is None:
+    has_subject_ref_teacher_text = (
+        "mmh3_teacher_subject_ref_hidden_states" in batch or "mmh3_teacher_subject_ref_token_tags" in batch
+    )
+    if (has_fl_teacher_text or has_ref_teacher_text or has_subject_ref_teacher_text) and teacher_conditions is None:
         raise ValueError(
             "MiniMax-H3 text cache contains teacher rows (--teacher_conditions); pass --h3_teacher_matching"
             " or rebuild the text cache without --teacher_conditions"
@@ -321,6 +325,44 @@ def _runtime_batch_plan(
             target_video=target_geometry,
             target_audio_frames=audio_latents.shape[-1],
             references=(H3ReferenceGeometry("video", video=target_geometry, audio_frames=audio_latents.shape[-1]),),
+        )
+    elif teacher_conditions == TEACHER_CONDITIONS_SUBJECT_REF:
+        if has_fl_condition:
+            raise ValueError("MiniMax-H3 subject-reference teacher does not use FL2VA first/last condition roles")
+        if not reference_roles:
+            raise ValueError(
+                "MiniMax-H3 subject-reference teacher requires Ref2VA latent caches with explicit JSONL references"
+            )
+        if has_fl_teacher_text or has_ref_teacher_text or not has_subject_ref_teacher_text:
+            raise ValueError(
+                "MiniMax-H3 subject-reference teacher requires matching subject_ref text-cache rows"
+            )
+        if set(reference_roles) != set(range(len(reference_roles))):
+            raise ValueError("MiniMax-H3 subject-reference indices must be contiguous from 000")
+        teacher_references = []
+        for index in range(len(reference_roles)):
+            roles = reference_roles[index]
+            image = roles.get("image")
+            if image is None or set(roles) != {"image"}:
+                raise ValueError("MiniMax-H3 subject-reference teacher currently accepts image references only")
+            if image.ndim != 5 or image.shape[1] != 24 or image.shape[0] != batch_size or image.shape[2] != 1:
+                raise ValueError(f"MiniMax-H3 subject reference {index:03d} must be [B,24,1,H,W]")
+            teacher_references.append(H3ReferenceGeometry("image", video=H3VideoGeometry(*image.shape[2:])))
+            teacher_visual_conditions.append(image)
+        task = "t2va"
+        teacher_hidden_states = _stack_single_text_rows(
+            batch.get("mmh3_teacher_subject_ref_hidden_states"), "subject-reference teacher text hidden states"
+        )
+        teacher_token_tags = _stack_single_text_rows(
+            batch.get("mmh3_teacher_subject_ref_token_tags"), "subject-reference teacher text token tags"
+        )
+        _validate_teacher_text_rows(teacher_hidden_states, teacher_token_tags, hidden_states)
+        teacher_layout = build_h3_layout(
+            task="ref2va",
+            text_length=teacher_hidden_states.shape[1],
+            target_video=H3VideoGeometry(*video_latents.shape[2:]),
+            target_audio_frames=audio_latents.shape[-1],
+            references=tuple(teacher_references),
         )
     elif teacher_conditions is not None:
         # the student trains as T2VA; the first/last latents and the Picture-prefixed text rows
@@ -670,11 +712,17 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         guidance_scale = float(args.h3_guidance_loss_scale)
         if guidance_scale < 0.0:
             raise ValueError(f"--h3_guidance_loss_scale must be nonnegative, got {guidance_scale}")
-        for name in ("h3_teacher_loss_dc_weight", "h3_teacher_loss_mag_weight", "h3_teacher_preservation_weight"):
+        for name in (
+            "h3_teacher_loss_dc_weight",
+            "h3_teacher_loss_mag_weight",
+            "h3_teacher_preservation_weight",
+            "h3_teacher_direct_loss_weight",
+        ):
             value = float(getattr(args, name))
             if value < 0.0:
                 raise ValueError(f"--{name} must be nonnegative, got {value}")
-            if value != 1.0 and not getattr(args, "h3_teacher_matching", False):
+            inactive_default = 0.0 if name == "h3_teacher_direct_loss_weight" else 1.0
+            if value != inactive_default and not getattr(args, "h3_teacher_matching", False):
                 raise ValueError(f"--{name} shapes the teacher-matching loss and requires --h3_teacher_matching")
         if getattr(args, "h3_teacher_matching", False):
             if getattr(args, "h3_training_assistant_enabled", False):
@@ -1138,6 +1186,7 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
             metadata["ss_minimax_h3_teacher_loss_mag_weight"] = args.h3_teacher_loss_mag_weight
             metadata["ss_minimax_h3_teacher_loss_dc_weight"] = args.h3_teacher_loss_dc_weight
             metadata["ss_minimax_h3_teacher_preservation_weight"] = args.h3_teacher_preservation_weight
+            metadata["ss_minimax_h3_teacher_direct_loss_weight"] = getattr(args, "h3_teacher_direct_loss_weight", 0.0)
         if getattr(args, "h3_training_assistant_enabled", False):
             metadata["ss_minimax_h3_training_assistant_enabled"] = True
             metadata["ss_minimax_h3_training_assistant"] = str(args.h3_training_assistant)
@@ -1235,6 +1284,10 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
 
         video_target = latents - noise
         audio_target = audio_latents - audio_noise
+        # Keep the mathematically exact flow targets available when an experimental
+        # reference teacher is mixed with direct dataset supervision.
+        direct_video_target = video_target
+        direct_audio_target = audio_target
         guidance_log: dict[str, torch.Tensor] = {}
         if self._guidance_uncond is not None:
             # the uncond forward runs before the grad forward so the block-swap offloader
@@ -1313,6 +1366,8 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
                 "audio_target": audio_target,
                 "audio_loss_weight": audio_loss_weight,
                 "guidance_log": guidance_log,
+                "direct_video_target": direct_video_target,
+                "direct_audio_target": direct_audio_target,
             },
         )
 
@@ -1641,6 +1696,25 @@ class MiniMaxH3NetworkTrainer(NetworkTrainer):
         video_weight = 0.0 if args.audio_only else 1.0
         logs["loss/video_weight"] = video_loss.detach().new_tensor(video_weight)
         total_loss = video_weight * video_loss + weight * audio_loss
+        direct_strength = float(getattr(args, "h3_teacher_direct_loss_weight", 0.0))
+        if teacher_matching and conditioned and direct_strength > 0.0:
+            direct_video = torch.nn.functional.mse_loss(
+                output.pred.float(), output.extra["direct_video_target"].float(), reduction="mean"
+            )
+            if weight == 0.0:
+                direct_audio = direct_video.detach().new_zeros(())
+            else:
+                direct_audio = torch.nn.functional.mse_loss(
+                    output.extra["audio_pred"].float(), output.extra["direct_audio_target"].float(), reduction="mean"
+                )
+            direct_total = video_weight * direct_video + weight * direct_audio
+            # Match Ostris's later "bleed" update: normalize the ordinary target to
+            # the teacher loss magnitude, then apply the user's contribution.
+            scale = total_loss.detach() / direct_total.detach().clamp(min=1e-8)
+            total_loss = total_loss + direct_total * scale * direct_strength
+            logs["loss/teacher"] = (video_weight * video_loss + weight * audio_loss).detach()
+            logs["loss/direct"] = direct_total.detach()
+            logs["loss/direct_scaled"] = (direct_total * scale * direct_strength).detach()
         if teacher_matching and not conditioned:
             # preservation-anchor step: user weight on top of the automatic focus compensation,
             # so raising the timestep focus does not silently weaken the drift protection.
@@ -1820,6 +1894,14 @@ def minimax_h3_setup_parser(parser: argparse.ArgumentParser) -> argparse.Argumen
         " --h3_teacher_condition_sigma_max), applied on top of an automatic correction that keeps the anchor's"
         " expected gradient share invariant under --h3_timestep_focus_prob. Raise it if the anchor-band drift"
         " (teacher/*_residual_dc_rms on unconditioned steps) keeps growing",
+    )
+    parser.add_argument(
+        "--h3_teacher_direct_loss_weight",
+        type=float,
+        default=0.0,
+        help="reference teacher only: also learn from the exact ordinary dataset flow target. The direct loss is"
+        " normalized to the teacher-loss magnitude before this weight is applied (0 = teacher only; 1 = an"
+        " equal-magnitude direct contribution). Inspired by Ostris AI Toolkit's D-OPSD bleed term.",
     )
     parser.add_argument(
         "--h3_timestep_focus_min",

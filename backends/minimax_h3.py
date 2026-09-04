@@ -9,6 +9,18 @@ DEFAULT_H3_TRAINING_ASSISTANT = (
 )
 
 
+def teacher_condition_value(value):
+    """Map friendly GUI labels and legacy saved values to the trainer contract."""
+    normalized = str(value or "ref").strip().lower()
+    if normalized.startswith("same training item") or normalized == "ref":
+        return "ref"
+    if normalized.startswith("other pictures") or normalized == "subject_ref":
+        return "subject_ref"
+    if normalized.startswith("first and last") or normalized == "first,last":
+        return "first,last"
+    return normalized
+
+
 def quality_protection_method(settings):
     """Return the CLI value while accepting old saved boolean recipes."""
     value = str(settings.get("minimax_h3_quality_protection_method") or "").strip().lower()
@@ -108,8 +120,14 @@ def build_commands(settings):
     add_arg(cmd, "--use_pinned_memory_for_block_swap", settings.get("use_pinned_memory_for_block_swap"))
     add_arg(cmd, "--convrot_bwd_mode", settings.get("minimax_h3_convrot_bwd_mode") or "bf16")
     protection = quality_protection_components(settings)
-    add_arg(cmd, "--h3_training_assistant_enabled", protection["assistant"])
-    add_arg(cmd, "--h3_guidance_distillation_protection", protection["dynamic"])
+    teacher_matching = bool(settings.get("minimax_h3_teacher_matching"))
+    if teacher_matching:
+        add_arg(cmd, "--h3_teacher_matching", True)
+        add_arg(cmd, "--h3_teacher_conditions", teacher_condition_value(settings.get("minimax_h3_teacher_conditions")))
+        add_arg(cmd, "--h3_teacher_condition_sigma_max", settings.get("minimax_h3_teacher_condition_sigma_max") or "0.75")
+        add_arg(cmd, "--h3_teacher_direct_loss_weight", settings.get("minimax_h3_teacher_direct_loss_weight") or "0.0")
+    add_arg(cmd, "--h3_training_assistant_enabled", protection["assistant"] and not teacher_matching)
+    add_arg(cmd, "--h3_guidance_distillation_protection", protection["dynamic"] and not teacher_matching)
     add_arg(cmd, "--h3_dynamic_sigma_every_n_steps", settings.get("minimax_h3_dynamic_sigma_every_n_steps") or "1")
     add_arg(cmd, "--h3_guidance_distillation_scale", settings.get("minimax_h3_guidance_distillation_scale") or "4.0")
     add_arg(cmd, "--h3_guidance_distillation_schedule", settings.get("minimax_h3_guidance_distillation_schedule") or "sigma")
@@ -201,11 +219,12 @@ def _build_multimodal_commands(settings):
     protection = quality_protection_components(settings)
     if teacher_matching:
         add_arg(cmd, "--h3_teacher_matching", True)
-        add_arg(cmd, "--h3_teacher_conditions", settings.get("minimax_h3_teacher_conditions") or "ref")
+        add_arg(cmd, "--h3_teacher_conditions", teacher_condition_value(settings.get("minimax_h3_teacher_conditions")))
         add_arg(cmd, "--h3_teacher_condition_sigma_max", settings.get("minimax_h3_teacher_condition_sigma_max") or "0.75")
         add_arg(cmd, "--h3_teacher_loss_dc_weight", settings.get("minimax_h3_teacher_loss_dc_weight") or "0.3")
         add_arg(cmd, "--h3_teacher_loss_mag_weight", settings.get("minimax_h3_teacher_loss_mag_weight") or "1.0")
         add_arg(cmd, "--h3_teacher_preservation_weight", settings.get("minimax_h3_teacher_preservation_weight") or "1.0")
+        add_arg(cmd, "--h3_teacher_direct_loss_weight", settings.get("minimax_h3_teacher_direct_loss_weight") or "0.0")
         add_arg(cmd, "--h3_timestep_focus_min", settings.get("minimax_h3_timestep_focus_min") or "0.4")
         add_arg(cmd, "--h3_timestep_focus_max", settings.get("minimax_h3_timestep_focus_max") or "0.8")
         add_arg(cmd, "--h3_timestep_focus_prob", settings.get("minimax_h3_timestep_focus_prob") or "0.5")
@@ -245,8 +264,7 @@ def build_cache_commands(settings, python_executable):
         return _build_multimodal_cache_commands(settings, python_executable)
     commands = []
     if settings.get("recache_latents"):
-        commands.append(
-            [
+        latent_command = [
                 python_executable,
                 "src/musubi_tuner/minimax_h3_image_cache_latents.py",
                 "--dataset_config",
@@ -256,7 +274,11 @@ def build_cache_commands(settings, python_executable):
                 "--vae_dtype",
                 "float32",
             ]
-        )
+        if settings.get("minimax_h3_teacher_matching") and teacher_condition_value(
+            settings.get("minimax_h3_teacher_conditions")
+        ) == "subject_ref":
+            add_arg(latent_command, "--teacher_conditions", "subject_ref")
+        commands.append(latent_command)
     if settings.get("recache_text"):
         command = [
             python_executable,
@@ -273,6 +295,8 @@ def build_cache_commands(settings, python_executable):
         add_arg(command, "--text_encoder_blocks_to_swap", setting_or_default(settings, "minimax_h3_text_encoder_blocks_to_swap", "50"))
         add_arg(command, "--cache_dtype", settings.get("minimax_h3_text_cache_dtype") or "bfloat16")
         add_arg(command, "--cache_h3_unconditional", quality_protection_components(settings)["dynamic"])
+        if settings.get("minimax_h3_teacher_matching"):
+            add_arg(command, "--teacher_conditions", teacher_condition_value(settings.get("minimax_h3_teacher_conditions")))
         build_dop_cache_args(command, settings)
         commands.append(command)
     return commands
@@ -282,8 +306,13 @@ def _build_multimodal_cache_commands(settings, python_executable):
     commands = []
     task = settings.get("minimax_h3_multimodal_task") or "t2va"
     teacher_matching = bool(settings.get("minimax_h3_teacher_matching"))
-    teacher_conditions = settings.get("minimax_h3_teacher_conditions") or "ref"
-    latent_task = "fl2va" if teacher_matching and teacher_conditions == "first,last" else task
+    teacher_conditions = teacher_condition_value(settings.get("minimax_h3_teacher_conditions"))
+    if teacher_matching and teacher_conditions == "first,last":
+        latent_task = "fl2va"
+    elif teacher_matching and teacher_conditions == "subject_ref":
+        latent_task = "ref2va"
+    else:
+        latent_task = task
     if settings.get("recache_latents"):
         commands.append([
             python_executable, "src/musubi_tuner/minimax_h3_native_cache_latents.py",

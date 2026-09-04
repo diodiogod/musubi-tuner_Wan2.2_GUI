@@ -57,6 +57,19 @@ class Flux2NetworkTrainer(NetworkTrainer):
                 args.dop_class_word,
                 args.dop_loss_weight,
             )
+        if getattr(args, "flux2_reference_guided", False):
+            if args.model_version == "dev":
+                raise ValueError("Reference-guided learning currently supports FLUX.2 Klein, not FLUX.2 Dev")
+            if not 0.0 <= args.flux2_reference_sigma_max <= 1.0:
+                raise ValueError("FLUX.2 reference cutoff sigma must be between 0 and 1")
+            if args.flux2_reference_direct_loss_weight < 0:
+                raise ValueError("FLUX.2 direct dataset contribution must be non-negative")
+            logger.info(
+                "FLUX.2 Klein reference-guided learning enabled: conditions=%s, cutoff=%g, direct=%g",
+                args.flux2_reference_conditions,
+                args.flux2_reference_sigma_max,
+                args.flux2_reference_direct_loss_weight,
+            )
 
     def process_sample_prompts(self, args: argparse.Namespace, accelerator: Accelerator, sample_prompts: str):
         device = accelerator.device
@@ -363,18 +376,75 @@ class Flux2NetworkTrainer(NetworkTrainer):
         noisy_input, timesteps = self.get_noisy_model_input_and_timesteps(
             args, noise, latents, batch["timesteps"], noise_scheduler, accelerator.device, dit_dtype
         )
-        output = self.call_dit(
-            args, accelerator, transformer, latents, batch, noise, noisy_input, timesteps, network_dtype
+        teacher_prediction = None
+        teacher_conditioned = False
+        ordinary_target = noise.to(accelerator.device, dtype=network_dtype) - latents.to(
+            accelerator.device, dtype=network_dtype
         )
+        student_batch = batch
+        if getattr(args, "flux2_reference_guided", False):
+            student_batch = {
+                key: value for key, value in batch.items() if not key.startswith("latents_control_")
+            }
+            sigma = float((timesteps.float() / 1000.0).reshape(-1)[0].item())
+            teacher_conditioned = sigma <= args.flux2_reference_sigma_max
+            teacher_batch = dict(student_batch)
+            if teacher_conditioned:
+                if args.flux2_reference_conditions == "same_item":
+                    teacher_batch["latents_control_0"] = latents
+                else:
+                    references = sorted(
+                        (key, value) for key, value in batch.items() if key.startswith("latents_control_")
+                    )
+                    if not references:
+                        raise ValueError(
+                            "FLUX.2 other-picture teacher requires control_path/control_path_N images in the image dataset"
+                        )
+                    teacher_batch.update(references)
+            base_network = accelerator.unwrap_model(network)
+            if not hasattr(base_network, "set_enabled"):
+                raise RuntimeError("FLUX.2 reference-guided learning requires a LoRA network with set_enabled")
+            # Run the frozen teacher before the gradient-bearing student so its temporary
+            # image-reference tokens never coexist with the student's autograd graph.
+            base_network.set_enabled(False)
+            try:
+                with torch.no_grad():
+                    teacher_prediction = self.call_dit(
+                        args, accelerator, transformer, latents, teacher_batch, noise,
+                        noisy_input, timesteps, network_dtype,
+                    ).pred.detach()
+            finally:
+                base_network.set_enabled(True)
+        output = self.call_dit(
+            args, accelerator, transformer, latents, student_batch, noise, noisy_input, timesteps, network_dtype
+        )
+        if teacher_prediction is not None:
+            output.target = teacher_prediction.to(output.pred.dtype)
         normal_loss, metrics = self.compute_loss(
             args, output, timesteps, noise_scheduler, dit_dtype, network_dtype, global_step
         )
         if dop_enabled(args):
             metrics["loss/diffusion"] = normal_loss.detach()
+        total_loss = normal_loss
+        if teacher_prediction is not None:
+            metrics["teacher/conditioned"] = torch.tensor(
+                1.0 if teacher_conditioned else 0.0, device=output.pred.device
+            )
+            metrics["teacher/flow_gap_rms"] = (
+                teacher_prediction.float() - ordinary_target.float()
+            ).pow(2).mean().sqrt().detach()
+            direct_strength = float(args.flux2_reference_direct_loss_weight)
+            if teacher_conditioned and direct_strength > 0.0:
+                direct_loss = torch.nn.functional.mse_loss(output.pred.float(), ordinary_target.float())
+                direct_scaled = direct_loss * normal_loss.detach() / direct_loss.detach().clamp_min(1e-12)
+                total_loss = total_loss + direct_strength * direct_scaled
+                metrics["loss/teacher"] = normal_loss.detach()
+                metrics["loss/direct"] = direct_loss.detach()
+                metrics["loss/direct_scaled"] = direct_scaled.detach()
         self._dop_step_context = (
-            batch, latents, noise, noisy_input, timesteps, network_dtype
+            student_batch, latents, noise, noisy_input, timesteps, network_dtype
         ) if dop_enabled(args) else None
-        return normal_loss, metrics
+        return total_loss, metrics
 
     def compute_auxiliary_loss(self, args, accelerator, transformer, network):
         context = getattr(self, "_dop_step_context", None)
@@ -395,6 +465,12 @@ class Flux2NetworkTrainer(NetworkTrainer):
             "ss_dop_trigger_word": args.dop_trigger_word if dop_enabled(args) else "",
             "ss_dop_class_word": args.dop_class_word if dop_enabled(args) else "",
             "ss_dop_reference": "https://github.com/ostris/ai-toolkit" if dop_enabled(args) else "",
+            "ss_flux2_reference_guided": getattr(args, "flux2_reference_guided", False),
+            "ss_flux2_reference_conditions": getattr(args, "flux2_reference_conditions", "same_item"),
+            "ss_flux2_reference_sigma_max": getattr(args, "flux2_reference_sigma_max", 0.75),
+            "ss_flux2_reference_direct_loss_weight": getattr(
+                args, "flux2_reference_direct_loss_weight", 0.0
+            ),
         }
 
     # endregion model specific
@@ -405,6 +481,13 @@ def flux2_setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     parser.add_argument("--fp8_scaled", action="store_true", help="use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う")
     parser.add_argument("--text_encoder", type=str, default=None, help="text encoder checkpoint path")
     parser.add_argument("--fp8_text_encoder", action="store_true", help="use fp8 for Text Encoder model")
+    reference = parser.add_argument_group("FLUX.2 Klein reference-guided learning (experimental)")
+    reference.add_argument("--flux2_reference_guided", action="store_true")
+    reference.add_argument(
+        "--flux2_reference_conditions", choices=("same_item", "subject_ref"), default="same_item"
+    )
+    reference.add_argument("--flux2_reference_sigma_max", type=float, default=0.75)
+    reference.add_argument("--flux2_reference_direct_loss_weight", type=float, default=0.0)
     flux2_utils.add_model_version_args(parser)
     return parser
 

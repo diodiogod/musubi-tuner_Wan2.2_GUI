@@ -219,3 +219,44 @@ not contain the GUI files.
 - Keep old method-selector recipes migrated by `backends/minimax_h3.py`; new recipes
   pass independent component flags and editable cadence values.
   Tests: `tests/test_h3_training_assistant.py`, `tests/test_minimax_h3_backend.py`.
+
+### MiniMax H3 reference-guided teacher training
+
+- Native video support selectively adapts the teacher-cache/conditioning design from
+  Musubi draft PRs `#1085`/`#1086`; do not merge their stacked branches wholesale.
+- `ref` gives a frozen Ref2VA teacher the exact target item (the practical Ostris
+  AI Toolkit experiment). `subject_ref` gives it explicit other pictures of the
+  subject. The T2VA/caption-only student never receives those references.
+- Compact ConvRot still-image training retains `forward_image` for the student. Its
+  teacher-only bridge repeats the noisy still to H3's minimum two latent frames,
+  runs the packed Ref2VA forward, and uses the first teacher prediction.
+- Compact `subject_ref` deliberately reuses existing image-JSONL
+  `control_path`/`control_path_N` images as teacher references. H3 compact has no
+  pre-existing control-training meaning, so this avoids a second manifest format.
+- Visual teacher rows require the full visual-capable Qwen path during text-cache
+  rebuilding. Normal caption-only caching keeps the faster compact text-only path.
+- Optional direct-data contribution follows Ostris's “bleed” concept but normalizes
+  the ordinary loss to the teacher-loss magnitude before applying its user weight.
+- These modes are off-policy reference teachers. They must not be described as the
+  paper-faithful D-OPSD algorithm, whose official implementation uses a complete
+  4/8-step student trajectory and a separate EMA teacher adapter.
+- Disabled invariant: without `--h3_teacher_matching`, existing caches, forwards,
+  targets, memory use, and training behavior are unchanged.
+- Tests: `tests/test_minimax_h3_native_teacher_matching.py`,
+  `tests/test_minimax_h3_image_training.py`, and `tests/test_minimax_h3_backend.py`.
+
+### FLUX.2 Klein reference-guided teacher training
+
+- `flux_2_train_network.py` reuses Klein's existing image-conditioning tokens for
+  an optional frozen-base teacher pass. The student batch always removes those
+  tokens, so the resulting LoRA remains caption-only at inference.
+- `same_item` feeds the cached target latent back as the teacher reference.
+  `subject_ref` reuses existing image-JSONL `control_path`/`control_path_N`
+  latents, so it needs no new cache or dataset format.
+- Above the configurable sigma cutoff, the teacher drops its reference and acts
+  as a frozen-base preservation target. An optional magnitude-normalized direct
+  dataset contribution matches the H3 experimental control.
+- This is the cheaper off-policy adaptation demonstrated conceptually by Ostris,
+  not the official D-OPSD repository's 4/8-step trajectory with an EMA teacher.
+- FLUX.2 Dev rejects the option. Disabled mode preserves upstream Flux.2 behavior.
+- Tests: `tests/test_dop.py` and backend/Modern UI validation tests.

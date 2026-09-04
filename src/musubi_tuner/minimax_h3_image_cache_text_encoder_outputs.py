@@ -15,6 +15,15 @@ from musubi_tuner.dataset.cache_io import save_text_encoder_output_cache_minimax
 from musubi_tuner.dataset.config_utils import BlueprintGenerator, ConfigSanitizer
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
 from musubi_tuner.minimax_h3.image_text_encoder import DEFAULT_PROCESSOR_ID, load_minimax_h3_te
+from musubi_tuner.minimax_h3_native.text_encoder import (
+    H3Presentation,
+    IMAGE_PLACEHOLDER,
+    encode_h3_presentation,
+    load_h3_processor,
+    load_h3_text_encoder,
+    wrap_ref_teacher_caption,
+    wrap_subject_reference_caption,
+)
 from musubi_tuner.training.dop import (
     add_cache_arguments,
     dop_signature,
@@ -27,12 +36,26 @@ from musubi_tuner.training.dop import (
 logger = logging.getLogger(__name__)
 
 
+class _NativeTextAdapter:
+    """Expose the compact encoder's tiny ``encode`` contract over the full visual tower."""
+
+    def __init__(self, processor, encoder) -> None:
+        self.processor = processor
+        self.encoder = encoder
+
+    def encode(self, text: str):
+        presentation = H3Presentation(text=text, processor_text=text)
+        hidden_states, _ = encode_h3_presentation(self.processor, self.encoder, presentation)
+        return (hidden_states,)
+
+
 def is_valid_minimax_h3_text_cache(
     item: ItemInfo,
     dop_trigger_word: str = "",
     dop_class_word: str = "",
     cache_dtype: str = "float32",
     require_unconditional: bool = False,
+    require_teacher: bool = False,
 ) -> bool:
     """Accept caption-matching caches produced by the corrected Comfy-style tower."""
     path = str(getattr(item, "text_encoder_output_cache_path", "") or "")
@@ -48,6 +71,11 @@ def is_valid_minimax_h3_text_cache(
                 return False
             if require_unconditional and f"varlen_mmh3_unconditional_hidden_states_{cache_dtype}" not in keys:
                 return False
+            if require_teacher:
+                if f"varlen_mmh3_teacher_ref_hidden_states_{cache_dtype}" not in keys:
+                    return False
+                if "varlen_mmh3_teacher_ref_token_tags_int64" not in keys:
+                    return False
     except (OSError, RuntimeError, ValueError):
         return False
     if dop_trigger_word or dop_class_word:
@@ -67,6 +95,9 @@ def encode_and_save_batch(
     dop_class_word: str = "",
     cache_dtype: torch.dtype = torch.bfloat16,
     unconditional_hidden_states: torch.Tensor | None = None,
+    teacher_encoder=None,
+    teacher_processor=None,
+    teacher_conditions: str | None = None,
 ) -> None:
     use_dop = bool(dop_trigger_word or dop_class_word)
     signature = None
@@ -76,6 +107,39 @@ def encode_and_save_batch(
     for item in batch:
         logger.info("Encoding MiniMax-H3 caption for %s", item.item_key)
         hidden_states = encoder.encode(item.caption)[0].to(dtype=cache_dtype)
+        teacher_hidden_states = teacher_token_tags = None
+        if teacher_encoder is not None:
+            if teacher_conditions == "subject_ref":
+                if not item.control_content:
+                    raise ValueError(
+                        "Other-subject reference learning requires control_path/control_path_N images in an image JSONL dataset"
+                    )
+                images = tuple(torch.as_tensor(reference)[..., :3] for reference in item.control_content)
+                wrapped = wrap_subject_reference_caption(item.caption, len(images))
+            else:
+                frames = torch.as_tensor(item.content)
+                if frames.ndim == 3:
+                    frames = frames.unsqueeze(0)
+                if frames.ndim != 4 or frames.shape[0] != 1:
+                    raise ValueError(
+                        f"Compact H3 reference-guided caching requires one decoded image [1,H,W,C], got {tuple(frames.shape)}"
+                    )
+                images = (frames[0],)
+                wrapped = wrap_ref_teacher_caption(item.caption)
+            prefix = "".join(
+                f"<Picture {index}>: {IMAGE_PLACEHOLDER}" for index in range(1, len(images) + 1)
+            )
+            presentation_text = prefix + wrapped
+            teacher_hidden_states, teacher_token_tags = encode_h3_presentation(
+                teacher_processor,
+                teacher_encoder,
+                H3Presentation(
+                    text=presentation_text,
+                    images=images,
+                    processor_text=presentation_text,
+                ),
+            )
+            teacher_hidden_states = teacher_hidden_states.to(dtype=cache_dtype)
         dop_hidden_states = None
         if use_dop:
             try:
@@ -90,6 +154,8 @@ def encode_and_save_batch(
             dop_hidden_states,
             signature,
             unconditional_hidden_states,
+            teacher_hidden_states,
+            teacher_token_tags,
         )
 
 
@@ -134,6 +200,15 @@ def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         action="store_true",
         help="Also cache the empty-prompt state required by H3 guidance-distillation protection",
     )
+    parser.add_argument(
+        "--teacher_conditions",
+        choices=("ref", "subject_ref"),
+        default=None,
+        help=(
+            "Cache a visual teacher presentation for experimental compact reference-guided learning. "
+            "'ref' lets the frozen teacher see the same training image; ordinary caption-only caching stays unchanged."
+        ),
+    )
     return parser
 
 
@@ -152,37 +227,57 @@ def main() -> None:
     datasets = group.datasets
     all_cache_files, all_cache_paths = cache_text_encoder_outputs.prepare_cache_files_and_paths(datasets)
 
-    logger.info("Loading MiniMax-H3 Qwen3-VL-32B text encoder from %s", args.text_encoder)
-    encoder = load_minimax_h3_te(
-        args.text_encoder,
-        device=device,
-        compute_dtype=torch.float32,
-        quantize=True,
-        tokenizer_dir=args.tokenizer,
-        load_mode=args.text_encoder_load_mode,
-        blocks_to_swap=args.text_encoder_blocks_to_swap,
-    )
+    teacher_encoder = teacher_processor = None
+    if args.teacher_conditions:
+        logger.info("Loading visual-capable MiniMax-H3 Qwen3-VL teacher encoder from %s", args.text_encoder)
+        teacher_processor = load_h3_processor()
+        teacher_encoder = load_h3_text_encoder(
+            args.text_encoder,
+            device=device,
+            dtype=torch.bfloat16,
+            blocks_to_swap=args.text_encoder_blocks_to_swap,
+        )
+        encoder = None
+    else:
+        logger.info("Loading MiniMax-H3 Qwen3-VL-32B text encoder from %s", args.text_encoder)
+        encoder = load_minimax_h3_te(
+            args.text_encoder,
+            device=device,
+            compute_dtype=torch.float32,
+            quantize=True,
+            tokenizer_dir=args.tokenizer,
+            load_mode=args.text_encoder_load_mode,
+            blocks_to_swap=args.text_encoder_blocks_to_swap,
+        )
 
     cache_dtype = torch.bfloat16 if args.cache_dtype == "bfloat16" else torch.float32
     unconditional_hidden_states = None
     if args.cache_h3_unconditional:
         logger.info("Encoding MiniMax-H3 empty prompt for guidance-distillation protection")
-        unconditional_hidden_states = encoder.encode("")[0].to(dtype=cache_dtype)
+        if encoder is None:
+            empty = H3Presentation(text="", processor_text="")
+            unconditional_hidden_states = encode_h3_presentation(teacher_processor, teacher_encoder, empty)[0].to(dtype=cache_dtype)
+        else:
+            unconditional_hidden_states = encoder.encode("")[0].to(dtype=cache_dtype)
 
     def encode(batch: list[ItemInfo]):
         encode_and_save_batch(
-            encoder,
+            encoder if encoder is not None else _NativeTextAdapter(teacher_processor, teacher_encoder),
             batch,
             args.dop_trigger_word,
             args.dop_class_word,
             cache_dtype,
             unconditional_hidden_states,
+            teacher_encoder,
+            teacher_processor,
+            args.teacher_conditions,
         )
 
     # Precision is part of the cache contract so changing the UI option rebuilds only
     # caption caches while keeping image latents untouched.
     cache_validator = lambda item: is_valid_minimax_h3_text_cache(
-        item, args.dop_trigger_word, args.dop_class_word, args.cache_dtype, args.cache_h3_unconditional
+        item, args.dop_trigger_word, args.dop_class_word, args.cache_dtype, args.cache_h3_unconditional,
+        bool(args.teacher_conditions),
     )
 
     cache_text_encoder_outputs.process_text_encoder_batches(
@@ -193,9 +288,10 @@ def main() -> None:
         all_cache_files,
         all_cache_paths,
         encode,
+        requires_content=bool(args.teacher_conditions),
         cache_validator=cache_validator,
     )
-    del encoder
+    del encoder, teacher_encoder
     cache_text_encoder_outputs.post_process_cache_files(datasets, all_cache_files, all_cache_paths, args.keep_cache)
 
 

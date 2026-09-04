@@ -75,6 +75,10 @@ Docs: [docs/wan.md](./docs/wan.md)
 - Qwen3 or Mistral3 text encoder input
 - FP8 text encoder option
 - Experimental DOP class preservation for Klein 4B/9B
+- Experimental reference-guided Klein training: a frozen teacher can see either
+  the training image itself or separate `control_path` images while the LoRA
+  student learns caption-only behavior. This is the practical one-extra-pass
+  method, not the much heavier multi-step EMA D-OPSD paper implementation.
 
 Docs: [docs/flux_2.md](./docs/flux_2.md)
 

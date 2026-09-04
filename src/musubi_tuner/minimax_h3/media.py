@@ -42,6 +42,18 @@ class H3Record:
     target_audio: H3AudioSource
     references: tuple[H3Reference, ...]
     jsonl_line: int
+    teacher_caption: Optional[str] = None
+
+
+def validate_subject_reference_record(record: H3Record, context: str) -> None:
+    if not record.references:
+        raise ValueError(f"{context}: subject-reference teaching requires at least one image reference")
+    unsupported = [reference.type for reference in record.references if reference.type != "image"]
+    if unsupported:
+        raise ValueError(
+            f"{context}: subject-reference teaching currently supports image references only "
+            f"(got {unsupported[0]!r})"
+        )
 
 
 def _validate_frame_count(frame_count: int) -> None:
@@ -274,6 +286,9 @@ def load_h3_jsonl_records(
             caption = data.get("caption")
             if not isinstance(caption, str):
                 raise ValueError(f"H3 JSONL line {line_number}: caption must be a string")
+            teacher_caption = data.get("teacher_caption")
+            if teacher_caption is not None and (not isinstance(teacher_caption, str) or not teacher_caption.strip()):
+                raise ValueError(f"H3 JSONL line {line_number}: teacher_caption must be a non-empty string when present")
             target_audio = _resolve_target_audio(data, video_path, base_directory, line_number, probe)
 
             raw_references = data.get("references", [])
@@ -291,6 +306,7 @@ def load_h3_jsonl_records(
                     target_audio=target_audio,
                     references=references,
                     jsonl_line=line_number,
+                    teacher_caption=teacher_caption,
                 )
             )
 

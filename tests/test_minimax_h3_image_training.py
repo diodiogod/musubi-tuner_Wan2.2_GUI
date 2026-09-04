@@ -317,6 +317,19 @@ def test_image_cache_contract_uses_shared_dataset_keys(tmp_path):
     assert torch.equal(text_state["varlen_mmh3_token_tags_int64"], torch.ones(3, dtype=torch.int64))
 
 
+def test_image_cache_can_store_explicit_subject_reference_latents(tmp_path):
+    item = ItemInfo("item", "caption", (32, 32), (32, 32))
+    item.latent_cache_path = str(tmp_path / "item_0032x0032_mmh3.safetensors")
+    target = torch.zeros(24, 1, 2, 2, dtype=torch.float32)
+    reference = torch.ones(24, 1, 3, 4, dtype=torch.float32)
+
+    save_latent_cache_minimax_h3_image(item, target, [reference])
+
+    state = load_file(item.latent_cache_path)
+    assert "latents_ref_000_image_1x3x4_float32" in state
+    torch.testing.assert_close(state["latents_ref_000_image_1x3x4_float32"], reference)
+
+
 def test_h3_text_cache_validator_accepts_requested_storage_precision(tmp_path):
     item = ItemInfo("item", "caption", (32, 32), (32, 32))
     item.text_encoder_output_cache_path = str(tmp_path / "item_mmh3_te.safetensors")
@@ -345,6 +358,92 @@ def test_h3_text_cache_validator_requires_empty_prompt_when_quality_protection_i
     assert is_valid_minimax_h3_text_cache(item, cache_dtype="bfloat16", require_unconditional=True)
     state = load_file(item.text_encoder_output_cache_path)
     assert state["varlen_mmh3_unconditional_hidden_states_bfloat16"].shape == (2, 5120)
+
+
+def test_h3_compact_text_cache_stores_visual_teacher_rows(tmp_path):
+    item = ItemInfo("item", "caption", (32, 32), (32, 32))
+    item.text_encoder_output_cache_path = str(tmp_path / "item_mmh3_te.safetensors")
+    caption = torch.zeros(3, 5120, dtype=torch.bfloat16)
+    teacher = torch.ones(5, 5120, dtype=torch.bfloat16)
+    tags = torch.tensor([1, 0, 0, 0, 1], dtype=torch.int64)
+
+    save_text_encoder_output_cache_minimax_h3_image(
+        item, caption, teacher_hidden_states=teacher, teacher_token_tags=tags
+    )
+
+    assert is_valid_minimax_h3_text_cache(
+        item, cache_dtype="bfloat16", require_teacher=True
+    )
+    state = load_file(item.text_encoder_output_cache_path)
+    torch.testing.assert_close(state["varlen_mmh3_teacher_ref_hidden_states_bfloat16"], teacher)
+    torch.testing.assert_close(state["varlen_mmh3_teacher_ref_token_tags_int64"], tags)
+
+
+def test_compact_reference_teacher_bridges_two_frames_without_changing_student_shape(monkeypatch):
+    trainer = MiniMaxH3ImageNetworkTrainer()
+    latents = torch.zeros(1, 24, 1, 2, 2)
+    teacher_calls = []
+
+    class Network:
+        enabled = True
+
+        def set_enabled(self, enabled):
+            self.enabled = enabled
+
+    class Transformer:
+        def __call__(self, **kwargs):
+            teacher_calls.append(kwargs)
+            assert kwargs["video_latents"].shape == (1, 24, 2, 2, 2)
+            assert kwargs["visual_condition_latents"][0].shape == latents.shape
+            assert kwargs["layout"].task == "ref2va"
+            return SimpleNamespace(video=torch.full((1, 24, 2, 2, 2), 2.0))
+
+    network = Network()
+    monkeypatch.setattr(
+        trainer,
+        "get_noisy_model_input_and_timesteps",
+        lambda *args, **kwargs: (torch.zeros_like(latents), torch.tensor([500.0])),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "call_dit",
+        lambda *args, **kwargs: DiTOutput(
+            pred=torch.zeros_like(latents, requires_grad=True), target=torch.ones_like(latents)
+        ),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "compute_loss",
+        lambda _args, output, *_rest, **_kwargs: (
+            torch.nn.functional.mse_loss(output.pred, output.target), {}
+        ),
+    )
+    args = SimpleNamespace(
+        h3_teacher_matching=True,
+        h3_teacher_condition_sigma_max=0.75,
+        h3_teacher_direct_loss_weight=0.0,
+        h3_guidance_distillation_protection=False,
+        h3_base_preservation_enabled=False,
+        depth_anchor_weight=0.0,
+        depth_anchor_every_n_steps=1,
+        dop_loss_weight=0.0,
+    )
+    batch = {
+        "timesteps": torch.tensor([0.5]),
+        "mmh3_hidden_states": [torch.zeros(3, 5120)],
+        "mmh3_teacher_ref_hidden_states": [torch.zeros(5, 5120)],
+        "mmh3_teacher_ref_token_tags": [torch.tensor([1, 0, 0, 0, 1])],
+    }
+
+    loss, metrics = trainer.process_batch(
+        args, _CPUAccelerator(), Transformer(), network, batch, latents, torch.zeros_like(latents),
+        object(), torch.bfloat16, torch.bfloat16, None, 0,
+    )
+
+    assert len(teacher_calls) == 1
+    assert network.enabled is True
+    assert loss.item() == pytest.approx(4.0)
+    assert metrics["teacher/conditioned"].item() == 1.0
 
 
 def test_h3_text_cache_can_store_fp32_encoder_output_as_bf16(tmp_path):

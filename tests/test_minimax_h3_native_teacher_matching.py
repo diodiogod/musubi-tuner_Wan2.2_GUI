@@ -1465,6 +1465,16 @@ def _ref_teacher_batch(*, text_length: int = 3, teacher_text_length: int = 5, te
     return batch
 
 
+def _subject_ref_teacher_batch(*, text_length: int = 3, teacher_text_length: int = 5, teacher_width: int = 12):
+    batch = _training_batch(text_length=text_length)
+    batch["latents_ref_000_image"] = torch.full((1, 24, 1, 4, 6), 7.0)
+    batch["mmh3_teacher_subject_ref_hidden_states"] = [torch.zeros(teacher_text_length, teacher_width)]
+    batch["mmh3_teacher_subject_ref_token_tags"] = [
+        torch.tensor([1, 0, 0, 1, 1][:teacher_text_length], dtype=torch.int64)
+    ]
+    return batch
+
+
 def _patch_deterministic_noise(monkeypatch):
     monkeypatch.setattr(torch, "rand", lambda shape, **kwargs: torch.tensor([0.25], device=kwargs.get("device")))
     monkeypatch.setattr(torch, "randn_like", lambda tensor, *args, **kwargs: torch.zeros_like(tensor))
@@ -1592,8 +1602,10 @@ def test_timestep_focus_remaps_a_uniform_draw_into_the_band_mixture():
         ({"h3_teacher_loss_dc_weight": 0.0}, "h3_teacher_matching"),
         ({"h3_teacher_loss_mag_weight": 0.5}, "h3_teacher_matching"),
         ({"h3_teacher_preservation_weight": 2.0}, "h3_teacher_matching"),
+        ({"h3_teacher_direct_loss_weight": 1.0}, "h3_teacher_matching"),
         ({"h3_teacher_matching": True, "h3_teacher_loss_mag_weight": -1.0}, "nonnegative"),
         ({"h3_teacher_matching": True, "h3_teacher_preservation_weight": -0.5}, "nonnegative"),
+        ({"h3_teacher_matching": True, "h3_teacher_direct_loss_weight": -0.5}, "nonnegative"),
     ],
 )
 def test_teacher_loss_and_timestep_focus_validation(overrides, message):
@@ -1670,6 +1682,31 @@ def test_compute_loss_keeps_full_magnitude_correction_on_anchor_steps():
     assert teaching_logs["loss/video"].item() == pytest.approx(0.0, abs=1e-6)
 
 
+def test_teacher_direct_contribution_is_magnitude_normalized_and_conditioned_only():
+    trainer = MiniMaxH3NetworkTrainer()
+    output = _dc_split_output(conditioned=1.0)
+    output.extra["direct_video_target"] = torch.full_like(output.pred, 10.0)
+    output.extra["direct_audio_target"] = None
+    loss, logs = trainer.compute_loss(
+        _trainer_args(h3_teacher_matching=True, h3_teacher_direct_loss_weight=0.5),
+        output, None, None, torch.bfloat16, torch.float32, 0,
+    )
+    # Regardless of the raw direct loss magnitude, weight 0.5 contributes half
+    # of the teacher loss after normalization.
+    assert loss.item() == pytest.approx(logs["loss/teacher"].item() * 1.5)
+    assert logs["loss/direct"].item() > logs["loss/teacher"].item()
+
+    anchor = _dc_split_output(conditioned=0.0)
+    anchor.extra["direct_video_target"] = torch.full_like(anchor.pred, 10.0)
+    anchor.extra["direct_audio_target"] = None
+    anchor_loss, anchor_logs = trainer.compute_loss(
+        _trainer_args(h3_teacher_matching=True, h3_teacher_direct_loss_weight=0.5),
+        anchor, None, None, torch.bfloat16, torch.float32, 0,
+    )
+    assert "loss/direct" not in anchor_logs
+    assert anchor_loss.item() == pytest.approx(anchor_logs["loss/video"].item())
+
+
 def test_preservation_density_compensation_restores_the_anchor_share_under_focus():
     from musubi_tuner.minimax_h3_native_train_network import _preservation_density_compensation
 
@@ -1712,6 +1749,7 @@ def test_extra_metadata_records_teacher_loss_shape_and_timestep_focus():
         h3_teacher_loss_dc_weight=0.2,
         h3_teacher_loss_mag_weight=0.5,
         h3_teacher_preservation_weight=1.5,
+        h3_teacher_direct_loss_weight=0.75,
         h3_timestep_focus_prob=0.5,
     )
 
@@ -1721,6 +1759,7 @@ def test_extra_metadata_records_teacher_loss_shape_and_timestep_focus():
     assert metadata["ss_minimax_h3_teacher_loss_dc_weight"] == 0.2
     assert metadata["ss_minimax_h3_teacher_loss_mag_weight"] == 0.5
     assert metadata["ss_minimax_h3_teacher_preservation_weight"] == 1.5
+    assert metadata["ss_minimax_h3_teacher_direct_loss_weight"] == 0.75
     assert metadata["ss_minimax_h3_timestep_focus_min"] == 0.4
     assert metadata["ss_minimax_h3_timestep_focus_max"] == 0.8
     assert metadata["ss_minimax_h3_timestep_focus_prob"] == 0.5
@@ -1865,6 +1904,26 @@ def test_h3_teacher_conditions_accepts_ref_and_records_it_in_metadata():
 
     metadata = trainer.extra_metadata(args)
     assert metadata["ss_minimax_h3_teacher_conditions"] == "ref"
+
+
+def test_subject_ref_teacher_uses_explicit_other_image_only_for_teacher(monkeypatch):
+    trainer = MiniMaxH3NetworkTrainer()
+    args = _trainer_args(h3_teacher_matching=True, h3_teacher_conditions="subject_ref")
+    trainer.handle_model_specific_args(args)
+    network = _ToggleNetwork()
+    transformer = _TeacherAwareTransformer(network)
+    _patch_deterministic_noise(monkeypatch)
+
+    _teacher_matching_process_batch(
+        trainer, args, _subject_ref_teacher_batch(), network=network, transformer=transformer
+    )
+
+    teacher_call, student_call = transformer.calls
+    assert teacher_call["layout"].task == "ref2va"
+    assert teacher_call["layout"].references[0].kind == "image"
+    assert len(teacher_call["visual_condition_latents"]) == 1
+    assert student_call["layout"].task == "t2va"
+    assert len(student_call["visual_condition_latents"]) == 0
 
 
 def test_ref_teacher_matching_runs_the_teacher_on_the_self_reference_layout(monkeypatch):

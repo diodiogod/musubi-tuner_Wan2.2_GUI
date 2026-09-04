@@ -126,6 +126,44 @@ def test_cache_commands_use_image_only_tools_and_compact_te(tmp_path):
     assert commands[1][commands[1].index("--cache_dtype") + 1] == "bfloat16"
 
 
+def test_compact_same_item_teacher_is_forwarded_to_training_and_text_cache(tmp_path):
+    settings = _settings(tmp_path) | {
+        "minimax_h3_teacher_matching": True,
+        "minimax_h3_teacher_conditions": "Same training item (Ostris-style)",
+        "minimax_h3_teacher_condition_sigma_max": "0.7",
+        "minimax_h3_teacher_direct_loss_weight": "0.25",
+        "minimax_h3_dynamic_sigma_enabled": True,
+        "minimax_h3_training_assistant_enabled": True,
+        "recache_text": True,
+    }
+
+    command, = minimax_h3.build_commands(settings)
+    text = minimax_h3.build_cache_commands(settings, "python")[0]
+
+    assert command[command.index("--h3_teacher_conditions") + 1] == "ref"
+    assert command[command.index("--h3_teacher_condition_sigma_max") + 1] == "0.7"
+    assert command[command.index("--h3_teacher_direct_loss_weight") + 1] == "0.25"
+    assert "--h3_guidance_distillation_protection" not in command
+    assert "--h3_training_assistant_enabled" not in command
+    assert text[text.index("--teacher_conditions") + 1] == "ref"
+
+
+def test_compact_other_picture_teacher_rebuilds_reference_latents(tmp_path):
+    settings = _settings(tmp_path) | {
+        "minimax_h3_teacher_matching": True,
+        "minimax_h3_teacher_conditions": "Other pictures of subject (Musubi-style)",
+        "recache_latents": True,
+        "recache_text": True,
+    }
+
+    latent, text = minimax_h3.build_cache_commands(settings, "python")
+    command, = minimax_h3.build_commands(settings)
+
+    assert latent[latent.index("--teacher_conditions") + 1] == "subject_ref"
+    assert text[text.index("--teacher_conditions") + 1] == "subject_ref"
+    assert command[command.index("--h3_teacher_conditions") + 1] == "subject_ref"
+
+
 def test_explicit_zero_text_encoder_streaming_is_not_replaced_by_default(tmp_path):
     settings = _settings(tmp_path) | {
         "recache_text": True,
@@ -229,6 +267,7 @@ def test_native_ref_teacher_builds_matching_train_and_text_cache_commands(tmp_pa
         "minimax_h3_video_vae": str(tmp_path / "video_vae.safetensors"),
         "minimax_h3_audio_vae": str(tmp_path / "audio_vae.safetensors"),
         "minimax_h3_teacher_loss_dc_weight": "0.3",
+        "minimax_h3_teacher_direct_loss_weight": "0.5",
         "minimax_h3_timestep_focus_prob": "0.5",
         "recache_latents": True,
         "recache_text": True,
@@ -240,11 +279,34 @@ def test_native_ref_teacher_builds_matching_train_and_text_cache_commands(tmp_pa
     assert "--h3_teacher_matching" in command
     assert command[command.index("--h3_teacher_conditions") + 1] == "ref"
     assert command[command.index("--h3_teacher_loss_dc_weight") + 1] == "0.3"
+    assert command[command.index("--h3_teacher_direct_loss_weight") + 1] == "0.5"
     assert command[command.index("--h3_timestep_focus_prob") + 1] == "0.5"
     assert "--h3_guidance_loss_scale" not in command
     assert latent[latent.index("--task") + 1] == "t2va"
     assert text[text.index("--teacher_conditions") + 1] == "ref"
     assert "--uncond_output" not in text
+
+
+def test_native_subject_reference_teacher_uses_ref2va_latent_cache_for_t2va_student(tmp_path):
+    settings = _settings(tmp_path) | {
+        "minimax_h3_training_workflow": "Video + audio · official multimodal",
+        "minimax_h3_multimodal_task": "t2va",
+        "minimax_h3_teacher_matching": True,
+        "minimax_h3_teacher_conditions": "subject_ref",
+        "minimax_h3_video_vae": str(tmp_path / "video_vae.safetensors"),
+        "minimax_h3_audio_vae": str(tmp_path / "audio_vae.safetensors"),
+        "recache_latents": True,
+        "recache_text": True,
+    }
+
+    (command,) = minimax_h3.build_commands(settings)
+    latent, text = minimax_h3.build_cache_commands(settings, "python")
+
+    assert command[command.index("--task") + 1] == "t2va"
+    assert command[command.index("--h3_teacher_conditions") + 1] == "subject_ref"
+    assert latent[latent.index("--task") + 1] == "ref2va"
+    assert text[text.index("--task") + 1] == "t2va"
+    assert text[text.index("--teacher_conditions") + 1] == "subject_ref"
 
 
 def test_native_endpoint_teacher_uses_fl2va_latents_for_t2va_student(tmp_path):

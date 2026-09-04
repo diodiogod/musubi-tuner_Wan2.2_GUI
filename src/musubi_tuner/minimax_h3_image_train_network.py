@@ -14,6 +14,7 @@ from musubi_tuner.dataset.architectures import ARCHITECTURE_MINIMAX_H3, ARCHITEC
 from musubi_tuner.minimax_h3.image_sampling import decode_image_latent, sample_image_latent
 from musubi_tuner.minimax_h3.image_text_encoder import DEFAULT_PROCESSOR_ID, load_minimax_h3_te
 from musubi_tuner.minimax_h3.model import load_h3_transformer
+from musubi_tuner.minimax_h3.packing import H3ReferenceGeometry, H3VideoGeometry, build_h3_layout
 from musubi_tuner.minimax_h3.video_sampling import decode_video_latent, sample_video_latent
 from musubi_tuner.minimax_h3.video_vae import load_video_vae
 from musubi_tuner.training.parser_common import read_config_from_file, setup_parser_common
@@ -159,6 +160,18 @@ class MiniMaxH3ImageNetworkTrainer(NetworkTrainer):
             and not args.h3_training_assistant_enabled
         ):
             raise ValueError("Base + assistant reference requires the Ostris training assistant to be enabled")
+        if getattr(args, "h3_teacher_matching", False):
+            if args.h3_teacher_conditions not in {"ref", "subject_ref"}:
+                raise ValueError(
+                    "Compact ConvRot teacher matching supports same-item ('ref') and explicit other-picture "
+                    "('subject_ref') teachers. Endpoint teachers require the native video workflow."
+                )
+            if not 0.0 <= args.h3_teacher_condition_sigma_max <= 1.0:
+                raise ValueError("H3 teacher condition sigma maximum must be between 0 and 1")
+            if args.h3_teacher_direct_loss_weight < 0:
+                raise ValueError("H3 teacher direct loss weight must be non-negative")
+            if guidance_protection_enabled(args):
+                raise ValueError("Compact teacher matching and Dynamic Sigma are alternative target methods")
 
     def on_transformer_loaded(self, args, accelerator, transformer) -> None:
         if getattr(args, "h3_foundation_lora", None):
@@ -528,6 +541,79 @@ class MiniMaxH3ImageNetworkTrainer(NetworkTrainer):
             timesteps,
             network_dtype,
         )
+        teacher_conditioned = False
+        ordinary_target = output.target
+        if getattr(args, "h3_teacher_matching", False):
+            teacher_rows = batch.get("mmh3_teacher_ref_hidden_states")
+            teacher_tags = batch.get("mmh3_teacher_ref_token_tags")
+            if not isinstance(teacher_rows, list) or len(teacher_rows) != 1:
+                raise ValueError(
+                    "Compact reference-guided learning needs teacher text rows. Rebuild Caption/Text Cache with it enabled."
+                )
+            if not isinstance(teacher_tags, list) or len(teacher_tags) != 1:
+                raise ValueError("Compact reference-guided cache is missing visual token tags")
+            unwrapped_network = accelerator.unwrap_model(network)
+            base_sigma_value = float(base_sigma.reshape(-1)[0].item())
+            teacher_conditioned = base_sigma_value <= getattr(args, "h3_teacher_condition_sigma_max", 0.75)
+            unwrapped_network.set_enabled(False)
+            try:
+                with torch.no_grad(), accelerator.autocast():
+                    if teacher_conditioned:
+                        # The released packed H3 path has a two-latent-frame minimum. Repeat the
+                        # noisy still only for this frozen teacher and keep its first prediction;
+                        # the ordinary one-frame student path and its gradients remain unchanged.
+                        teacher_video = noisy_input.to(accelerator.device, dtype=network_dtype).repeat(1, 1, 2, 1, 1)
+                        if getattr(args, "h3_teacher_conditions", "ref") == "subject_ref":
+                            ref_keys = sorted(
+                                key for key in batch if key.startswith("latents_ref_") and key.endswith("_image")
+                            )
+                            if not ref_keys:
+                                raise ValueError(
+                                    "Other-subject teacher needs cached control_path/control_path_N reference images"
+                                )
+                            reference_videos = tuple(
+                                batch[key].to(accelerator.device, dtype=network_dtype) for key in ref_keys
+                            )
+                        else:
+                            reference_videos = (latents.to(accelerator.device, dtype=network_dtype),)
+                        text = teacher_rows[0].unsqueeze(0).to(accelerator.device, dtype=network_dtype)
+                        tags = teacher_tags[0].unsqueeze(0).to(accelerator.device, dtype=torch.int64)
+                        references = tuple(
+                            H3ReferenceGeometry("image", video=H3VideoGeometry(*reference.shape[2:]))
+                            for reference in reference_videos
+                        )
+                        layout = build_h3_layout(
+                            task="ref2va",
+                            text_length=text.shape[1],
+                            target_video=H3VideoGeometry(*teacher_video.shape[2:]),
+                            target_audio_frames=8,
+                            references=references,
+                        )
+                        silent_audio = torch.zeros(
+                            (1, 32, 2, 8), device=accelerator.device, dtype=network_dtype
+                        )
+                        teacher_model_t = 1.0 - (
+                            timesteps.to(accelerator.device, dtype=torch.float32) - 1.0
+                        ) / 1000.0
+                        teacher_prediction = transformer(
+                            video_latents=teacher_video,
+                            audio_latents=silent_audio,
+                            text_hidden_states=text,
+                            text_token_tags=tags,
+                            layout=layout,
+                            model_t_video=teacher_model_t,
+                            model_t_audio=teacher_model_t,
+                            visual_condition_latents=reference_videos,
+                        ).video[:, :, :1].detach()
+                    else:
+                        teacher_prediction = transformer.forward_image(
+                            noisy_input.to(accelerator.device, dtype=network_dtype),
+                            1.0 - (timesteps.to(accelerator.device, dtype=torch.float32) - 1.0) / 1000.0,
+                            batch["mmh3_hidden_states"][0].unsqueeze(0).to(accelerator.device, dtype=network_dtype),
+                        ).detach()
+            finally:
+                unwrapped_network.set_enabled(True)
+            output.target = teacher_prediction.to(output.pred.dtype)
         if unconditional_prediction is not None:
             normal_target = output.target
             output.target = build_guided_target(
@@ -547,6 +633,22 @@ class MiniMaxH3ImageNetworkTrainer(NetworkTrainer):
             global_step,
         )
         total = diffusion_loss
+        if getattr(args, "h3_teacher_matching", False):
+            metrics["teacher/conditioned"] = torch.tensor(
+                1.0 if teacher_conditioned else 0.0, device=output.pred.device
+            )
+            metrics["teacher/flow_gap_rms"] = (
+                output.target.float() - ordinary_target.float()
+            ).pow(2).mean().sqrt().detach()
+            direct_strength = float(getattr(args, "h3_teacher_direct_loss_weight", 0.0))
+            if teacher_conditioned and direct_strength > 0.0:
+                direct = torch.nn.functional.mse_loss(output.pred.float(), ordinary_target.float())
+                scale = diffusion_loss.detach() / direct.detach().clamp_min(1e-12)
+                direct_scaled = direct * scale
+                total = total + direct_strength * direct_scaled
+                metrics["loss/teacher"] = diffusion_loss.detach()
+                metrics["loss/direct"] = direct.detach()
+                metrics["loss/direct_scaled"] = direct_scaled.detach()
         if reference_prediction is not None:
             preservation = base_preservation_loss(output.pred, reference_prediction)
             total = total + getattr(args, "h3_base_preservation_loss_weight", 0.0) * preservation
@@ -764,6 +866,11 @@ def minimax_h3_image_setup_parser(parser: argparse.ArgumentParser) -> argparse.A
     guidance.add_argument("--h3_base_preservation_loss_weight", type=float, default=0.0)
     guidance.add_argument("--h3_base_preservation_every_n_steps", type=int, default=10)
     guidance.add_argument("--h3_base_preservation_reference", choices=("base", "assistant"), default="assistant")
+    teacher = parser.add_argument_group("MiniMax-H3 compact reference-guided learning (experimental)")
+    teacher.add_argument("--h3_teacher_matching", action="store_true")
+    teacher.add_argument("--h3_teacher_conditions", choices=("ref",), default="ref")
+    teacher.add_argument("--h3_teacher_condition_sigma_max", type=float, default=0.75)
+    teacher.add_argument("--h3_teacher_direct_loss_weight", type=float, default=0.0)
     depth_anchor = parser.add_argument_group("MiniMax-H3 perceptual depth anchor (experimental)")
     depth_anchor.add_argument("--depth_anchor_weight", type=float, default=0.0)
     depth_anchor.add_argument("--depth_anchor_model", default="depth-anything/Depth-Anything-V2-Small-hf")

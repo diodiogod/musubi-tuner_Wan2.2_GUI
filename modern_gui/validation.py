@@ -66,6 +66,29 @@ def validate_training_settings(settings: dict[str, Any]) -> dict[str, list[dict[
     elif mode in {"Flux.2 Klein", "Flux.2 Dev"}:
         require("flux2_dit_model", "FLUX.2 DiT")
         require("flux2_text_encoder", "FLUX.2 text encoder")
+        if settings.get("flux2_reference_guided"):
+            if mode == "Flux.2 Dev":
+                error("flux2_reference_guided", "Reference-guided learning currently supports FLUX.2 Klein only.")
+            from backends.flux2 import reference_condition_value
+
+            conditions = reference_condition_value(settings.get("flux2_reference_conditions"))
+            if conditions not in {"same_item", "subject_ref"}:
+                error("flux2_reference_conditions", "Choose Same training item or Other pictures of subject.")
+            for key, minimum, maximum in (
+                ("flux2_reference_sigma_max", 0.0, 1.0),
+                ("flux2_reference_direct_loss_weight", 0.0, None),
+            ):
+                try:
+                    value = float(settings.get(key))
+                    if value < minimum or (maximum is not None and value > maximum):
+                        raise ValueError
+                except (TypeError, ValueError):
+                    error(key, f"Enter a number between {minimum} and {maximum if maximum is not None else '∞'}.")
+            if conditions == "subject_ref" and not settings.get("recache_latents"):
+                warning(
+                    "recache_latents",
+                    "Other-picture learning needs control_path/control_path_N reference images in the image dataset and a rebuilt Image/Latent Cache.",
+                )
     elif mode == "Krea 2":
         require("krea2_dit_model", "Krea 2 RAW DiT")
         require("krea2_text_encoder", "Krea 2 text encoder")
@@ -107,14 +130,17 @@ def validate_training_settings(settings: dict[str, Any]) -> dict[str, list[dict[
             if teacher_matching:
                 if selected_task != "t2va":
                     error("minimax_h3_multimodal_task", "Teacher matching trains a T2VA student. Select t2va.")
-                conditions = str(settings.get("minimax_h3_teacher_conditions") or "ref")
-                if conditions not in {"ref", "first,last"}:
-                    error("minimax_h3_teacher_conditions", "Teacher Information must be ref or first,last.")
+                from backends.minimax_h3 import teacher_condition_value
+
+                conditions = teacher_condition_value(settings.get("minimax_h3_teacher_conditions"))
+                if conditions not in {"ref", "subject_ref", "first,last"}:
+                    error("minimax_h3_teacher_conditions", "Choose one of the available reference-teacher methods.")
                 numeric_ranges = {
                     "minimax_h3_teacher_condition_sigma_max": (0.0, 1.0),
                     "minimax_h3_teacher_loss_dc_weight": (0.0, 1.0),
                     "minimax_h3_teacher_loss_mag_weight": (0.0, None),
                     "minimax_h3_teacher_preservation_weight": (0.0, None),
+                    "minimax_h3_teacher_direct_loss_weight": (0.0, None),
                     "minimax_h3_timestep_focus_min": (0.0, 1.0),
                     "minimax_h3_timestep_focus_max": (0.0, 1.0),
                     "minimax_h3_timestep_focus_prob": (0.0, 1.0),
@@ -182,6 +208,40 @@ def validate_training_settings(settings: dict[str, Any]) -> dict[str, list[dict[
                     error("dataset_config", message)
                 for message in dataset_audit["warnings"]:
                     warning("dataset_config", message)
+        elif settings.get("minimax_h3_teacher_matching"):
+            from backends.minimax_h3 import teacher_condition_value
+
+            conditions = teacher_condition_value(settings.get("minimax_h3_teacher_conditions"))
+            if conditions not in {"ref", "subject_ref"}:
+                error(
+                    "minimax_h3_teacher_conditions",
+                    "Compact ConvRot supports Same training item and image-JSONL other-subject pictures. First/last frames require native Video + audio.",
+                )
+            for key, minimum, maximum in (
+                ("minimax_h3_teacher_condition_sigma_max", 0.0, 1.0),
+                ("minimax_h3_teacher_direct_loss_weight", 0.0, None),
+            ):
+                try:
+                    value = float(settings.get(key))
+                    if value < minimum or (maximum is not None and value > maximum):
+                        raise ValueError
+                except (TypeError, ValueError):
+                    error(key, f"Enter a number between {minimum} and {maximum if maximum is not None else '∞'}.")
+            if not settings.get("recache_text"):
+                warning(
+                    "recache_text",
+                    "Compact reference-guided learning needs visual teacher rows. Rebuild Caption/Text Cache once after enabling it; image latents do not change.",
+                )
+            if conditions == "subject_ref" and not settings.get("recache_latents"):
+                warning(
+                    "recache_latents",
+                    "Other-subject pictures must be encoded once. Rebuild Image/Latent Cache after adding control_path/control_path_N references to the image JSONL.",
+                )
+            if settings.get("minimax_h3_training_assistant_enabled") or settings.get("minimax_h3_dynamic_sigma_enabled"):
+                error(
+                    "minimax_h3_teacher_matching",
+                    "Reference-guided learning replaces the Ostris Assistant and Dynamic Sigma target for this run; disable those two options.",
+                )
         cadence_enabled = any(
             (
                 _positive_number(str(settings.get("sample_every_n_epochs") or "").strip()),

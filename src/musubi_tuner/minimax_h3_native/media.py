@@ -41,6 +41,18 @@ class H3Record:
     caption: str
     references: tuple[H3Reference, ...]
     jsonl_line: int
+    teacher_caption: Optional[str] = None
+
+
+def validate_subject_reference_record(record: H3Record, context: str) -> None:
+    if not record.references:
+        raise ValueError(f"{context}: subject-reference teaching requires at least one image reference")
+    unsupported = [reference.type for reference in record.references if reference.type != "image"]
+    if unsupported:
+        raise ValueError(
+            f"{context}: subject-reference teaching currently supports image references only "
+            f"(got {unsupported[0]!r})"
+        )
 
 
 def _validate_frame_count(frame_count: int) -> None:
@@ -215,6 +227,9 @@ def _record_from_jsonl_data(
     caption = data.get("caption")
     if not isinstance(caption, str):
         raise ValueError(f"H3 JSONL line {line_number}: caption must be a string")
+    teacher_caption = data.get("teacher_caption")
+    if teacher_caption is not None and (not isinstance(teacher_caption, str) or not teacher_caption.strip()):
+        raise ValueError(f"H3 JSONL line {line_number}: teacher_caption must be a non-empty string when present")
 
     raw_references = data.get("references", [])
     if task == "ref2va":
@@ -224,7 +239,13 @@ def _record_from_jsonl_data(
             raise ValueError(f"H3 JSONL line {line_number}: references require task ref2va")
         references = ()
 
-    return H3Record(video_path=video_path, caption=caption, references=references, jsonl_line=line_number)
+    return H3Record(
+        video_path=video_path,
+        caption=caption,
+        references=references,
+        jsonl_line=line_number,
+        teacher_caption=teacher_caption,
+    )
 
 
 def load_h3_jsonl_records(
@@ -291,4 +312,3 @@ def h3_records_from_datasource(
             raise ValueError("MiniMax-H3 directory caption must be a string")
         records.append(H3Record(video_path=video_path, caption=caption, references=(), jsonl_line=0))
     return records
-

@@ -565,6 +565,7 @@ TEXT_CACHE_FORMAT = "minimax-h3-text-v2"
 # interfaces.
 TEACHER_CONDITIONS_FIRST_LAST = "first,last"
 TEACHER_CONDITIONS_REF = "ref"
+TEACHER_CONDITIONS_SUBJECT_REF = "subject_ref"
 
 
 def normalize_teacher_conditions(value: str) -> str:
@@ -573,9 +574,36 @@ def normalize_teacher_conditions(value: str) -> str:
         return TEACHER_CONDITIONS_FIRST_LAST
     if parts == [TEACHER_CONDITIONS_REF]:
         return TEACHER_CONDITIONS_REF
+    if parts == [TEACHER_CONDITIONS_SUBJECT_REF]:
+        return TEACHER_CONDITIONS_SUBJECT_REF
     raise ValueError(
         f"MiniMax-H3 teacher matching supports only teacher conditions "
-        f"'{TEACHER_CONDITIONS_FIRST_LAST}' or '{TEACHER_CONDITIONS_REF}', got {value!r}"
+        f"'{TEACHER_CONDITIONS_FIRST_LAST}', '{TEACHER_CONDITIONS_REF}' or "
+        f"'{TEACHER_CONDITIONS_SUBJECT_REF}', got {value!r}"
+    )
+
+
+def wrap_subject_reference_caption(caption: str, image_count: int, *, still_image: bool = False) -> str:
+    if image_count < 1:
+        raise ValueError("MiniMax-H3 subject-reference caption requires at least one picture")
+    labels = [f"<Subject {index}>" for index in range(1, image_count + 1)]
+    subjects = labels[0] if len(labels) == 1 else ", ".join(labels[:-1]) + f" and {labels[-1]}"
+    definitions = "\n".join(
+        f"<Subject {index}> is the subject whose appearance comes from <Picture {index}> (face and hair style)."
+        for index in range(1, image_count + 1)
+    )
+    summary = (
+        f"The target is a single still image with no motion, a static shot of {subjects} as described below."
+        if still_image else f"The target video shows {subjects} as described below."
+    )
+    retention = "\n".join(
+        f"<Subject {index}> (appears in [Shot 1]): attribute_transfer - the appearance of <Subject {index}> in "
+        f"<Picture {index}> is referenced; pose, framing, outfit and setting follow the description."
+        for index in range(1, image_count + 1)
+    )
+    return (
+        f"subject_definitions:\n{definitions}\n\nsummary:\n[reference generation] {summary}\n\n"
+        f"retention_analysis:\n{retention}\n\ndetailed_description:\n{caption}"
     )
 
 

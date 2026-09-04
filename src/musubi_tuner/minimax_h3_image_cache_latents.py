@@ -22,7 +22,7 @@ from musubi_tuner.minimax_h3.video_vae import encode_video_target, load_video_va
 logger = logging.getLogger(__name__)
 
 
-def encode_and_save_batch(vae, batch: list[ItemInfo], cache_seed: int) -> None:
+def encode_and_save_batch(vae, batch: list[ItemInfo], cache_seed: int, cache_subject_refs: bool = False) -> None:
     device = next(vae.parameters()).device
     dtype = next(vae.parameters()).dtype
     for item in batch:
@@ -30,13 +30,31 @@ def encode_and_save_batch(vae, batch: list[ItemInfo], cache_seed: int) -> None:
         pixels = torch.from_numpy(content[..., :3]).permute(2, 0, 1).unsqueeze(0)
         pixels = (pixels.to(device=device, dtype=dtype) / 127.5) - 1.0
         latent = encode_video_target(vae, pixels, cache_seed, item.item_key)[0]
+        reference_latents = []
+        if cache_subject_refs:
+            if not item.control_content:
+                raise ValueError(
+                    "Other-subject reference learning requires control_path/control_path_N images in an image JSONL dataset"
+                )
+            for index, reference in enumerate(item.control_content):
+                ref_pixels = torch.from_numpy(reference[..., :3]).permute(2, 0, 1).unsqueeze(0)
+                ref_pixels = (ref_pixels.to(device=device, dtype=dtype) / 127.5) - 1.0
+                reference_latents.append(
+                    encode_video_target(vae, ref_pixels, cache_seed, f"{item.item_key}:subject_ref:{index}")[0]
+                )
         logger.info("Saving MiniMax-H3 image latent %s to %s", tuple(latent.shape), item.latent_cache_path)
-        save_latent_cache_minimax_h3_image(item, latent)
+        save_latent_cache_minimax_h3_image(item, latent, reference_latents)
 
 
 def setup_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--cache_seed", type=int, default=42, help="deterministic VAE posterior-sampling seed")
     parser.add_argument("--disable_mmap", action="store_true", help="disable memory-mapped VAE loading")
+    parser.add_argument(
+        "--teacher_conditions",
+        choices=("subject_ref",),
+        default=None,
+        help="Cache image-JSONL control_path/control_path_N images as explicit other-subject teacher references",
+    )
     return parser
 
 
@@ -75,13 +93,17 @@ def main() -> None:
     vae.requires_grad_(False).eval()
 
     def encode(batch: list[ItemInfo]):
-        encode_and_save_batch(vae, batch, args.cache_seed)
+        encode_and_save_batch(vae, batch, args.cache_seed, args.teacher_conditions == "subject_ref")
 
     cache_latents.encode_datasets(
         group.datasets,
         encode,
         args,
-        skip_existing_validator=is_latent_cache_minimax_h3_image_current,
+        skip_existing_validator=(
+            (lambda _path: False)
+            if args.teacher_conditions == "subject_ref"
+            else is_latent_cache_minimax_h3_image_current
+        ),
     )
 
 

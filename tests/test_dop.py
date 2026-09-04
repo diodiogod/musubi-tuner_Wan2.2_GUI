@@ -15,6 +15,8 @@ from musubi_tuner.training.dop import (
     validate_dop_config,
 )
 from musubi_tuner_gui import MusubiTunerGUI
+from musubi_tuner.flux_2_train_network import DiTOutput, Flux2NetworkTrainer, flux2_setup_parser
+from musubi_tuner.training.parser_common import setup_parser_common
 
 
 def test_make_class_caption_replaces_literal_trigger_case_insensitively():
@@ -205,6 +207,82 @@ def test_flux2_dev_does_not_forward_dop():
     }
     assert "--dop_loss_weight" not in flux2.build_commands(settings)[0]
     assert "--dop_trigger_word" not in flux2.build_cache_commands(settings, "python")[0]
+
+
+def test_flux2_klein_reference_guided_command_is_explicit_and_disabled_by_default():
+    settings = {
+        "flux2_model_version": "Klein Base 4B ★",
+        "dataset_config": "dataset.toml", "vae_model": "vae.safetensors",
+        "flux2_dit_model": "klein.safetensors", "flux2_text_encoder": "text",
+        "output_dir": ".", "output_name": "test", "network_type": "LoRA",
+        "network_dim_low": "8", "network_alpha_low": "8",
+    }
+    assert "--flux2_reference_guided" not in flux2.build_commands(settings)[0]
+
+    settings.update(
+        flux2_reference_guided=True,
+        flux2_reference_conditions="Other pictures of subject (image JSONL)",
+        flux2_reference_sigma_max="0.7",
+        flux2_reference_direct_loss_weight="0.25",
+    )
+    command = flux2.build_commands(settings)[0]
+    assert command[command.index("--flux2_reference_conditions") + 1] == "subject_ref"
+    assert command[command.index("--flux2_reference_sigma_max") + 1] == "0.7"
+    assert command[command.index("--flux2_reference_direct_loss_weight") + 1] == "0.25"
+
+
+def test_flux2_reference_guided_parser_rejects_dev():
+    parser = flux2_setup_parser(setup_parser_common())
+    args = parser.parse_args([
+        "--model_version", "dev", "--flux2_reference_guided",
+    ])
+    with pytest.raises(ValueError, match="Klein"):
+        Flux2NetworkTrainer().handle_model_specific_args(args)
+
+
+def test_flux2_same_item_teacher_hides_reference_from_student(monkeypatch):
+    trainer = Flux2NetworkTrainer()
+    latents = torch.zeros(1, 4, 2, 2)
+    calls = []
+
+    class Network:
+        enabled = True
+        def set_enabled(self, enabled):
+            self.enabled = enabled
+
+    network = Network()
+    monkeypatch.setattr(
+        trainer, "get_noisy_model_input_and_timesteps",
+        lambda *args, **kwargs: (torch.zeros_like(latents), torch.tensor([500.0])),
+    )
+    def fake_call(_args, _accelerator, _transformer, _latents, batch, *_rest, **_kwargs):
+        calls.append((network.enabled, sorted(key for key in batch if key.startswith("latents_control_"))))
+        value = 2.0 if not network.enabled else 0.0
+        return DiTOutput(pred=torch.full_like(latents, value, requires_grad=network.enabled), target=torch.ones_like(latents))
+    monkeypatch.setattr(trainer, "call_dit", fake_call)
+    monkeypatch.setattr(
+        trainer, "compute_loss",
+        lambda _args, output, *_rest, **_kwargs: (torch.nn.functional.mse_loss(output.pred, output.target), {}),
+    )
+    args = Namespace(
+        flux2_reference_guided=True, flux2_reference_conditions="same_item",
+        flux2_reference_sigma_max=0.75, flux2_reference_direct_loss_weight=0.0,
+        dop_loss_weight=0.0,
+    )
+    accelerator = SimpleNamespace(
+        device=torch.device("cpu"), unwrap_model=lambda model: model,
+    )
+
+    loss, metrics = trainer.process_batch(
+        args, accelerator, object(), network,
+        {"timesteps": torch.tensor([0.5]), "ctx_vec": torch.zeros(1, 1, 1)},
+        latents, torch.zeros_like(latents), object(), torch.float32, torch.float32, None, 0,
+    )
+
+    assert calls == [(False, ["latents_control_0"]), (True, [])]
+    assert network.enabled is True
+    assert loss.item() == pytest.approx(4.0)
+    assert metrics["teacher/conditioned"].item() == 1.0
 
 
 def test_staged_dop_can_inherit_override_and_disable():

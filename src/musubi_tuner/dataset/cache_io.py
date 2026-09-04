@@ -214,7 +214,9 @@ def save_latent_cache_krea2(item_info: ItemInfo, latent: torch.Tensor):
 MINIMAX_H3_IMAGE_POSTERIOR_POLICY = "video_vae=fp32"
 
 
-def save_latent_cache_minimax_h3_image(item_info: ItemInfo, latent: torch.Tensor):
+def save_latent_cache_minimax_h3_image(
+    item_info: ItemInfo, latent: torch.Tensor, reference_latents: Optional[list[torch.Tensor]] = None
+):
     """Save one H3 video-VAE frame for the experimental image-only trainer."""
     if latent.ndim != 4 or tuple(latent.shape[:2]) != (24, 1):
         raise ValueError(f"MiniMax-H3 image latent must be [24,1,H,W], got {tuple(latent.shape)}")
@@ -226,6 +228,15 @@ def save_latent_cache_minimax_h3_image(item_info: ItemInfo, latent: torch.Tensor
         )
     dtype = dtype_to_str(latent.dtype)
     sd = {f"latents_1x{latent.shape[-2]}x{latent.shape[-1]}_{dtype}": latent}
+    for index, reference in enumerate(reference_latents or []):
+        if reference.ndim != 4 or tuple(reference.shape[:2]) != (24, 1):
+            raise ValueError(f"MiniMax-H3 reference latent must be [24,1,H,W], got {tuple(reference.shape)}")
+        if reference.dtype != torch.float32:
+            raise ValueError("MiniMax-H3 reference latents require the FP32 VAE posterior policy")
+        ref_dtype = dtype_to_str(reference.dtype)
+        sd[
+            f"latents_ref_{index:03d}_image_1x{reference.shape[-2]}x{reference.shape[-1]}_{ref_dtype}"
+        ] = reference
     save_latent_cache_common(
         item_info,
         sd,
@@ -512,6 +523,8 @@ def save_text_encoder_output_cache_minimax_h3_image(
     dop_hidden_states: Optional[torch.Tensor] = None,
     dop_signature: Optional[torch.Tensor] = None,
     unconditional_hidden_states: Optional[torch.Tensor] = None,
+    teacher_hidden_states: Optional[torch.Tensor] = None,
+    teacher_token_tags: Optional[torch.Tensor] = None,
 ):
     """Save raw layer-50 Qwen3-VL states; image-caption rows use text modality tag 1."""
     if hidden_states.ndim != 2 or hidden_states.shape[1] != 5120:
@@ -536,6 +549,19 @@ def save_text_encoder_output_cache_minimax_h3_image(
             )
         unconditional_dtype = dtype_to_str(unconditional_hidden_states.dtype)
         sd[f"varlen_mmh3_unconditional_hidden_states_{unconditional_dtype}"] = unconditional_hidden_states
+    if teacher_hidden_states is not None:
+        if teacher_hidden_states.ndim != 2 or teacher_hidden_states.shape[1] != 5120:
+            raise ValueError(
+                "MiniMax-H3 teacher hidden states must be [L,5120], "
+                f"got {tuple(teacher_hidden_states.shape)}"
+            )
+        if teacher_token_tags is None or teacher_token_tags.shape != (teacher_hidden_states.shape[0],):
+            raise ValueError("MiniMax-H3 teacher token tags must be [L]")
+        teacher_dtype = dtype_to_str(teacher_hidden_states.dtype)
+        sd[f"varlen_mmh3_teacher_ref_hidden_states_{teacher_dtype}"] = teacher_hidden_states
+        sd["varlen_mmh3_teacher_ref_token_tags_int64"] = teacher_token_tags.to(torch.int64)
+    elif teacher_token_tags is not None:
+        raise ValueError("MiniMax-H3 teacher token tags require teacher hidden states")
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_MINIMAX_H3_FULL, merge_existing=False)
 
 
@@ -672,16 +698,21 @@ def save_text_encoder_output_cache_minimax_h3(
     student_hidden_keys = [key for key in tensors if key.startswith("varlen_mmh3_hidden_states_")]
     teacher_hidden_keys = [key for key in tensors if key.startswith("varlen_mmh3_teacher_hidden_states_")]
     teacher_ref_hidden_keys = [key for key in tensors if key.startswith("varlen_mmh3_teacher_ref_hidden_states_")]
+    teacher_subject_ref_hidden_keys = [
+        key for key in tensors if key.startswith("varlen_mmh3_teacher_subject_ref_hidden_states_")
+    ]
     if len(student_hidden_keys) != 1:
         raise ValueError(f"MiniMax-H3 text cache requires exactly one hidden-state tensor, found {len(student_hidden_keys)}")
     tags_key = "varlen_mmh3_token_tags_int64"
     teacher_tags_key = "varlen_mmh3_teacher_token_tags_int64"
     teacher_ref_tags_key = "varlen_mmh3_teacher_ref_token_tags_int64"
+    teacher_subject_ref_tags_key = "varlen_mmh3_teacher_subject_ref_token_tags_int64"
 
     has_fl_teacher = bool(teacher_hidden_keys) or teacher_tags_key in tensors
     has_ref_teacher = bool(teacher_ref_hidden_keys) or teacher_ref_tags_key in tensors
-    if has_fl_teacher and has_ref_teacher:
-        raise ValueError("MiniMax-H3 text cache cannot mix first,last and ref teacher rows")
+    has_subject_ref_teacher = bool(teacher_subject_ref_hidden_keys) or teacher_subject_ref_tags_key in tensors
+    if sum((has_fl_teacher, has_ref_teacher, has_subject_ref_teacher)) > 1:
+        raise ValueError("MiniMax-H3 text cache cannot mix multiple teacher row kinds")
 
     pairs = [(student_hidden_keys[0], "varlen_mmh3_hidden_states_", tags_key)]
     expected_keys = {student_hidden_keys[0], tags_key}
@@ -695,6 +726,17 @@ def save_text_encoder_output_cache_minimax_h3(
             raise ValueError("MiniMax-H3 teacher text rows require exactly one hidden-state tensor and its token tags")
         pairs.append((teacher_ref_hidden_keys[0], "varlen_mmh3_teacher_ref_hidden_states_", teacher_ref_tags_key))
         expected_keys |= {teacher_ref_hidden_keys[0], teacher_ref_tags_key}
+    if has_subject_ref_teacher:
+        if len(teacher_subject_ref_hidden_keys) != 1 or teacher_subject_ref_tags_key not in tensors:
+            raise ValueError("MiniMax-H3 subject-reference teacher rows require one hidden-state tensor and token tags")
+        pairs.append(
+            (
+                teacher_subject_ref_hidden_keys[0],
+                "varlen_mmh3_teacher_subject_ref_hidden_states_",
+                teacher_subject_ref_tags_key,
+            )
+        )
+        expected_keys |= {teacher_subject_ref_hidden_keys[0], teacher_subject_ref_tags_key}
     if set(tensors) != expected_keys:
         raise ValueError(f"MiniMax-H3 text cache requires exactly the keys {sorted(expected_keys)}")
 

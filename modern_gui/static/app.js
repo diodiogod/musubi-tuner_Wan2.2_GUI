@@ -100,12 +100,17 @@ const HELP = {
   minimax_h3_training_target: "Choose exactly what contributes to the training loss. Video + audio learns both. Video only ignores audio loss. Audio only is experimental: it learns only from real synchronized audio, but still requires a video clip and both VAEs because H3 processes video and audio together.",
   minimax_h3_training_workflow: "Choose Still images for the proven compact ConvRot workflow, or Video + audio for native H3 clip training. This choice changes the required model files, dataset geometry, and available training targets.",
   minimax_h3_audio_loss_weight: "1.0 gives video and available audio their normal joint objective. Lower values make audio learning gentler. Zero is equivalent to video-only supervision.",
-  minimax_h3_teacher_matching: "Another experimental way to protect the model's original quality while training. The unchanged base model acts as a teacher and discourages the LoRA from degrading video quality. It works with normal still-image datasets: you do not need to provide a separate reference image. Use Ref for still-image training. Training is slower because the model runs one extra time per step, and the Caption/Text Cache must be rebuilt.",
-  minimax_h3_teacher_conditions: "Choose what information the unchanged teacher model receives. Use Ref for normal still-image training; it uses the current training sample, so no separate reference image is required. First,last is intended for video datasets and uses the real first and last frames. Ref is the recommended starting option.",
-  minimax_h3_teacher_condition_sigma_max: "At or below this base sigma, the teacher uses the target condition. Above it, the extra pass becomes a pure frozen-base preservation anchor. Upstream currently recommends 0.75.",
+  minimax_h3_teacher_matching: "Like what H3 produces from your reference pictures and want to capture that behavior in a LoRA? A frozen teacher sees extra image information; the LoRA must reproduce its prediction from the caption alone, so the reference is not required afterward. This is the practical Ostris/Musubi off-policy experiment, not the paper's much heavier 4/8-step EMA on-policy algorithm. It can inherit both the teacher's strengths and mistakes, is slower, may use more memory, and is not proven better than ordinary training.",
+  minimax_h3_teacher_conditions: "Same training item lets the teacher see the exact image/video being learned. Other pictures never shows the answer item to the teacher: native video uses its references list; compact image training uses control_path/control_path_N entries in an image JSONL. First and last uses native-video endpoints. These are different experiments, not quality levels.",
+  flux2_reference_guided: "Like what FLUX.2 Klein produces when it can see a reference picture and want to capture that behavior in a caption-only LoRA? A frozen Klein teacher receives the image while the trainable student receives only the caption. The reference is not needed when using the finished LoRA. This is an inexpensive off-policy experiment, not the paper's much heavier multi-step EMA D-OPSD algorithm. It adds one no-gradient DiT pass per training step and is not available for FLUX.2 Dev.",
+  flux2_reference_conditions: "Same training item gives the teacher the exact target image. Other pictures uses control_path/control_path_N images from an image JSONL and never gives the teacher the answer image. In both modes, those images are hidden from the student and are not required when using the LoRA.",
+  flux2_reference_sigma_max: "At or below this noise level, the frozen teacher uses the reference picture. Above it, the teacher drops the picture and becomes a frozen-base preservation target. Start with 0.75; lowering it protects the base composition prior more strongly.",
+  flux2_reference_direct_loss_weight: "Also learn directly from the real dataset target instead of relying entirely on the teacher's interpretation. 0 uses only the teacher. 1 adds an ordinary-training contribution normalized to approximately the teacher loss size. This may recover details the teacher misses, but can reduce preservation.",
+  minimax_h3_teacher_condition_sigma_max: "At or below this base sigma, the teacher uses the reference condition. Above it, the extra pass becomes a frozen-base preservation anchor. Start with 0.75 for the same-item teacher; different-subject recipes may use a wider band.",
   minimax_h3_teacher_loss_dc_weight: "Reduces how strongly conditioned teacher steps copy global color and tone. Upstream's identity starting recipe uses 0.3. Preservation steps still keep full color correction.",
   minimax_h3_teacher_loss_mag_weight: "On conditioned teaching steps, weights prediction magnitude relative to direction. Keep 1.0 unless diagnostics show a specific norm problem. High-noise preservation-anchor steps always retain the full magnitude correction so lowering this cannot weaken their protection.",
   minimax_h3_teacher_preservation_weight: "Strength of high-noise frozen-base anchor steps. Raise it only if samples show growing composition or palette drift.",
+  minimax_h3_teacher_direct_loss_weight: "Also learn directly from the real dataset target instead of relying entirely on the teacher's interpretation. 0 uses only the teacher. 1 adds an ordinary-training contribution normalized to roughly the same loss magnitude. This may recover details the teacher misses, but it can also reduce the teacher method's quality-preservation benefit.",
   minimax_h3_timestep_focus_min: "Lower edge of the teacher's extra sampling focus band. This uses base sigma before H3's video/audio shifts.",
   minimax_h3_timestep_focus_max: "Upper edge of the teacher's extra sampling focus band. Upstream observed content decisions mainly in the 0.4–0.8 region.",
   minimax_h3_timestep_focus_prob: "Fraction of steps deliberately drawn from the focus band. 0.5 is the upstream identity starting recipe; the remaining steps still cover the full schedule.",
@@ -153,7 +158,7 @@ const HELP = {
   krea2_keep_depth_helpers_on_gpu: "Keeps the frozen depth model and its helper tensors in GPU memory between steps. Enable only when you have plenty of free VRAM and want less CPU-to-GPU loading. Leave disabled for safer memory use; it does not improve LoRA quality.",
   krea2_depth_vae_device: "Select where Krea 2 performs the differentiable VAE decode used by depth anchoring. Training GPU is the established default. Secondary sends only the predicted latent to another visible CUDA GPU, decodes it there, and returns pixels and gradients automatically.\n\nKrea uses a lighter 2D image VAE than MiniMax, so an 8 GB helper GPU may be usable, but this is experimental and not guaranteed. Start with a short run and check the startup log to confirm the device mapping.",
 };
-const LONG_HELP = new Set(["training_mode","starting_point_mode","timestep_sampling","dop_enabled","krea2_projector_diff","krea2_generalization_preset","krea2_depth_anchor_gradient_weight","krea2_depth_anchor_grad_checkpoint","krea2_keep_depth_helpers_on_gpu","blocks_to_swap","fp8_base","minimax_h3_dit_model","minimax_h3_convrot_bwd_mode","minimax_h3_training_preview_mode","minimax_h3_foundation_lora_enabled","minimax_h3_foundation_lora","minimax_h3_quality_protection_preset","minimax_h3_training_assistant_enabled","minimax_h3_dynamic_sigma_enabled","minimax_h3_dynamic_sigma_every_n_steps","minimax_h3_training_assistant","minimax_h3_base_preservation_enabled","minimax_h3_base_preservation_loss_weight","minimax_h3_base_preservation_every_n_steps","minimax_h3_base_preservation_reference","minimax_h3_guidance_distillation_scale","minimax_h3_guidance_distillation_schedule","minimax_h3_guidance_distillation_sigma_min","recache_latents","recache_text","sample_every_n_epochs","sample_every_n_steps","sample_at_first","save_every_n_epochs","save_every_n_steps","rename_final_artifacts_to_epoch"]);
+const LONG_HELP = new Set(["training_mode","starting_point_mode","timestep_sampling","dop_enabled","flux2_reference_guided","flux2_reference_conditions","krea2_projector_diff","krea2_generalization_preset","krea2_depth_anchor_gradient_weight","krea2_depth_anchor_grad_checkpoint","krea2_keep_depth_helpers_on_gpu","blocks_to_swap","fp8_base","minimax_h3_dit_model","minimax_h3_convrot_bwd_mode","minimax_h3_training_preview_mode","minimax_h3_foundation_lora_enabled","minimax_h3_foundation_lora","minimax_h3_quality_protection_preset","minimax_h3_training_assistant_enabled","minimax_h3_dynamic_sigma_enabled","minimax_h3_dynamic_sigma_every_n_steps","minimax_h3_training_assistant","minimax_h3_base_preservation_enabled","minimax_h3_base_preservation_loss_weight","minimax_h3_base_preservation_every_n_steps","minimax_h3_base_preservation_reference","minimax_h3_guidance_distillation_scale","minimax_h3_guidance_distillation_schedule","minimax_h3_guidance_distillation_sigma_min","recache_latents","recache_text","sample_every_n_epochs","sample_every_n_steps","sample_at_first","save_every_n_epochs","save_every_n_steps","rename_final_artifacts_to_epoch"]);
 const LONG_HELP_COPY = {
   training_mode: "The model family controls far more than the visible model path. It selects the correct Musubi training script, cache commands, supported precision options, sampling behavior, and mode-specific settings.\n\nChoose the family of the base model you will actually train. Changing it later preserves your other recipe values, but you should review every model path and the Method step again.",
   starting_point_mode: "New LoRA starts from the base model with a fresh adapter. Use this for a new subject, style, or concept.\n\nContinue from LoRA adds more training to existing adapter weights, but starts a fresh optimizer and schedule. Exact recovery restores a verified saved training state so the optimizer, scheduler, epoch, and step position continue together. Do not use exact recovery merely to extend a completed run.",
@@ -310,12 +315,24 @@ function fieldControl(field, {wide = false} = {}) {
       state.settings.minimax_h3_dynamic_sigma_enabled=false;
       state.settings.minimax_h3_training_assistant_enabled=false;
       state.settings.recache_text=true;
-      toast("Teacher matching selected T2VA, disabled the alternative Ostris assistant, and enabled the required Caption/Text Cache rebuild.");
+      toast("Reference-guided learning disabled the alternative assistant and Dynamic Sigma targets, and enabled the required Caption/Text Cache rebuild.");
     }
-    if(field.key==="minimax_h3_teacher_conditions"&&input.value==="first,last"){
+    if(field.key==="minimax_h3_teacher_conditions"&&(input.value==="first,last"||input.value.startsWith("First and last"))){
       state.settings.recache_latents=true;
       state.settings.recache_text=true;
       toast("First/last teacher selected the required latent and text cache rebuilds.");
+    }
+    if(field.key==="minimax_h3_teacher_conditions"&&(input.value==="subject_ref"||input.value.startsWith("Other pictures"))){
+      state.settings.recache_latents=true;
+      state.settings.recache_text=true;
+      toast("Other-subject teacher selected both cache rebuilds; compact datasets use image-JSONL control_path entries as references.");
+    }
+    if(field.key==="flux2_reference_guided"&&input.checked){
+      toast("Reference-guided Klein training enabled. Same-item mode reuses the normal latent cache; other-picture mode needs control images cached.");
+    }
+    if(field.key==="flux2_reference_conditions"&&(input.value==="subject_ref"||input.value.startsWith("Other pictures"))){
+      state.settings.recache_latents=true;
+      toast("Other-picture Klein teacher selected the required Image/Latent Cache rebuild for control_path references.");
     }
     if(field.key==="minimax_h3_quality_protection_preset"&&applyH3QualityPreset(input.value))return;
     if(field.key==="minimax_h3_training_workflow"){
@@ -332,7 +349,7 @@ function fieldControl(field, {wide = false} = {}) {
       const presetControl=document.querySelector('[data-key="minimax_h3_quality_protection_preset"] select');
       if(presetControl)presetControl.value="Custom";
     }
-    if(["minimax_h3_training_assistant_enabled","minimax_h3_dynamic_sigma_enabled","minimax_h3_base_preservation_enabled","minimax_h3_teacher_matching","minimax_h3_foundation_lora_enabled"].includes(field.key)){
+    if(["minimax_h3_training_assistant_enabled","minimax_h3_dynamic_sigma_enabled","minimax_h3_base_preservation_enabled","minimax_h3_teacher_matching","minimax_h3_foundation_lora_enabled","flux2_reference_guided"].includes(field.key)){
       sync();renderGuided();return;
     }
     if(field.key === "krea2_generalization_preset" && applyGeneralizationPreset(input.value)) return;
@@ -471,11 +488,20 @@ function renderGuided() {
     }
   }
   const depthComputeKeys=["minimax_h3_depth_vae_device","minimax_h3_keep_depth_vae_on_device","minimax_h3_depth_every_n_steps"];
-  const h3GuidanceKeys=["minimax_h3_teacher_matching","minimax_h3_teacher_conditions","minimax_h3_teacher_condition_sigma_max","minimax_h3_teacher_loss_dc_weight","minimax_h3_teacher_loss_mag_weight","minimax_h3_teacher_preservation_weight","minimax_h3_timestep_focus_min","minimax_h3_timestep_focus_max","minimax_h3_timestep_focus_prob","minimax_h3_guidance_distillation_protection","minimax_h3_quality_protection_method","minimax_h3_quality_protection_preset","minimax_h3_training_assistant_enabled","minimax_h3_training_assistant","minimax_h3_dynamic_sigma_enabled","minimax_h3_dynamic_sigma_every_n_steps","minimax_h3_guidance_distillation_scale","minimax_h3_guidance_distillation_schedule","minimax_h3_guidance_distillation_sigma_min","minimax_h3_base_preservation_enabled","minimax_h3_base_preservation_loss_weight","minimax_h3_base_preservation_every_n_steps","minimax_h3_base_preservation_reference"];
+  const h3GuidanceKeys=["minimax_h3_teacher_matching","minimax_h3_teacher_conditions","minimax_h3_teacher_condition_sigma_max","minimax_h3_teacher_loss_dc_weight","minimax_h3_teacher_loss_mag_weight","minimax_h3_teacher_preservation_weight","minimax_h3_teacher_direct_loss_weight","minimax_h3_timestep_focus_min","minimax_h3_timestep_focus_max","minimax_h3_timestep_focus_prob","minimax_h3_guidance_distillation_protection","minimax_h3_quality_protection_method","minimax_h3_quality_protection_preset","minimax_h3_training_assistant_enabled","minimax_h3_training_assistant","minimax_h3_dynamic_sigma_enabled","minimax_h3_dynamic_sigma_every_n_steps","minimax_h3_guidance_distillation_scale","minimax_h3_guidance_distillation_schedule","minimax_h3_guidance_distillation_sigma_min","minimax_h3_base_preservation_enabled","minimax_h3_base_preservation_loss_weight","minimax_h3_base_preservation_every_n_steps","minimax_h3_base_preservation_reference"];
   const kreaDepthComputeKeys=["krea2_depth_vae_device"];
   const dopKeys=["dop_enabled","dop_trigger_word","dop_class_word","dop_loss_weight"];
-  const regularizationKeys=schemaFields(["regularization"]).map(field=>field.key).filter(key=>!depthComputeKeys.includes(key)&&!kreaDepthComputeKeys.includes(key)&&!dopKeys.includes(key)&&!h3GuidanceKeys.includes(key));
+  const fluxRefKeys=["flux2_reference_guided","flux2_reference_conditions","flux2_reference_sigma_max","flux2_reference_direct_loss_weight"];
+  const regularizationKeys=schemaFields(["regularization"]).map(field=>field.key).filter(key=>!depthComputeKeys.includes(key)&&!kreaDepthComputeKeys.includes(key)&&!dopKeys.includes(key)&&!h3GuidanceKeys.includes(key)&&!fluxRefKeys.includes(key));
   appendFields($("#regularization-fields"),regularizationKeys);
+  if(mode==="Flux.2 Klein"){
+    appendFields($("#regularization-fields"),["flux2_reference_guided"]);
+    if(state.settings.flux2_reference_guided)appendFields($("#regularization-fields"),fluxRefKeys.slice(1));
+  }else if(mode==="Flux.2 Dev"){
+    appendFields($("#regularization-fields"),["flux2_reference_guided"]);
+    const fluxRefField=$("#regularization-fields").querySelector('[data-key="flux2_reference_guided"]');
+    if(fluxRefField)markUnavailable(fluxRefField,"Reference-guided learning is implemented for FLUX.2 Klein only; Dev uses a different training target.");
+  }
   $("#regularization-settings").hidden=h3Multimodal;
   const supportsDop=["Krea 2","Flux.2 Klein","MiniMax H3 (Experimental)"].includes(mode);
   $("#dop-settings").hidden=!supportsDop;
@@ -485,7 +511,7 @@ function renderGuided() {
   const visibleH3Protection=[];
   if(h3Multimodal){
     visibleH3Protection.push("minimax_h3_teacher_matching");
-    if(state.settings.minimax_h3_teacher_matching)visibleH3Protection.push("minimax_h3_teacher_conditions","minimax_h3_teacher_condition_sigma_max","minimax_h3_teacher_loss_dc_weight","minimax_h3_teacher_loss_mag_weight","minimax_h3_teacher_preservation_weight","minimax_h3_timestep_focus_min","minimax_h3_timestep_focus_max","minimax_h3_timestep_focus_prob");
+    if(state.settings.minimax_h3_teacher_matching)visibleH3Protection.push("minimax_h3_teacher_conditions","minimax_h3_teacher_condition_sigma_max","minimax_h3_teacher_loss_dc_weight","minimax_h3_teacher_loss_mag_weight","minimax_h3_teacher_preservation_weight","minimax_h3_teacher_direct_loss_weight","minimax_h3_timestep_focus_min","minimax_h3_timestep_focus_max","minimax_h3_timestep_focus_prob");
     else {
       visibleH3Protection.push("minimax_h3_training_assistant_enabled");
       if(state.settings.minimax_h3_training_assistant_enabled)visibleH3Protection.push("minimax_h3_training_assistant");
@@ -493,12 +519,16 @@ function renderGuided() {
     }
     visibleH3Protection.push("minimax_h3_base_preservation_enabled","minimax_h3_base_preservation_loss_weight","minimax_h3_base_preservation_every_n_steps","minimax_h3_base_preservation_reference");
   }else{
-    visibleH3Protection.push("minimax_h3_quality_protection_preset","minimax_h3_training_assistant_enabled");
-    if(state.settings.minimax_h3_training_assistant_enabled)visibleH3Protection.push("minimax_h3_training_assistant");
-    visibleH3Protection.push("minimax_h3_dynamic_sigma_enabled");
-    if(state.settings.minimax_h3_dynamic_sigma_enabled)visibleH3Protection.push("minimax_h3_dynamic_sigma_every_n_steps","minimax_h3_guidance_distillation_scale","minimax_h3_guidance_distillation_schedule","minimax_h3_guidance_distillation_sigma_min");
-    visibleH3Protection.push("minimax_h3_base_preservation_enabled");
-    if(state.settings.minimax_h3_base_preservation_enabled)visibleH3Protection.push("minimax_h3_base_preservation_loss_weight","minimax_h3_base_preservation_every_n_steps","minimax_h3_base_preservation_reference");
+    visibleH3Protection.push("minimax_h3_teacher_matching");
+    if(state.settings.minimax_h3_teacher_matching)visibleH3Protection.push("minimax_h3_teacher_conditions","minimax_h3_teacher_condition_sigma_max","minimax_h3_teacher_direct_loss_weight");
+    else {
+      visibleH3Protection.push("minimax_h3_quality_protection_preset","minimax_h3_training_assistant_enabled");
+      if(state.settings.minimax_h3_training_assistant_enabled)visibleH3Protection.push("minimax_h3_training_assistant");
+      visibleH3Protection.push("minimax_h3_dynamic_sigma_enabled");
+      if(state.settings.minimax_h3_dynamic_sigma_enabled)visibleH3Protection.push("minimax_h3_dynamic_sigma_every_n_steps","minimax_h3_guidance_distillation_scale","minimax_h3_guidance_distillation_schedule","minimax_h3_guidance_distillation_sigma_min");
+      visibleH3Protection.push("minimax_h3_base_preservation_enabled");
+      if(state.settings.minimax_h3_base_preservation_enabled)visibleH3Protection.push("minimax_h3_base_preservation_loss_weight","minimax_h3_base_preservation_every_n_steps","minimax_h3_base_preservation_reference");
+    }
   }
   appendFields($("#minimax-guidance-fields"),visibleH3Protection);
   const h3Foundation=$("#minimax-foundation-lora");

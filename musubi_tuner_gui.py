@@ -721,6 +721,42 @@ class MusubiTunerGUI:
         self._add_widget(self.hidden_frames['flux2_model_paths'], "flux2_dit_model", "DiT Model:", "Path to the Flux.2 DiT model (.safetensors).", kind='path_entry', options=[("Model files", "*.safetensors *.pt")], is_required=True, is_path=True)
         self._add_widget(self.hidden_frames['flux2_model_paths'], "flux2_text_encoder", "Text Encoder (Qwen3 or Mistral3):", "Path to the Qwen3 or Mistral3 text encoder directory or safetensors file.", kind='path_entry', options=[("Model files", "*.safetensors *.pt")], is_required=True, is_path=True)
         self._add_widget(self.hidden_frames['flux2_model_paths'], "fp8_text_encoder", "FP8 Text Encoder", "Load the text encoder in FP8 precision to reduce VRAM.", kind='checkbox')
+        flux_ref_title = ttk.Label(
+            self.hidden_frames['flux2_model_paths'], text="Reference-Guided Learning (Experimental)", style="PageTitle.TLabel"
+        )
+        flux_ref_title.pack(anchor="w", padx=8, pady=(12, 2))
+        ToolTip(
+            flux_ref_title,
+            "Like what FLUX.2 Klein produces from a reference picture and want to capture that behavior in a "
+            "caption-only LoRA? A frozen teacher sees the picture while the student does not. This is the cheaper "
+            "off-policy experiment, not the paper's multi-step EMA algorithm, and it is unavailable for Flux.2 Dev.",
+        )
+        self._add_widget(
+            self.hidden_frames['flux2_model_paths'], "flux2_reference_guided", "Use Reference-Guided Learning",
+            "A frozen Klein teacher gets extra image information and the trainable LoRA learns to reproduce its "
+            "prediction from text alone. The reference is not required afterward. Adds one no-gradient DiT pass "
+            "per step and may inherit the teacher's mistakes.",
+            kind="checkbox", default_val=False, command=self._on_flux2_reference_changed,
+        )
+        self._flux2_reference_details = ttk.Frame(self.hidden_frames['flux2_model_paths'])
+        self._add_widget(
+            self._flux2_reference_details, "flux2_reference_conditions", "Teacher Information:",
+            "Same training item gives the teacher the exact target. Other pictures uses control_path/control_path_N "
+            "images from an image JSONL; those pictures are hidden from the student.",
+            kind="combobox", options=["Same training item (self-reference)", "Other pictures of subject (image JSONL)"],
+            command=self._on_flux2_reference_changed,
+        )
+        self._add_widget(
+            self._flux2_reference_details, "flux2_reference_sigma_max", "Teacher Cutoff Sigma:",
+            "Start with 0.75. Above this noise level the teacher drops the reference and becomes a frozen-base preservation target.",
+            validate_num=True,
+        )
+        self._add_widget(
+            self._flux2_reference_details, "flux2_reference_direct_loss_weight", "Direct Dataset Learning Contribution:",
+            "0 uses only the teacher. 1 adds an ordinary target contribution normalized to roughly the teacher loss size. "
+            "It can recover details the teacher misses but may reduce preservation.",
+            validate_num=True,
+        )
 
         # ---- Krea 2 model paths section ----
         self.hidden_frames['krea2_model_paths'] = ttk.LabelFrame(frame, text="Krea 2 Model Paths")
@@ -1407,32 +1443,41 @@ class MusubiTunerGUI:
         ).pack(anchor="w", padx=10, pady=(8, 4))
         teacher_title = ttk.Label(
             self.hidden_frames['minimax_h3_guidance_protection'],
-            text="Native video workflow · upstream teacher matching",
+            text="Reference-guided learning (Experimental)",
             style="PageTitle.TLabel",
         )
         teacher_title.pack(anchor="w", padx=10, pady=(6, 2))
-        ToolTip(teacher_title, "These controls apply only to native Video + audio training and require a T2VA task plus a rebuilt text cache.")
+        ToolTip(
+            teacher_title,
+            "Available for native T2VA and compact still-image training. Compact ConvRot supports Same training "
+            "item and image-JSONL control_path pictures; native video also supports other-subject references and "
+            "first/last frames. Enabling it "
+            "requires rebuilding the text cache because the teacher needs visual-aware Qwen rows.",
+        )
         self._add_widget(
             self.hidden_frames['minimax_h3_guidance_protection'], "minimax_h3_teacher_matching",
-            "Use Upstream Teacher Matching",
-            "Another experimental way to protect the model's original quality while training. The unchanged base model "
-            "acts as a teacher and discourages the LoRA from degrading video quality. It works with normal still-image "
-            "datasets: no separate reference image is needed. Use Ref for still images. Training is slower because the "
-            "model runs one extra time per step, and the Caption/Text Cache must be rebuilt. It cannot run together with Dynamic Sigma.",
+            "Use Reference-Guided Learning",
+            "Like what H3 produces from your reference pictures and want to capture that behavior in a LoRA? A frozen "
+            "teacher sees extra image information; the LoRA must reproduce its prediction from the caption alone, so "
+            "the reference is not required afterward. This can inherit both the teacher's strengths and mistakes. It "
+            "is the practical Ostris/Musubi off-policy experiment, not the paper's much heavier 4/8-step EMA "
+            "on-policy algorithm. It is slower, may use more memory, and is not proven better than ordinary training.",
             kind="checkbox", default_val=False, command=self._on_h3_teacher_matching_changed,
         )
         self._add_widget(
             self.hidden_frames['minimax_h3_guidance_protection'], "minimax_h3_teacher_conditions", "Teacher Information:",
-            "Use Ref for normal still-image training. It uses the current training sample, so you do not need a separate "
-            "reference image. First,last is intended for video datasets and uses the real first and last frames. Ref is "
-            "the recommended starting option.",
-            kind="combobox", options=["ref", "first,last"], command=self._on_h3_teacher_matching_changed,
+            "Same training item lets the teacher see the exact image/video being learned. Other pictures never shows "
+            "the answer item to the teacher: native video uses its JSONL references list; compact image training uses "
+            "control_path/control_path_N entries in an image JSONL. First and last uses "
+            "video endpoints. These are different experiments, not quality levels.",
+            kind="combobox", options=["Same training item (Ostris-style)", "Other pictures of subject (Musubi-style)", "First and last video frames (upstream)"], command=self._on_h3_teacher_matching_changed,
         )
         for key, label, tip in (
             ("minimax_h3_teacher_condition_sigma_max", "Teacher Cutoff Sigma:", "Recommended 0.75. Above this base sigma the extra pass becomes pure frozen-base preservation."),
             ("minimax_h3_teacher_loss_dc_weight", "Teacher Color/Style Weight:", "Upstream identity starting value: 0.3. Reduces copying of global color and tone on teaching steps."),
             ("minimax_h3_teacher_loss_mag_weight", "Teacher Magnitude Weight:", "Keep 1.0 normally. This changes conditioned teaching steps only; preservation-anchor steps always retain full magnitude correction."),
             ("minimax_h3_teacher_preservation_weight", "Teacher Base-Preservation Weight:", "Keep 1.0 initially. Raise only when high-noise composition or palette drift keeps growing."),
+            ("minimax_h3_teacher_direct_loss_weight", "Direct Dataset Learning Contribution:", "Also learn from the exact real training image or video instead of relying entirely on the teacher's interpretation. 0 uses only the teacher. 1 adds an ordinary-training contribution normalized to roughly the same magnitude. This may recover details the teacher misses, but can reduce the preservation benefit."),
             ("minimax_h3_timestep_focus_min", "Teacher Focus Band Start:", "Lower base-sigma edge of the teacher focus band; upstream starts at 0.4."),
             ("minimax_h3_timestep_focus_max", "Teacher Focus Band End:", "Upper base-sigma edge of the teacher focus band; upstream starts at 0.8."),
             ("minimax_h3_timestep_focus_prob", "Teacher Focus Probability:", "0.5 draws half the steps from the focus band while the rest still cover the full schedule."),
@@ -6849,6 +6894,28 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             if self.entries["network_alpha_low"].get().strip() in ("", "16"):
                 self.entries["network_alpha_low"].delete(0, tk.END)
                 self.entries["network_alpha_low"].insert(0, "32")
+        elif mode in ("Flux.2 Klein", "Flux.2 Dev") and settings.get("flux2_reference_guided"):
+            if mode == "Flux.2 Dev":
+                messagebox.showerror("Validation Error", "Reference-Guided Learning currently supports Flux.2 Klein only.")
+                return
+            try:
+                cutoff = float(settings.get("flux2_reference_sigma_max") or "")
+                direct = float(settings.get("flux2_reference_direct_loss_weight") or "")
+                if not 0 <= cutoff <= 1 or direct < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                messagebox.showerror(
+                    "Validation Error",
+                    "Klein Teacher Cutoff Sigma must be between 0 and 1, and Direct Dataset Learning Contribution cannot be negative.",
+                )
+                return
+            if str(settings.get("flux2_reference_conditions") or "").lower().startswith("other pictures"):
+                if not settings.get("recache_latents"):
+                    messagebox.showerror(
+                        "Validation Error",
+                        "Other-picture Klein learning needs control_path/control_path_N references and Rebuild Image/Latent Cache enabled.",
+                    )
+                    return
         elif mode == "MiniMax H3 (Experimental)":
             multimodal = str(self.entries["minimax_h3_training_workflow"].get() or "").startswith("Video")
             self.mode_note_label.config(text=(
@@ -6881,6 +6948,8 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             self.hidden_frames['krea2_model_paths'].pack_forget()
             self.hidden_frames['minimax_h3_model_paths'].pack_forget()
             self.hidden_frames['flux2_model_paths'].pack(fill="x", padx=10, pady=10, before=self._vae_frame)
+            self.entries["flux2_reference_guided"].configure(state="normal" if mode == "Flux.2 Klein" else "disabled")
+            self._on_flux2_reference_changed()
             # Update version choices
             ver_combo = self.entries["flux2_model_version"]
             if mode == "Flux.2 Dev":
@@ -7360,7 +7429,7 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
                         widget.configure(state="readonly")
                     else:
                         widget.configure(state="normal")
-                teacher_active = h3_multimodal and self.entries["minimax_h3_teacher_matching"].var.get()
+                teacher_active = self.entries["minimax_h3_teacher_matching"].var.get()
                 self.entries["minimax_h3_training_assistant_enabled"].configure(state="disabled" if teacher_active else "normal")
                 self.entries["minimax_h3_training_assistant"].configure(
                     state="normal" if self.entries["minimax_h3_training_assistant_enabled"].var.get() and not teacher_active else "disabled"
@@ -7458,9 +7527,24 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
                 self.entries["minimax_h3_dynamic_sigma_enabled"].var.set(False)
                 self.entries["minimax_h3_training_assistant_enabled"].var.set(False)
                 self.entries["recache_text"].var.set(True)
-                if self.entries["minimax_h3_teacher_conditions"].get() == "first,last":
+                condition = self.entries["minimax_h3_teacher_conditions"].get().lower()
+                if condition == "first,last" or condition.startswith("first and last") or condition.startswith("other pictures"):
                     self.entries["recache_latents"].var.set(True)
             self._on_h3_quality_controls_changed(mark_custom=False)
+        except (KeyError, AttributeError, tk.TclError):
+            pass
+
+    def _on_flux2_reference_changed(self, _event=None):
+        try:
+            enabled = self.entries["flux2_reference_guided"].var.get()
+            if enabled:
+                self._flux2_reference_details.pack(fill="x", padx=8, pady=(2, 8))
+                condition = self.entries["flux2_reference_conditions"].get().lower()
+                if condition.startswith("other pictures"):
+                    self.entries["recache_latents"].var.set(True)
+            else:
+                self._flux2_reference_details.pack_forget()
+            self.update_button_states()
         except (KeyError, AttributeError, tk.TclError):
             pass
 
@@ -7748,6 +7832,8 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             "min_timestep_low": "0", "max_timestep_low": "875", "min_timestep_high": "875", "max_timestep_high": "1000",
             "vae_model": "", "clip_model": "", "t5_model": "",
             "flux2_model_version": "Klein Base 4B ★", "flux2_dit_model": "", "flux2_text_encoder": "", "fp8_text_encoder": False,
+            "flux2_reference_guided": False, "flux2_reference_conditions": "Same training item (self-reference)",
+            "flux2_reference_sigma_max": "0.75", "flux2_reference_direct_loss_weight": "0.0",
             "krea2_dit_model": "", "krea2_text_encoder": "", "krea2_turbo_dit": "", "krea2_turbo_dit_cache": False,
             "krea2_projector_diff": "", "krea2_projector_diff_strength": "1.0",
             "minimax_h3_training_workflow": "Still images · compact ConvRot", "minimax_h3_multimodal_task": "t2va",
@@ -7771,9 +7857,10 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
             "minimax_h3_guidance_distillation_scale": "4.0",
             "minimax_h3_guidance_distillation_schedule": "sigma",
             "minimax_h3_guidance_distillation_sigma_min": "0.15",
-            "minimax_h3_teacher_matching": False, "minimax_h3_teacher_conditions": "ref",
+            "minimax_h3_teacher_matching": False, "minimax_h3_teacher_conditions": "Same training item (Ostris-style)",
             "minimax_h3_teacher_condition_sigma_max": "0.75", "minimax_h3_teacher_loss_dc_weight": "0.3",
             "minimax_h3_teacher_loss_mag_weight": "1.0", "minimax_h3_teacher_preservation_weight": "1.0",
+            "minimax_h3_teacher_direct_loss_weight": "0.0",
             "minimax_h3_timestep_focus_min": "0.4", "minimax_h3_timestep_focus_max": "0.8",
             "minimax_h3_timestep_focus_prob": "0.5",
             "minimax_h3_training_assistant": "ostris/minimax_h3_training_adapter/minimax_h3_training_adapter_v1.safetensors",
