@@ -90,6 +90,10 @@ not contain the GUI files.
 
 ### MiniMax H3 official video and joint-audio path
 
+- Selectively imported upstream PR #1073's generic LoRA conversion fix: preserve
+  `qkv_proj`, `out_proj`, and `adaln_proj` module names when exporting. Original
+  trainer checkpoints are unaffected. Regression coverage: `tests/test_convert_lora_h3.py`.
+
 - Upstream `/dev` capability snapshot: `b871786` (2026-08-25). Selectively adopted through PR #1065; upstream one-frame training/editing remains an evaluation candidate rather than a replacement for the proven 24 GB compact path.
 - The upstream multimodal modules live under `src/musubi_tuner/minimax_h3_native/` and use entry points named `minimax_h3_native_*`. This namespace is intentional: never overwrite the compact downstream `minimax_h3/` image implementation with the upstream package wholesale.
 - `backends/minimax_h3.py` selects the native entry points only when `minimax_h3_training_workflow` starts with `Video`; missing/old projects remain on `Still images · compact ConvRot`.
