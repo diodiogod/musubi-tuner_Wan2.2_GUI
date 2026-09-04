@@ -1441,31 +1441,44 @@ class MusubiTunerGUI:
             wraplength=850,
             style="PageHelp.TLabel",
         ).pack(anchor="w", padx=10, pady=(8, 4))
-        teacher_title = ttk.Label(
+        h3_reference_guided_frame = ttk.LabelFrame(
             self.hidden_frames['minimax_h3_guidance_protection'],
-            text="Reference-guided learning (Experimental)",
-            style="PageTitle.TLabel",
+            text="Reference-Guided Learning (Experimental · Optional)",
         )
-        teacher_title.pack(anchor="w", padx=10, pady=(6, 2))
-        ToolTip(
-            teacher_title,
-            "Available for native T2VA and compact still-image training. Compact ConvRot supports Same training "
-            "item and image-JSONL control_path pictures; native video also supports other-subject references and "
-            "first/last frames. Enabling it "
-            "requires rebuilding the text cache because the teacher needs visual-aware Qwen rows.",
+        teacher_heading = ttk.Frame(h3_reference_guided_frame)
+        teacher_heading.pack(fill="x", padx=10, pady=(7, 2))
+        ttk.Label(
+            teacher_heading,
+            text="Alternative experimental learning method—not the recommended default.",
+            style="PageHelp.TLabel",
+        ).pack(side="left", fill="x", expand=True)
+        teacher_long_help = (
+            "Like what H3 produces from your reference pictures and want to capture that behavior in a LoRA? "
+            "A frozen teacher sees extra image information, while the LoRA learns to reproduce its prediction "
+            "from the caption alone, so the reference is not required when using the finished LoRA.\n\n"
+            "This is an experimental alternative to the established Dynamic Sigma and assistant-based quality "
+            "protection—not the recommended default. It can inherit both the teacher's strengths and mistakes, "
+            "takes an additional model pass, may use more memory, and is not proven to outperform ordinary "
+            "training. This follows the practical Ostris/Musubi off-policy approach, not the paper's much heavier "
+            "multi-step EMA on-policy algorithm.\n\nEnabling it requires rebuilding the Caption/Text Cache because "
+            "the teacher needs visual-aware Qwen rows. Start with a short comparison and keep an ordinary-training baseline."
         )
+        ttk.Button(
+            teacher_heading,
+            text="?",
+            width=3,
+            command=lambda: messagebox.showinfo(
+                "Reference-Guided Learning", teacher_long_help, parent=self.root
+            ),
+        ).pack(side="right", padx=(8, 0))
         self._add_widget(
-            self.hidden_frames['minimax_h3_guidance_protection'], "minimax_h3_teacher_matching",
+            h3_reference_guided_frame, "minimax_h3_teacher_matching",
             "Use Reference-Guided Learning",
-            "Like what H3 produces from your reference pictures and want to capture that behavior in a LoRA? A frozen "
-            "teacher sees extra image information; the LoRA must reproduce its prediction from the caption alone, so "
-            "the reference is not required afterward. This can inherit both the teacher's strengths and mistakes. It "
-            "is the practical Ostris/Musubi off-policy experiment, not the paper's much heavier 4/8-step EMA "
-            "on-policy algorithm. It is slower, may use more memory, and is not proven better than ordinary training.",
+            "Experimental alternative. Click the ? above for the full explanation and limitations.",
             kind="checkbox", default_val=False, command=self._on_h3_teacher_matching_changed,
         )
         self._add_widget(
-            self.hidden_frames['minimax_h3_guidance_protection'], "minimax_h3_teacher_conditions", "Teacher Information:",
+            h3_reference_guided_frame, "minimax_h3_teacher_conditions", "Teacher Information:",
             "Same training item lets the teacher see the exact image/video being learned. Other pictures never shows "
             "the answer item to the teacher: native video uses its JSONL references list; compact image training uses "
             "control_path/control_path_N entries in an image JSONL. First and last uses "
@@ -1482,7 +1495,7 @@ class MusubiTunerGUI:
             ("minimax_h3_timestep_focus_max", "Teacher Focus Band End:", "Upper base-sigma edge of the teacher focus band; upstream starts at 0.8."),
             ("minimax_h3_timestep_focus_prob", "Teacher Focus Probability:", "0.5 draws half the steps from the focus band while the rest still cover the full schedule."),
         ):
-            self._add_widget(self.hidden_frames['minimax_h3_guidance_protection'], key, label, tip, validate_num=True)
+            self._add_widget(h3_reference_guided_frame, key, label, tip, validate_num=True)
         self._add_widget(
             self.hidden_frames['dop_options'],
             "dop_enabled",
@@ -1648,6 +1661,7 @@ class MusubiTunerGUI:
             "The dynamic method was adapted independently for Musubi. Assistant modes consume Ostris's published "
             "minimax_h3_training_adapter_v1.safetensors as a frozen live helper and do not merge it into user outputs.",
         )
+        h3_reference_guided_frame.pack(fill="x", padx=10, pady=(6, 10))
 
         self.hidden_frames['krea2_regularization'] = ttk.LabelFrame(self.regularization_frame, text="Krea 2 · Generalization (Experimental)")
         ttk.Label(
