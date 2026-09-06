@@ -800,9 +800,10 @@ class MusubiTunerGUI:
         ).pack(anchor="w", padx=8, pady=(8, 4))
         self._add_widget(
             self.hidden_frames['minimax_h3_model_paths'], "minimax_h3_training_workflow", "Training Media Type:",
-            "Still images uses this GUI's proven compact ConvRot workflow. Video + audio uses the isolated official "
-            "MiniMax multimodal cache and trainer. Existing projects default to Still images for backward compatibility.",
-            kind='combobox', options=["Still images · compact ConvRot", "Video + audio · official multimodal"],
+            "Still images uses this GUI's proven compact ConvRot workflow. Video + audio uses only clips. Video + images "
+            "uses upstream PR #1057's native one-frame targets so ordinary image datasets and full video clips can train "
+            "together without converting images into fake videos. Existing projects keep their saved workflow.",
+            kind='combobox', options=["Still images · compact ConvRot", "Video + audio · official multimodal", "Video + images · official mixed T2VA"],
         )
         self._add_widget(
             self.hidden_frames['minimax_h3_model_paths'], "minimax_h3_multimodal_task", "Video Model Task:",
@@ -9222,6 +9223,13 @@ Note: If you get a 'ValueError: fp16 mixed precision requires a GPU', try answer
                     return
             h3_protection = minimax_h3_backend.quality_protection_components(settings)
             if multimodal:
+                mixed_one_frame = str(settings.get("minimax_h3_training_workflow") or "").startswith("Video + images")
+                if mixed_one_frame and settings.get("minimax_h3_multimodal_task") != "t2va":
+                    messagebox.showerror("Validation Error", "Mixed native image/video training currently supports T2VA only.")
+                    return
+                if mixed_one_frame and settings.get("minimax_h3_teacher_matching"):
+                    messagebox.showerror("Validation Error", "Reference-guided teacher matching is not yet compatible with native one-frame image batches.")
+                    return
                 # Compact-only values remain saved and visible but are deliberately
                 # inactive in the native trainer.
                 h3_protection["assistant"] = False

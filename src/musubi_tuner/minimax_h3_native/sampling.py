@@ -25,6 +25,7 @@ from fractions import Fraction
 from pathlib import Path
 
 import av
+from PIL import Image
 import torch
 
 from musubi_tuner.minimax_h3_native.packing import H3PackedLayout
@@ -289,6 +290,14 @@ def decoded_video_to_uint8(decoded_video: torch.Tensor, *, frame_limit: int) -> 
 # PyAV's implicit libx264 rate control is roughly 1 Mbps, which visibly
 # destroys detail in H3's high-resolution previews. CRF is resolution-aware.
 H3_VIDEO_CRF = 16
+
+
+def write_image(frame: torch.Tensor, output_path: str | Path) -> None:
+    if frame.ndim != 3 or frame.shape[-1] != 3 or frame.dtype != torch.uint8:
+        raise ValueError(f"MiniMax-H3 image write needs uint8 [H,W,3], got {tuple(frame.shape)} {frame.dtype}")
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(frame.cpu().numpy()).save(output_path)
 
 
 def write_video_only(video: torch.Tensor, output_path: str | Path, *, fps: int = 24) -> None:

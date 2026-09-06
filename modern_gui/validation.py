@@ -117,6 +117,7 @@ def validate_training_settings(settings: dict[str, Any]) -> dict[str, list[dict[
                 )
         multimodal = str(settings.get("minimax_h3_training_workflow") or "").startswith("Video")
         if multimodal:
+            mixed_one_frame = str(settings.get("minimax_h3_training_workflow") or "").startswith("Video + images")
             require("minimax_h3_video_vae", "official MiniMax H3 video VAE")
             require("minimax_h3_audio_vae", "official MiniMax H3 audio VAE")
             if "int8" in Path(str(settings.get("minimax_h3_video_vae") or "")).name.lower():
@@ -127,6 +128,10 @@ def validate_training_settings(settings: dict[str, Any]) -> dict[str, list[dict[
             dit_name = Path(str(settings.get("minimax_h3_dit_model") or "")).name.lower()
             selected_task = str(settings.get("minimax_h3_multimodal_task") or "t2va")
             teacher_matching = bool(settings.get("minimax_h3_teacher_matching"))
+            if mixed_one_frame and selected_task != "t2va":
+                error("minimax_h3_multimodal_task", "Mixed native image/video training currently supports T2VA only.")
+            if mixed_one_frame and teacher_matching:
+                error("minimax_h3_teacher_matching", "Reference-guided teacher matching is not yet compatible with native one-frame image batches.")
             if teacher_matching:
                 if selected_task != "t2va":
                     error("minimax_h3_multimodal_task", "Teacher matching trains a T2VA student. Select t2va.")
@@ -203,6 +208,7 @@ def validate_training_settings(settings: dict[str, Any]) -> dict[str, list[dict[
                     task=str(settings.get("minimax_h3_multimodal_task") or "t2va"),
                     training_target=target,
                     allow_experimental_duration=bool(settings.get("minimax_h3_allow_experimental_duration")),
+                    allow_one_frame_images=mixed_one_frame,
                 )
                 for message in dataset_audit["errors"]:
                     error("dataset_config", message)

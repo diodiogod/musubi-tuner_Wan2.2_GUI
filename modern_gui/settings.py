@@ -171,7 +171,11 @@ CHOICES = {
     "krea2_weight_noise_mode": ["relative", "absolute"],
     "krea2_generalization_preset": ["Off (Baseline)", "Weight Noise Only", "Balanced Experimental"],
     "minimax_h3_convrot_bwd_mode": ["bf16", "int8"],
-    "minimax_h3_training_workflow": ["Still images · compact ConvRot", "Video + audio · official multimodal"],
+    "minimax_h3_training_workflow": [
+        "Still images · compact ConvRot",
+        "Video + audio · official multimodal",
+        "Video + images · official mixed T2VA",
+    ],
     "minimax_h3_training_target": ["Video + audio", "Video only", "Audio only (experimental)"],
     "minimax_h3_multimodal_task": ["t2va", "fl2va", "ref2va"],
     "minimax_h3_teacher_conditions": [

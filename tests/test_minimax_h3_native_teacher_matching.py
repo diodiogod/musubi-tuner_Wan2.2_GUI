@@ -24,11 +24,29 @@ from musubi_tuner.minimax_h3_native_train_network import (
     _apply_timestep_focus,
     _decomposed_flow_loss,
     _prediction_geometry_log,
+    _runtime_batch_plan,
     minimax_h3_setup_parser,
 )
 from musubi_tuner.modules.custom_offloading_utils import BlockSwapConfig
 from musubi_tuner.networks import lora_minimax_h3
 from musubi_tuner.training.trainer_base import DiTOutput
+
+
+def test_one_frame_runtime_batch_can_mix_with_ordinary_video_batches():
+    image_batch = _training_batch()
+    image_batch["latents_audio"] = torch.zeros(1, 32, 2, 2)
+    image_batch["audio_present"] = torch.tensor([0.0])
+    image_batch["one_frame_target_index"] = torch.tensor([24], dtype=torch.int64)
+    image_plan = _runtime_batch_plan(image_batch, torch.zeros(1, 24, 1, 4, 4), one_frame=True)
+
+    video_batch = _training_batch()
+    video_plan = _runtime_batch_plan(video_batch, torch.zeros(1, 24, 2, 4, 4), one_frame=True)
+
+    assert image_plan.layout.target_video.frames == 1
+    assert image_plan.layout.time_overrides is not None
+    assert image_plan.audio_present.item() == 0.0
+    assert video_plan.layout.target_video.frames == 2
+    assert video_plan.layout.time_overrides is None
 
 
 def test_process_batch_accumulates_observed_audio_supervision(monkeypatch):

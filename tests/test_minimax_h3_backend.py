@@ -1,3 +1,5 @@
+import pytest
+
 from backends import minimax_h3
 
 
@@ -38,6 +40,30 @@ def test_training_command_enforces_direct_int8_safe_path(tmp_path):
     assert "--h3_guidance_distillation_protection" in command
     assert command[command.index("--h3_dynamic_sigma_every_n_steps") + 1] == "1"
     assert command[command.index("--h3_guidance_distillation_sigma_min") + 1] == "0.15"
+
+
+def test_native_mixed_workflow_enables_one_frame_for_training_and_caches(tmp_path):
+    settings = _settings(tmp_path) | {
+        "minimax_h3_training_workflow": "Video + images · official mixed T2VA",
+        "minimax_h3_multimodal_task": "t2va",
+        "minimax_h3_video_vae": str(tmp_path / "video_vae.safetensors"),
+        "minimax_h3_audio_vae": str(tmp_path / "audio_vae.safetensors"),
+        "recache_latents": True,
+        "recache_text": True,
+    }
+    (train,) = minimax_h3.build_commands(settings)
+    caches = minimax_h3.build_cache_commands(settings, "python")
+    assert "--one_frame" in train
+    assert len(caches) == 2 and all("--one_frame" in command for command in caches)
+
+
+def test_native_mixed_workflow_rejects_non_t2va(tmp_path):
+    settings = _settings(tmp_path) | {
+        "minimax_h3_training_workflow": "Video + images · official mixed T2VA",
+        "minimax_h3_multimodal_task": "fl2va",
+    }
+    with pytest.raises(ValueError, match="T2VA"):
+        minimax_h3.build_commands(settings)
 
 
 def test_compact_workflow_exposes_shifted_uniform_without_changing_default(tmp_path):

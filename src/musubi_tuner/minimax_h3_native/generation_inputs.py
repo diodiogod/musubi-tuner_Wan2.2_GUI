@@ -24,6 +24,40 @@ from musubi_tuner.minimax_h3_native_cache_latents import PyAVH3MediaDecoder
 VIDEO_VAE_SPATIAL_RATIO = 16
 
 
+def parse_one_frame_options(spec: str) -> tuple[int, tuple[int, ...] | None]:
+    """Parse one-frame target/control positions expressed as 24 fps pixel-frame indices."""
+
+    def nonnegative_index(value: str, label: str) -> int:
+        try:
+            index = int(value)
+        except ValueError as error:
+            raise ValueError(f"MiniMax-H3 --one_frame {label} must be an integer, got {value!r}") from error
+        if index < 0:
+            raise ValueError(f"MiniMax-H3 --one_frame {label} must be nonnegative, got {index}")
+        return index
+
+    target_index = 0
+    control_indices = None
+    seen = set()
+    for part in spec.split(","):
+        key, separator, value = part.partition("=")
+        key, value = key.strip(), value.strip()
+        if not separator or not key or not value:
+            raise ValueError(f"MiniMax-H3 --one_frame options must be key=value, got {part!r}")
+        if key not in {"target_index", "control_index"}:
+            raise ValueError(
+                f"MiniMax-H3 --one_frame has unknown option {key!r} (allowed: target_index, control_index)"
+            )
+        if key in seen:
+            raise ValueError(f"MiniMax-H3 --one_frame has duplicate option {key!r}")
+        seen.add(key)
+        if key == "target_index":
+            target_index = nonnegative_index(value, "target_index")
+        else:
+            control_indices = tuple(nonnegative_index(item, "control_index") for item in value.split(";"))
+    return target_index, control_indices
+
+
 def dummy_record(prompt: str) -> H3Record:
     return H3Record(
         video_path=Path("."),

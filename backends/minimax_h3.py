@@ -59,6 +59,10 @@ def is_multimodal(settings):
     return str(settings.get("minimax_h3_training_workflow") or "Still images · compact ConvRot").startswith("Video")
 
 
+def is_mixed_one_frame(settings):
+    return str(settings.get("minimax_h3_training_workflow") or "").startswith("Video + images")
+
+
 def _guidance_cache_path(settings):
     configured = str(settings.get("minimax_h3_guidance_uncond_cache") or "").strip()
     if configured:
@@ -180,6 +184,11 @@ def build_commands(settings):
 
 def _build_multimodal_commands(settings):
     """Build the isolated upstream video/joint-audio trainer command."""
+    if is_mixed_one_frame(settings):
+        if str(settings.get("minimax_h3_multimodal_task") or "t2va") != "t2va":
+            raise ValueError("Mixed native MiniMax image/video training currently supports T2VA only")
+        if settings.get("minimax_h3_teacher_matching"):
+            raise ValueError("Mixed native one-frame training is not yet compatible with teacher matching")
     cmd = [
         "accelerate", "launch", "--num_processes", "1", "--num_cpu_threads_per_process", "1",
         "src/musubi_tuner/minimax_h3_native_train_network.py",
@@ -188,6 +197,7 @@ def _build_multimodal_commands(settings):
     add_arg(cmd, "--dit", settings.get("minimax_h3_dit_model"), is_path=True)
     add_arg(cmd, "--dataset_config", settings.get("dataset_config"), is_path=True)
     add_arg(cmd, "--task", settings.get("minimax_h3_multimodal_task") or "t2va")
+    add_arg(cmd, "--one_frame", is_mixed_one_frame(settings))
     add_arg(cmd, "--video_vae", settings.get("minimax_h3_video_vae"), is_path=True)
     add_arg(cmd, "--audio_vae", settings.get("minimax_h3_audio_vae"), is_path=True)
     add_arg(cmd, "--text_encoder", settings.get("minimax_h3_text_encoder"), is_path=True)
@@ -306,6 +316,8 @@ def _build_multimodal_cache_commands(settings, python_executable):
     commands = []
     task = settings.get("minimax_h3_multimodal_task") or "t2va"
     teacher_matching = bool(settings.get("minimax_h3_teacher_matching"))
+    if is_mixed_one_frame(settings) and (task != "t2va" or teacher_matching):
+        raise ValueError("Mixed native MiniMax image/video caching requires T2VA with teacher matching disabled")
     teacher_conditions = teacher_condition_value(settings.get("minimax_h3_teacher_conditions"))
     if teacher_matching and teacher_conditions == "first,last":
         latent_task = "fl2va"
@@ -322,6 +334,7 @@ def _build_multimodal_cache_commands(settings, python_executable):
             "--task", latent_task,
         ])
         add_arg(commands[-1], "--allow_experimental_duration", settings.get("minimax_h3_allow_experimental_duration"))
+        add_arg(commands[-1], "--one_frame", is_mixed_one_frame(settings))
     if settings.get("recache_text"):
         command = [
             python_executable, "src/musubi_tuner/minimax_h3_native_cache_text_encoder_outputs.py",
@@ -332,6 +345,7 @@ def _build_multimodal_cache_commands(settings, python_executable):
         add_arg(command, "--text_encoder_blocks_to_swap", setting_or_default(settings, "minimax_h3_text_encoder_blocks_to_swap", "50"))
         add_arg(command, "--text_encoder_attn_mode", settings.get("minimax_h3_text_encoder_attn_mode") or "sdpa")
         add_arg(command, "--text_cache_dtype", "bf16" if settings.get("minimax_h3_text_cache_dtype") == "bfloat16" else "float32")
+        add_arg(command, "--one_frame", is_mixed_one_frame(settings))
         if teacher_matching:
             add_arg(command, "--teacher_conditions", teacher_conditions)
         elif quality_protection_components(settings)["dynamic"]:

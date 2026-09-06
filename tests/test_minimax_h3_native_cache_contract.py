@@ -31,10 +31,41 @@ from musubi_tuner.minimax_h3_native_cache_latents import (
 from musubi_tuner.dataset.bucket import BucketBatchManager
 from musubi_tuner.dataset.cache_io import (
     AUDIO_PRESENT_KEY,
+    ONE_FRAME_TARGET_INDEX_KEY,
     save_latent_cache_minimax_h3,
     save_text_encoder_output_cache_minimax_h3,
 )
 from musubi_tuner.dataset.image_video_dataset import ItemInfo
+
+
+def test_one_frame_cache_keys_round_trip_through_bucket_collator(tmp_path: Path):
+    item = ItemInfo("portrait", "an image caption", (64, 64), (64, 64))
+    item.latent_cache_path = str(tmp_path / "portrait_0064x0064_mmh3.safetensors")
+    item.text_encoder_output_cache_path = str(tmp_path / "portrait_mmh3_te.safetensors")
+    save_latent_cache_minimax_h3(
+        item,
+        {
+            "latents_1x4x4_float32": torch.zeros(24, 1, 4, 4),
+            "latents_audio_32x2x2_float32": torch.zeros(32, 2, 2),
+            AUDIO_PRESENT_KEY: torch.tensor(0.0),
+            ONE_FRAME_TARGET_INDEX_KEY: torch.tensor(24, dtype=torch.int64),
+        },
+        {"task": "t2va", "one_frame": "1"},
+    )
+    save_text_encoder_output_cache_minimax_h3(
+        item,
+        {
+            "varlen_mmh3_hidden_states_bfloat16": torch.zeros(3, 5120, dtype=torch.bfloat16),
+            "varlen_mmh3_token_tags_int64": torch.ones(3, dtype=torch.int64),
+        },
+        {"task": "t2va"},
+    )
+
+    batch = BucketBatchManager({(64, 64): [item]}, batch_size=1)[0]
+    assert batch["latents"].shape == (1, 24, 1, 4, 4)
+    assert batch["latents_audio"].shape == (1, 32, 2, 2)
+    torch.testing.assert_close(batch["audio_present"], torch.tensor([0.0]))
+    torch.testing.assert_close(batch["one_frame_target_index"], torch.tensor([24], dtype=torch.int64))
 
 
 @pytest.mark.parametrize(

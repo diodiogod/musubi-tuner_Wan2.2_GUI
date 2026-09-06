@@ -9,7 +9,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from musubi_tuner.minimax_h3_native.packing import (
+    FRAME_RESCALE,
     H3ReferenceGeometry,
+    H3TimeOverrides,
     H3VideoGeometry,
     build_h3_layout,
     build_position_grid,
@@ -18,6 +20,21 @@ from musubi_tuner.minimax_h3_native.packing import (
     pack_video_rows,
     unpack_targets,
 )
+
+
+def test_one_frame_layout_uses_explicit_target_time():
+    layout = build_h3_layout(
+        task="t2va",
+        text_length=3,
+        target_video=H3VideoGeometry(1, 4, 4),
+        target_audio_frames=2,
+        one_frame=True,
+        time_overrides=H3TimeOverrides(condition_times=(), target_time=FRAME_RESCALE * 24),
+    )
+    positions = build_position_grid(layout)
+    assert layout.target_video.frames == 1
+    assert layout.time_overrides.target_time == FRAME_RESCALE * 24
+    assert torch.all(positions[layout.target_video_segment.row_slice, 0] == 3 + FRAME_RESCALE * 24)
 
 
 TARGET_VIDEO = H3VideoGeometry(frames=2, height=4, width=4)

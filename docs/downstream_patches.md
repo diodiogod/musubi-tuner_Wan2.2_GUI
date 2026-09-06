@@ -94,7 +94,8 @@ not contain the GUI files.
   `qkv_proj`, `out_proj`, and `adaln_proj` module names when exporting. Original
   trainer checkpoints are unaffected. Regression coverage: `tests/test_convert_lora_h3.py`.
 
-- Upstream `/dev` capability snapshot: `b871786` (2026-08-25). Selectively adopted through PR #1065; upstream one-frame training/editing remains an evaluation candidate rather than a replacement for the proven 24 GB compact path.
+- Upstream `/dev` capability snapshot: `b871786` (2026-08-25). Selectively adopted through PR #1065; native one-frame support complements rather than replaces the proven 24 GB compact path.
+- PR #1057 one-frame T2VA caching/training is selectively adapted into the native namespace. The GUI's **Video + images** workflow may mix ordinary image and video dataset sections; image batches use single-token targets and video batches retain their configured geometry. The compact still-image path remains unchanged.
 - The upstream multimodal modules live under `src/musubi_tuner/minimax_h3_native/` and use entry points named `minimax_h3_native_*`. This namespace is intentional: never overwrite the compact downstream `minimax_h3/` image implementation with the upstream package wholesale.
 - `backends/minimax_h3.py` selects the native entry points only when `minimax_h3_training_workflow` starts with `Video`; missing/old projects remain on `Still images · compact ConvRot`.
 - Supported tasks are T2VA, FL2VA, and Ref2VA. Joint audio is optional at training time through `--video_only` / `--audio_loss_weight`, but the official cache contract always contains synchronized audio latents plus an `audio_present` fact so missing audio is not treated as supervised silence.

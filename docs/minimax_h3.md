@@ -1,7 +1,8 @@
 # MiniMax-H3
 
 > GUI fork note: choose **MiniMax H3 (Experimental)**, then set **Training Media Type** to
-> **Video + audio · native multimodal**. Existing image-only recipes remain on the compact
+> **Video + audio · official multimodal**, or choose **Video + images · official mixed T2VA**
+> to combine native one-frame image targets with full clips. Existing image-only recipes remain on the compact
 > ConvRot path documented in [MiniMax H3 image-only training](minimax_h3_experimental.md).
 
 ## Overview
@@ -53,6 +54,37 @@ The transformer, video VAE, packed-sequence logic, text presentation, and dual s
 `--allow_experimental_duration` bypasses only the released 5-to-15-second check. It does not bypass frame geometry, reference limits, or validation of an explicitly selected audio source.
 
 ## Dataset Configuration
+
+### Mixed images and videos (T2VA)
+
+The **Video + images · official mixed T2VA** workflow adapts upstream Musubi PR #1057. Put ordinary
+image and video dataset sections in the same TOML. Images are encoded as true single-token H3 video
+targets; they are not duplicated into artificial clips. Video sections retain their configured full
+clips and frame extraction. Every batch is dispatched from its cached latent shape, so image and video
+buckets can train in one run. This mode currently supports T2VA only and cannot be combined with
+reference-guided teacher matching.
+
+```toml
+[general]
+resolution = [768, 768]
+batch_size = 1
+enable_bucket = true
+
+[[datasets]]
+image_directory = "/data/h3/images"
+cache_directory = "/data/h3/cache-images"
+caption_extension = ".txt"
+
+[[datasets]]
+video_directory = "/data/h3/videos"
+cache_directory = "/data/h3/cache-videos"
+caption_extension = ".txt"
+target_frames = [22, 39, 90]
+```
+
+Use a different `cache_directory` for image and video sources. The GUI adds `--one_frame` to both
+cache commands and the trainer automatically. Image caches contain an unsupervised two-frame silence
+placeholder (`audio_present=0`), while real video audio follows the normal presence-gated policy.
 
 The GUI supports the same media contract in both the Modern and Classic interfaces. A normal
 video folder is enough for T2VA or FL2VA. Audio may be embedded in each video or stored beside it

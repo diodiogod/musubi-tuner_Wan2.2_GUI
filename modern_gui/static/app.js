@@ -98,7 +98,7 @@ const HELP = {
   minimax_h3_audio_vae: "Choose minimax_h3_audio_vae_fp32.safetensors. It is needed to build synchronized audio latents even when video-only learning is selected.",
   minimax_h3_video_only: "Enable this when you want video motion/appearance training without teaching audio. Audio is still cached as a synchronized placeholder so cache shapes remain valid.",
   minimax_h3_training_target: "Choose exactly what contributes to the training loss. Video + audio learns both. Video only ignores audio loss. Audio only is experimental: it learns only from real synchronized audio, but still requires a video clip and both VAEs because H3 processes video and audio together.",
-  minimax_h3_training_workflow: "Choose Still images for the proven compact ConvRot workflow, or Video + audio for native H3 clip training. This choice changes the required model files, dataset geometry, and available training targets.",
+  minimax_h3_training_workflow: "Choose Still images for the proven compact ConvRot workflow, Video + audio for clip-only native training, or Video + images to mix full clips with true one-frame image targets from upstream PR #1057. Mixed mode currently requires T2VA and does not convert images into fake videos.",
   minimax_h3_audio_loss_weight: "1.0 gives video and available audio their normal joint objective. Lower values make audio learning gentler. Zero is equivalent to video-only supervision.",
   minimax_h3_teacher_matching: "Experimental reference-guided learning. Open ? for what it does, limitations, and when to try it.",
   minimax_h3_teacher_conditions: "Same training item lets the teacher see the exact image/video being learned. Other pictures never shows the answer item to the teacher: native video uses its references list; compact image training uses control_path/control_path_N entries in an image JSONL. First and last uses native-video endpoints. These are different experiments, not quality levels.",
@@ -1726,7 +1726,8 @@ async function addDatasetFromExplorer(kind,button){
     const result=await api("/api/path/drop",{method:"POST",body:JSON.stringify({title,kind})});
     const paths=Array.isArray(result.paths)?result.paths:(result.path?[result.path]:[]);
     if(!paths.length){toast("No folder was selected. The TOML was left unchanged.");return}
-    const h3Native=kind==="video"&&state.settings.training_mode==="MiniMax H3 (Experimental)"&&String(state.settings.minimax_h3_training_workflow||"").startsWith("Video");
+    const workflow=String(state.settings.minimax_h3_training_workflow||"");
+    const h3Native=state.settings.training_mode==="MiniMax H3 (Experimental)"&&workflow.startsWith("Video")&&(kind==="video"||(kind==="image"&&workflow.startsWith("Video + images")));
     await mutateDataset("/api/dataset/add",{kind,source_paths:paths,architecture:h3Native?"minimax_h3":""},selected,{message:`${paths.length} ${kind} folder${paths.length===1?"":"s"} added. Review the inherited settings, then save the TOML.`});
   });
 }

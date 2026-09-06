@@ -198,6 +198,7 @@ def audit_h3_training_dataset(
     task: str,
     training_target: str,
     allow_experimental_duration: bool = False,
+    allow_one_frame_images: bool = False,
 ) -> dict[str, list[str]]:
     path = Path(str(dataset_config or "")).expanduser().resolve()
     if not path.is_file():
@@ -209,6 +210,13 @@ def audit_h3_training_dataset(
     warnings: list[str] = []
     for index, dataset in enumerate(datasets, start=1):
         if not isinstance(dataset, dict):
+            continue
+        is_image = bool(dataset.get("image_directory") or dataset.get("image_jsonl_file"))
+        if is_image:
+            if not allow_one_frame_images:
+                errors.append(f"Source {index} is an image dataset; select Video + images to mix native one-frame targets.")
+            elif task != "t2va":
+                errors.append(f"Source {index} is an image dataset; native one-frame targets currently require T2VA.")
             continue
         frames = dataset.get("target_frames", general.get("target_frames", []))
         if not isinstance(frames, list) or not frames:
